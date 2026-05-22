@@ -1,8 +1,35 @@
 # CLAUDE.md
 
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 本文件为 Claude Code 在此仓库中工作提供指导。
 
 **重要：所有回答请使用中文。**
+
+## 环境设置
+
+**创建并激活 conda 环境：**
+```bash
+conda create -n simvla python=3.10 -y
+conda activate simvla
+```
+
+**安装依赖：**
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+pip install transformers>=4.57.0
+pip install peft accelerate fastapi tensorboard uvicorn json_numpy safetensors scipy einops timm mmengine pyarrow h5py mediapy num2words av wandb websockets msgpack_numpy
+pip install flash-attn==2.5.6 --no-build-isolation
+pip install tensorflow tensorflow-datasets
+```
+
+**配置路径文件：**
+创建 `paths.env`（参考 `paths.env` 模板）：
+```bash
+# 基础模型路径
+export SIMVLA_SMOLVLM_MODEL="/datasets/models/smolvlm/SmolVLM-500M-Instruct"
+# 其他路径可选，脚本会使用默认值
+```
 
 ## 常用命令
 
@@ -59,9 +86,79 @@ CUDA_VISIBLE_DEVICES=1 python libero_client.py \
 ```
 
 
+**离线强化学习微调：**
 ```bash
-# 恢复改动
+python finetune_offline_rl.py \
+    --checkpoint /path/to/checkpoint \
+    --offline_data_path /path/to/offline/data \
+    --output_dir ./runs/offline_rl_finetuned \
+    --num_epochs 10 \
+    --batch_size 32
+```
+
+**故障恢复：**
+```bash
+# 恢复备份文件（如果存在）
 cp .backup/* models/ && cp .backup/train_smolvlm.py . && cp .backup/serve_smolvlm_libero.py evaluation/libero/ && cp .backup/libero_hdf5.py datasets/domain_handler/
+```
+
+## 开发指南
+
+### 修改模型配置
+
+修改 `SmolVLMVLAConfig`（`models/configuration_smolvlm_vla.py`）中的超参数。**警告**：`use_adaln` 和 `use_hypernet` 在 checkpoint 创建后不可更改。
+
+### 扩展动作空间
+
+在 `models/action_hub.py` 中使用装饰器注册新的动作空间：
+```python
+@register_action("new_action_space")
+class NewActionSpace(ActionSpace):
+    def __init__(self, **kwargs):
+        # 实现初始化
+        pass
+    
+    def normalize(self, action):
+        # 实现归一化
+        pass
+    
+    def denormalize(self, normalized_action):
+        # 实现反归一化
+        pass
+```
+
+在训练时通过 `--action_mode new_action_space` 指定。
+
+### 添加新的领域处理器
+
+在 `datasets/domain_handler/` 中创建新的处理器（参考 `libero_hdf5.py`）：
+```python
+# 在 handler 文件中
+@register_handler("new_domain")
+class NewDomainHandler(BaseDomainHandler):
+    def __init__(self, **kwargs):
+        pass
+    
+    def __call__(self, sample_idx):
+        # 返回 {"image": ..., "action": ..., "obs": ...}
+        pass
+```
+
+然后在 `datasets/domain_handler/registry.py` 中导入。
+
+### 处理器和输入处理
+
+使用 `SmolVLMVLAProcessor`（`models/processing_smolvlm_vla.py`）处理图像和文本：
+```python
+from models.processing_smolvlm_vla import SmolVLMVLAProcessor
+
+processor = SmolVLMVLAProcessor.from_pretrained(model_id)
+
+# 快速图像编码（推荐）
+image_features = processor.encode_image(images)  # 384x384 或 512x512
+
+# 文本 tokenization
+text_ids = processor.tokenizer(prompts, return_tensors="pt")
 ```
 
 ## 架构
@@ -102,7 +199,16 @@ Flow matching：采样 `t ~ Beta(1.5, 1)`，插值 `x_t = t*noise + (1-t)*action
 
 ### 数据集（`datasets/`）
 
-`SmolVLMDataReader`（`dataset_smolvlm.py`）— 无限 `IterableDataset`，读取 LIBERO HDF5 文件。`datasets/domain_handler/` 中的领域处理器通过 `registry.py` 查找。`LiberoHDF5Handler` 读取 agentview_rgb + eye_in_hand_rgb（原始 128×128，resize 到 384×384），提取 7 维 delta 动作并将 euler 角转换为 axis-angle。数据集权重在 `domain_config.py` 中配置。
+`SmolVLMDataReader`（`dataset_smolvlm.py`）— 无限 `IterableDataset`，通过领域处理器读取数据。`datasets/domain_handler/` 中的处理器通过 `registry.py` 查找（`BaseDomainHandler` 基类在 `base.py` 中）。
+
+**`LiberoHDF5Handler` 工作流程：**
+1. 读取 agentview_rgb + eye_in_hand_rgb（原始 128×128）
+2. 在 GPU 上 resize 到 384×384（或 512×512，可配置）
+3. 提取 7 维 delta 动作（xyz_delta + euler_delta + gripper）
+4. 转换 euler 角为 axis-angle 格式
+5. 应用 `-mean / std` 归一化（从 `norm_stats/libero_norm.json` 读取）
+
+数据集权重和采样策略在 `domain_config.py` 中配置（多 domain 时用于平衡采样）。
 
 ### 推理与部署
 
@@ -124,3 +230,27 @@ Flow matching：采样 `t ~ Beta(1.5, 1)`，插值 `x_t = t*noise + (1-t)*action
 - 评估需要独立的 `libero` conda 环境（Python 3.8）运行 LIBERO 模拟器；推理服务器在 `simvla` 环境中运行
 - 本机双卡（GPU 0/1），串行跑 4 个评估套件；`run_eval_all.sh` 需要 4 张卡并行，本机不适用
 - 小模型在 GPU 0–3 训练，大模型在 GPU 4–7 训练（在 shell 脚本中配置）
+
+## 常见问题与调试
+
+**问题：训练时显存溢出（OOM）**
+- 减小 `--batch_size`（默认 64，试试 32 或 16）
+- 设置 `--gradient_accumulation_steps` 保持有效 batch 大小
+- 使用 `--use_fp16` 启用半精度训练
+
+**问题：加载 checkpoint 失败**
+- 确保 checkpoint 目录包含 `config.json`、`model.safetensors` 和 `processor_config.json`
+- 检查 checkpoint 路径中是否存在特殊字符或空格
+
+**问题：评估服务器无法连接**
+- 检查防火墙是否允许指定端口
+- 验证客户端和服务器使用相同的 `--host` 和 `--port`
+- 查看服务器日志：`tail -f serve_smolvlm_libero.log`
+
+**问题：归一化统计量不匹配**
+- 确保使用与训练数据相同的 `libero_norm.json`
+- 如果添加新数据集，需要重新计算统计量：`python compute_libero_norm_stats.py ...`
+
+**问题：模型配置冲突**
+- `use_adaln` 和 `use_hypernet` 不能同时为 `True`
+- 从 checkpoint 加载时，配置参数会自动覆盖命令行参数
