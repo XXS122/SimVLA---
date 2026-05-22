@@ -69,7 +69,7 @@ if [ ! -f "$TRAIN_METAS_PATH" ]; then
     echo "Creating training metadata..."
     python create_libero_meta.py \
         --data_dir $LIBERO_DATA_DIR \
-        --subsets libero_10 libero_goal libero_object libero_spatial libero_90 \
+        --subsets libero_10 libero_goal libero_object libero_spatial \
         --output $TRAIN_METAS_PATH
 fi
 
@@ -80,7 +80,7 @@ if [ ! -f "$NORM_STATS_PATH" ]; then
     echo "Computing normalization statistics..."
     python compute_libero_norm_stats.py \
         --data_dir $LIBERO_DATA_DIR \
-        --subsets libero_10 libero_goal libero_object libero_spatial libero_90 \
+        --subsets libero_10 libero_goal libero_object libero_spatial \
         --output $NORM_STATS_PATH
 fi
 

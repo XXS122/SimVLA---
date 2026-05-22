@@ -471,15 +471,11 @@ def main(args):
         logger.info(f"   HyperNet mode: rank={args.hypernet_rank}")
 
     for batch in train_dataloader:
-        if global_step < 2:
-            print(f"[DEBUG] got batch step={global_step} keys={list(batch.keys())}", flush=True)
         # Encode language
         lang = processor.encode_language(batch["language_instruction"])
         batch.pop("language_instruction", None)
         inputs = {**batch, **lang}
         inputs = {k: v.cuda(non_blocking=True) for k, v in inputs.items()}
-        if global_step < 2:
-            print(f"[DEBUG] moved to cuda step={global_step}", flush=True)
 
         # Update LR
         update_group_lrs(optim, global_step, args)
@@ -511,23 +507,15 @@ def main(args):
         inputs = {k: v for k, v in inputs.items() if k in _FORWARD_KEYS}
 
         # Forward
-        if global_step < 2:
-            print(f"[DEBUG] before forward step={global_step}", flush=True)
         loss_dict: Dict[str, torch.Tensor] = model(**inputs)
         loss = sum(loss_dict.values())
-        if global_step < 2:
-            print(f"[DEBUG] after forward step={global_step} losses={list(loss_dict.keys())}", flush=True)
 
         # Track velocity loss for diagnostics
         velocity_loss_val = loss_dict.get("loss_velocity", loss).detach().float().item()
         loss_history.append(velocity_loss_val)
 
         # Backward
-        if global_step < 2:
-            print(f"[DEBUG] before backward step={global_step}", flush=True)
         accelerator.backward(loss)
-        if global_step < 2:
-            print(f"[DEBUG] after backward step={global_step}", flush=True)
         if args.max_grad_norm:
             accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 

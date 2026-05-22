@@ -189,9 +189,6 @@ class SmolVLMDataReader(IterableDataset):
                     
                     yield sample
             except Exception as e:
-                import traceback
-                print(f"[DEBUG _iter_one_dataset] traj_idx={traj_idx} 异常被吞: {e}", flush=True)
-                traceback.print_exc()
                 continue
 
     def _infinite_iter(self, dataset_name: str) -> Iterable[dict]:
