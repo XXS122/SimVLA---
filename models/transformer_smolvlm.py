@@ -249,6 +249,32 @@ class FinalLayer(nn.Module):
         return self.linear(x)
 
 
+# --------------------------- Chunk Boundary Head ----------------------------------
+
+class ChunkBoundaryHead(nn.Module):
+    """
+    Predicts per-step chunk boundary score from action token features.
+
+    Trained to regress the local action change rate, so the model learns
+    to output high scores at high-velocity / contact moments (short chunk)
+    and low scores during smooth free-space motion (long chunk).
+    """
+
+    def __init__(self, hidden_size: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_size // 2, 1),
+        )
+        nn.init.constant_(self.net[-1].weight, 0)
+        nn.init.constant_(self.net[-1].bias, 0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [B, T, H] → [B, T]"""
+        return self.net(x).squeeze(-1)
+
+
 # --------------------------- Main Model (SmolVLM Version) ---------------------------------------
 
 class SmolVLMActionTransformer(nn.Module):
@@ -277,6 +303,7 @@ class SmolVLMActionTransformer(nn.Module):
         dim_time: int = 32,
         max_len_seq: int = 1024,
         use_adaln: bool = False,
+        use_adaptive_chunking: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -284,6 +311,7 @@ class SmolVLMActionTransformer(nn.Module):
         self.dim_time = dim_time
         self.dim_propio = dim_propio
         self.use_adaln = use_adaln
+        self.use_adaptive_chunking = use_adaptive_chunking
 
         if use_adaln:
             # ========== DiT Mode: AdaLN ==========
@@ -324,11 +352,14 @@ class SmolVLMActionTransformer(nn.Module):
             nn.init.normal_(self.pos_emb, std=0.02)
 
             self.norm = nn.LayerNorm(hidden_size)
-            
+
             # Action encoder/decoder
             action_input_dim = dim_action + dim_time + dim_propio
             self.action_encoder = nn.Linear(action_input_dim, hidden_size)
             self.action_decoder = nn.Linear(hidden_size, dim_action)
+
+        # Chunk boundary head (shared across both modes)
+        self.chunk_boundary_head = ChunkBoundaryHead(hidden_size) if use_adaptive_chunking else None
 
         self.apply(basic_init)
 
@@ -338,6 +369,7 @@ class SmolVLMActionTransformer(nn.Module):
         action_with_noise: torch.Tensor,
         proprio: torch.Tensor,
         t: torch.Tensor,
+        return_boundary: bool = False,
     ) -> torch.Tensor:
         """
         Forward pass for SmolVLM Action Transformer.
@@ -348,15 +380,18 @@ class SmolVLMActionTransformer(nn.Module):
         action_with_noise : [B, T_action, dim_action]
         proprio : [B, dim_proprio]
         t : [B]
+        return_boundary : if True and chunk_boundary_head is present, returns
+                          (velocity [B,T,D], boundary_logits [B,T]) instead of
+                          just velocity.
 
         Returns
         -------
-        Tensor: Predicted velocity, [B, T_action, dim_action]
+        Tensor or (Tensor, Tensor)
         """
         if self.use_adaln:
-            return self._forward_adaln(vlm_features, action_with_noise, proprio, t)
+            return self._forward_adaln(vlm_features, action_with_noise, proprio, t, return_boundary)
         else:
-            return self._forward_concat(vlm_features, action_with_noise, proprio, t)
+            return self._forward_concat(vlm_features, action_with_noise, proprio, t, return_boundary)
     
     def _forward_concat(
         self,
@@ -364,10 +399,11 @@ class SmolVLMActionTransformer(nn.Module):
         action_with_noise: torch.Tensor,
         proprio: torch.Tensor,
         t: torch.Tensor,
+        return_boundary: bool = False,
     ) -> torch.Tensor:
         """
         Concat mode forward pass.
-        
+
         Simplified: x = torch.cat([x, self.vlm_proj(vlm_features)], dim=1)
         No aux_visual_inputs needed.
         """
@@ -377,7 +413,7 @@ class SmolVLMActionTransformer(nn.Module):
         time_emb = timestep_embedding(t, self.dim_time)
         time_tokens = time_emb.unsqueeze(1).expand(B, num_actions, self.dim_time)
         proprio_tokens = proprio.unsqueeze(1).expand(B, num_actions, proprio.shape[-1])
-        
+
         action_tokens = torch.cat([action_with_noise, proprio_tokens, time_tokens], dim=-1)
         x = self.action_encoder(action_tokens)  # [B, T_action, H]
 
@@ -397,7 +433,12 @@ class SmolVLMActionTransformer(nn.Module):
             x = block(x)
 
         # Decode only the action segment
-        return self.action_decoder(self.norm(x[:, :num_actions]))
+        action_features = self.norm(x[:, :num_actions])  # [B, T, H]
+        velocity = self.action_decoder(action_features)   # [B, T, D]
+
+        if return_boundary and self.chunk_boundary_head is not None:
+            return velocity, self.chunk_boundary_head(action_features)
+        return velocity
     
     def _forward_adaln(
         self,
@@ -405,45 +446,43 @@ class SmolVLMActionTransformer(nn.Module):
         action_with_noise: torch.Tensor,
         proprio: torch.Tensor,
         t: torch.Tensor,
+        return_boundary: bool = False,
     ) -> torch.Tensor:
         """
         DiT/AdaLN mode forward pass.
-        
+
         Conditions (time, vlm, proprio) injected via AdaLN.
         No aux_visual needed for SmolVLM.
         """
         B, num_actions = action_with_noise.shape[:2]
-        
+
         # ========== 1. Build global condition c ==========
-        # Time embedding
         t_emb = timestep_embedding(t, self.hidden_size)
         t_emb = self.time_proj(t_emb)  # [B, H]
-        
-        # VLM condition: Global Average Pooling
+
         vlm_cond = self.vlm_cond_proj(vlm_features.mean(dim=1))  # [B, H]
-        
-        # Proprio condition
         proprio_cond = self.proprio_proj(proprio)  # [B, H]
-        
-        # Fuse all conditions
         c = t_emb + vlm_cond + proprio_cond  # [B, H]
-        
+
         # ========== 2. Encode action sequence ==========
         x = self.action_encoder(action_with_noise)  # [B, T_action, H]
-        
-        # Add position encoding
         x = x + self.pos_emb[:, :num_actions, :]
-        
+
         # ========== 3. DiT Blocks with AdaLN ==========
         for block in self.blocks:
             x = block(x, c)
-        
+
         # ========== 4. Final Layer with AdaLN ==========
-        return self.final_layer(x, c)
+        velocity = self.final_layer(x, c)  # [B, T, D]
+
+        if return_boundary and self.chunk_boundary_head is not None:
+            return velocity, self.chunk_boundary_head(x)
+        return velocity
 
 
 __all__ = [
     "SmolVLMActionTransformer",
+    "ChunkBoundaryHead",
     "TransformerBlock",
     "DiTBlock",
     "FinalLayer",

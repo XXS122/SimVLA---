@@ -145,7 +145,13 @@ def get_args_parser():
     # DiT/AdaLN mode
     parser.add_argument("--use_adaln", action="store_true", default=False,
                         help="Use DiT-style AdaLN conditioning")
-    
+
+    # Adaptive action chunking
+    parser.add_argument("--use_adaptive_chunking", action="store_true", default=False,
+                        help="Enable change-rate-weighted loss + boundary prediction head")
+    parser.add_argument("--chunk_loss_weight", type=float, default=0.1,
+                        help="Weight for the boundary prediction auxiliary loss")
+
     # Model architecture
     parser.add_argument("--hidden_size", type=int, default=768,
                         help="Hidden size for action transformer")
@@ -276,6 +282,8 @@ def main(args):
         "hidden_size": args.hidden_size,
         "depth": args.depth,
         "use_adaln": args.use_adaln,
+        "use_adaptive_chunking": args.use_adaptive_chunking,
+        "chunk_loss_weight": args.chunk_loss_weight,
     }
     
     if use_wandb:
@@ -341,6 +349,8 @@ def main(args):
             num_actions=args.num_actions,
             use_adaln=args.use_adaln,
             image_size=args.image_size,
+            use_adaptive_chunking=args.use_adaptive_chunking,
+            chunk_loss_weight=args.chunk_loss_weight,
         )
         model = SmolVLMVLA(config)
         
@@ -420,9 +430,15 @@ def main(args):
             if accelerator.is_main_process:
                 dt = (time.time() - t0) / args.log_interval
                 t0 = time.time()
+                boundary_str = (
+                    f" boundary={logs['boundary_loss']:.4f}"
+                    if "boundary_loss" in logs else ""
+                )
                 logger.info(
                     f"[{global_step}/{args.iters}] "
                     f"loss={logs['loss_total']:.4f} "
+                    f"vel={logs['velocity_loss']:.4f}"
+                    f"{boundary_str} "
                     f"lr_core={logs['lr_transformer_core']:.2e} "
                     f"lr_action={logs['lr_action_heads']:.2e} "
                     f"lr_vlm={logs['lr_vlm']:.2e} ({dt:.2f}s/it)"
