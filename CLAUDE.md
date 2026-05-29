@@ -19,6 +19,28 @@ pip install -r requirements.txt
 
 ## Key Commands
 
+### Local Machine Configuration (`paths.env`)
+
+Machine-specific paths, GPU config, and secrets live in a **git-ignored** `paths.env`
+(copy from `paths.env.example`). `source paths.env` before training/eval; the scripts
+read these with fallbacks to the previous hard-coded defaults:
+
+```bash
+cp paths.env.example paths.env   # then fill in real values
+source paths.env
+```
+
+| Variable | Used for |
+|----------|----------|
+| `SIMVLA_SMOLVLM_MODEL` | SmolVLM backbone path (train scripts, serve, `train_smolvlm.py` default) |
+| `LIBERO_DATASETS` | LIBERO data root (`--data_dir` for metadata/norm-stats) |
+| `SIMVLA_CHECKPOINTS` | Default training output dir / serve `--checkpoint` |
+| `SIMVLA_RESUME_CKPT` | Default resume checkpoint |
+| `CUDA_DEVICES` / `NUM_GPUS` | GPU ids + `accelerate --num_processes` (single-GPU capable) |
+| `WANDB_API_KEY` / `WANDB_PROJECT` | WandB tracking |
+
+`paths.env` is in `.gitignore` (it holds `WANDB_API_KEY`) — never commit it.
+
 ### Data Preparation (LIBERO)
 ```bash
 # Create training metadata
@@ -36,19 +58,31 @@ python compute_libero_norm_stats.py \
 
 ### Training
 ```bash
-# Small model (768 hidden, 12 layers, 12 heads, 384x384 images, 4 GPUs)
+source paths.env   # loads paths, GPU config, WANDB_API_KEY
+
+# Small model (768 hidden, 12 layers, 12 heads, 384x384 images)
 bash train_smolvlm_small.sh [batch_size] [learning_coef] [output_dir] [resume_ckpt]
 
 # Large model (1024 hidden, 24 layers, 16 heads)
 bash train_smolvlm_large.sh [batch_size] [learning_coef] [output_dir] [resume_ckpt]
 
+# Enable Adaptive Action Chunking (change-rate-weighted loss + boundary head)
+USE_ADAPTIVE_CHUNKING=true CHUNK_LOSS_WEIGHT=0.1 bash train_smolvlm_small.sh
+
 # Direct training script invocation
 python train_smolvlm.py --help
 ```
 
+Training logs are saved for later review:
+- Full console output → `OUTPUT_DIR/train_console_<timestamp>.log` (tee'd by the shell script)
+- Structured logger → `OUTPUT_DIR/train_smolvlm_<timestamp>.log` (per-run, not clobbered)
+- WandB: auto-enabled when `WANDB_API_KEY` is set; the log prints whether it is active
+
 ### Evaluation (LIBERO)
 ```bash
-# Start inference server
+source paths.env
+
+# Start inference server (checkpoint/backbone default to env vars if set)
 CUDA_VISIBLE_DEVICES=0 python evaluation/libero/serve_smolvlm_libero.py \
   --checkpoint YuankaiLuo/SimVLA-LIBERO \
   --norm_stats ./norm_stats/libero_norm.json \
@@ -72,6 +106,19 @@ bash evaluation/libero/run_eval_all.sh [port] [num_episodes] [run_name] [seeds]
 - DiT-style (Diffusion Transformer) action decoder with timestep and conditioning embeddings
 - Components: `TransformerBlock`, `DiTBlock`, `FinalLayer`, `Attention`, `Mlp`
 - Used for flow-matching / diffusion-based action prediction
+- Optional `ChunkBoundaryHead` (when `use_adaptive_chunking=True`): predicts a per-step
+  boundary score from action features; `forward(..., return_boundary=True)` returns
+  `(velocity, boundary_logits)`
+
+**Adaptive Action Chunking** (opt-in training innovation, off by default)
+- Config flags: `use_adaptive_chunking`, `chunk_loss_weight` (also `--use_adaptive_chunking`
+  / `--chunk_loss_weight` CLI; `USE_ADAPTIVE_CHUNKING` / `CHUNK_LOSS_WEIGHT` shell env)
+- In `SmolVLMVLA.forward` the flow-matching loss is weighted per-step by the ground-truth
+  action change rate (`||a[t+1]-a[t]||` → weights in `[0.5, 1.5]`), concentrating learning
+  on contact / direction-reversal moments; the boundary head regresses the (detached)
+  normalized change rate as an auxiliary loss
+- Setting the flag off recovers the exact original uniform-MSE objective (backward compatible)
+- Design notes / experiments: `docs/method_section_draft.md`, `docs/experiment_design.md`
 
 **`action_hub.py`** — Action space registry
 - `BaseActionSpace` abstract class; subclasses define observation/action dimensions
