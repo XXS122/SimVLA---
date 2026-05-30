@@ -205,6 +205,7 @@ def eval_libero(
     seed: int = 7,
     video_out_path: str = "data/libero/videos",
     save_video: bool = True,
+    task_id: int = None,
 ) -> float:
     """
     Run LIBERO evaluation across all tasks in a suite.
@@ -224,7 +225,8 @@ def eval_libero(
     
     total_episodes, total_successes = 0, 0
     
-    for task_id in tqdm(range(num_tasks - 1, -1, -1), desc="Tasks"):
+    task_ids = [task_id] if task_id is not None else range(num_tasks - 1, -1, -1)
+    for task_id in tqdm(task_ids, desc="Tasks"):
         task = task_suite.get_task(task_id)
         initial_states = task_suite.get_task_init_states(task_id)
         env, task_description = get_libero_env(task, LIBERO_ENV_RESOLUTION, seed)
@@ -328,6 +330,8 @@ def main():
     parser.add_argument("--replan_steps", type=int, default=5)
     parser.add_argument("--video_out", type=str, default="./eval_results")
     parser.add_argument("--no_video", action="store_true", help="Disable video recording for faster evaluation")
+    parser.add_argument("--task_id", type=int, default=None,
+                        help="If set, only evaluate this task index (0-based). Omit to run all tasks.")
 
     args = parser.parse_args()
 
@@ -367,6 +371,7 @@ def main():
         seed=args.seed,
         video_out_path=str(video_path),
         save_video=not args.no_video,
+        task_id=args.task_id,
     )
 
 
