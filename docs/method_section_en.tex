@@ -1,261 +1,124 @@
 % =============================================================================
-% SimVLA -- Method Section (LaTeX)
+% Adaptive Action Chunking -- Method Section (LaTeX)
 % =============================================================================
 
-\section{Method}
-\label{sec:method}
-
-\subsection{Overview}
-
-We present \textbf{SimVLA}, a Vision-Language-Action (VLA) model for robotic manipulation
-that couples a pretrained vision-language model (VLM) with a flow-matching action
-transformer. Given a language instruction and multi-camera observations, SimVLA predicts
-a chunk of future actions in an end-to-end fashion. The model consists of three
-components: (1) a VLM backbone for visual and language grounding, (2) a diffusion-style
-action transformer that decodes actions conditioned on VLM features, and (3) a
-flow-matching training objective that enables efficient, high-quality action generation.
-
-% -----------------------------------------------------------------------------
-\subsection{Vision-Language Backbone}
-\label{sec:backbone}
-
-We adopt \textbf{SmolVLM-500M-Instruct}~\cite{smolvlm} as our vision-language backbone.
-The model encodes up to $V{=}3$ camera views jointly alongside the natural-language task
-instruction. Each image is resized to $512{\times}512$ pixels via bicubic interpolation
-and normalized with ImageNet statistics
-($\boldsymbol{\mu}{=}[0.485, 0.456, 0.406]$,
- $\boldsymbol{\sigma}{=}[0.229, 0.224, 0.225]$).
-Multiple views are concatenated along the sequence dimension before being fed to the
-model, producing a unified visual-language feature sequence
-$\mathbf{z} \in \mathbb{R}^{T_{\text{vlm}} \times d_{\text{vlm}}}$,
-where $d_{\text{vlm}}{=}576$.
-
-During early training, the VLM backbone parameters are frozen (for the first $10^{3}$
-steps) to allow the action head to bootstrap stable gradients before joint fine-tuning
-commences.
-
-% -----------------------------------------------------------------------------
-\subsection{Action Transformer}
-\label{sec:action_transformer}
-
-The action transformer takes noisy actions, robot proprioception, and VLM conditioning
-features as input and predicts the denoising velocity field, following the flow-matching
-paradigm.
-
-\paragraph{Input encoding.}
-At each denoising step, let
-$\mathbf{x}_t \in \mathbb{R}^{T_a \times d_a}$
-denote the noisy action chunk, where $T_a{=}10$ is the number of predicted action steps
-and $d_a{=}7$ for the LIBERO joint-space action
-(end-effector $\Delta x, \Delta y, \Delta z, \Delta\text{roll}, \Delta\text{pitch},
-\Delta\text{yaw}$, and gripper command).
-The proprioceptive state
-$\mathbf{s} \in \mathbb{R}^{d_s}$
-($d_s{=}8$: end-effector position, orientation, gripper state)
-and a sinusoidal time embedding
-$\mathbf{e}_t \in \mathbb{R}^{32}$
-are tiled along the action-sequence dimension and concatenated with $\mathbf{x}_t$:
-%
-\begin{equation}
-  \mathbf{h}_0
-  = \operatorname{Linear}\!\bigl([\mathbf{x}_t \,\|\, \tilde{\mathbf{s}} \,\|\,
-    \tilde{\mathbf{e}}_t]\bigr)
-  \in \mathbb{R}^{T_a \times d_h},
-  \label{eq:input_enc}
-\end{equation}
-%
-where $d_h{=}768$ is the transformer hidden size and $[\cdot\|\cdot]$ denotes
-channel-wise concatenation.
-
-\paragraph{VLM conditioning.}
-The VLM output $\mathbf{z}$ is projected to $d_h$ dimensions via a linear layer and
-appended to the action token sequence, yielding a joint sequence of length
-$T_a + T_{\text{vlm}}$:
-%
-\begin{equation}
-  \mathbf{H}
-  = \bigl[\mathbf{h}_0 \,\|\, \mathbf{W}_z\mathbf{z}\bigr] + \mathbf{E}_{\text{pos}},
-  \label{eq:vlm_cond}
-\end{equation}
-%
-where $\mathbf{E}_{\text{pos}}$ is a learned positional embedding.
-
-\paragraph{Transformer blocks.}
-$\mathbf{H}$ is processed by $L{=}12$ standard Pre-LayerNorm transformer blocks, each
-with $N_h{=}12$ attention heads (head dimension 64), MLP expansion ratio 4
-($d_{\text{mlp}}{=}3072$), GELU activation, and dropout 0.1.
-After the final layer, only the $T_a$ action positions are retained and projected by a
-linear head to produce the velocity prediction
-$\hat{\mathbf{v}} \in \mathbb{R}^{T_a \times d_a}$.
-
-% -----------------------------------------------------------------------------
-\subsection{Flow Matching Training Objective}
-\label{sec:flow_matching}
-
-We train the action transformer using the \textbf{Conditional Flow Matching}
-(CFM)~\cite{lipman2022flow} framework.
-Given a ground-truth normalized action chunk
-$\mathbf{a} \in \mathbb{R}^{T_a \times d_a}$
-and Gaussian noise $\boldsymbol{\epsilon} \sim \mathcal{N}(\mathbf{0}, \mathbf{I})$,
-we define the linear interpolant:
-%
-\begin{equation}
-  \mathbf{x}_t
-  = t\,\boldsymbol{\epsilon} + (1-t)\,\mathbf{a},
-  \qquad
-  t \sim \operatorname{Beta}(1.5,\;1.0),
-  \label{eq:interpolant}
-\end{equation}
-%
-where $t$ is clipped to $[0.001, 0.999]$.
-The regression target (velocity field) is:
-%
-\begin{equation}
-  \mathbf{u}_t = \boldsymbol{\epsilon} - \mathbf{a}.
-  \label{eq:velocity_target}
-\end{equation}
-%
-The training loss is the mean squared error between the predicted and target velocity
-fields:
-%
-\begin{equation}
-  \mathcal{L}_{\text{flow}}
-  = \mathbb{E}_{t,\boldsymbol{\epsilon}}
-    \bigl\|
-      \hat{\mathbf{v}}(\mathbf{x}_t, t, \mathbf{z}, \mathbf{s}) - \mathbf{u}_t
-    \bigr\|_2^2.
-  \label{eq:flow_loss}
-\end{equation}
-
-\paragraph{Action normalization.}
-Prior to training, all action dimensions are normalized to zero mean and unit variance
-using dataset statistics:
-%
-\begin{equation}
-  \mathbf{a}_{\text{norm}}
-  = \frac{\mathbf{a} - \boldsymbol{\mu}}{\boldsymbol{\sigma} + \varepsilon},
-  \qquad \varepsilon = 10^{-6}.
-  \label{eq:norm}
-\end{equation}
-%
-Proprioceptive states are normalized identically.
-
-% -----------------------------------------------------------------------------
-\subsection{Adaptive Action Chunking}
+\section{Adaptive Action Chunking}
 \label{sec:adaptive_chunking}
 
-To focus learning on critical transition moments (\emph{e.g.}, contacts and direction
-reversals), we optionally apply \textbf{Adaptive Action Chunking} by reweighting the
-flow-matching loss with per-step change rates.
-For a ground-truth action chunk $\mathbf{a} \in \mathbb{R}^{T_a \times d_a}$, we compute
-the normalized step-wise change rate:
+\subsection{Motivation}
+
+The standard Flow Matching objective applies a uniform mean-squared-error (MSE) loss to
+every step of the action chunk, implicitly assuming that all timesteps within the chunk
+are equally important. In robotic manipulation, however, the critical motion moments ---
+such as making contact or reversing motion direction --- are concentrated in only a few
+steps of the chunk. Weighting these steps identically to the quasi-static steps leaves
+the model under-trained precisely where fine control matters most. We therefore propose
+\textbf{Adaptive Action Chunking}, which reweights the flow-matching loss according to
+the per-step change rate of the ground-truth actions, and introduces an auxiliary
+boundary prediction head that makes the model explicitly aware of the transition
+structure inside an action chunk. The module is optional: when disabled, it recovers the
+standard uniform-MSE objective and remains fully compatible with the original training
+setup.
+
+\subsection{Preliminaries}
+
+Let $\mathbf{a} \in \mathbb{R}^{T_a \times d_a}$ denote the normalized ground-truth action
+chunk, where $T_a$ is the number of action steps and $d_a$ the per-step action dimension.
+Under the conditional flow-matching framework, the model predicts a velocity field
+$\hat{\mathbf{v}}_\tau$ with regression target
+$\mathbf{u}_{t,\tau} = \boldsymbol{\epsilon}_\tau - \mathbf{a}_\tau$, and the baseline loss
+is a uniformly weighted MSE. Our contribution lies in the per-step reweighting of this
+loss and the auxiliary boundary supervision.
+
+\subsection{Change-Rate Weighting}
+
+We measure how abruptly the action evolves by the L2 distance between consecutive action
+steps. The per-step change rate is defined as
 %
 \begin{equation}
-  r_\tau
-  = \frac{\|\mathbf{a}_{\tau+1} - \mathbf{a}_\tau\|_2}
-         {\max_{\tau'}\|\mathbf{a}_{\tau'+1} - \mathbf{a}_{\tau'}\|_2},
-  \qquad \tau = 1, \ldots, T_a - 1.
+  c_\tau = \|\mathbf{a}_{\tau+1} - \mathbf{a}_\tau\|_2,
+  \quad \tau = 1, \ldots, T_a - 1,
+  \qquad c_{T_a} = 0,
   \label{eq:change_rate}
 \end{equation}
 %
-Each step is assigned a loss weight $w_\tau = 0.5 + r_\tau \in [0.5, 1.5]$, so the
-weighted flow-matching loss becomes:
+i.e., we compute the norm of the $T_a - 1$ consecutive differences over a chunk of length
+$T_a$ and zero-pad the last step so that the change rate aligns with the action sequence
+length. The change rate is then normalized per sample by its own maximum:
 %
 \begin{equation}
-  \mathcal{L}_{\text{flow}}^{*}
+  \tilde{c}_\tau
+  = \frac{c_\tau}{\max_{\tau'} c_{\tau'} + \varepsilon},
+  \quad \varepsilon = 10^{-6},
+  \qquad \tilde{c}_\tau \in [0, 1].
+  \label{eq:norm_rate}
+\end{equation}
+%
+The normalized change rate is mapped to per-step loss weights:
+%
+\begin{equation}
+  w_\tau = 0.5 + \tilde{c}_\tau \in [0.5,\, 1.5].
+  \label{eq:step_weight}
+\end{equation}
+%
+The most rapidly changing step receives the highest weight $1.5$, while quasi-static
+steps (including the padded last step) receive the lowest weight $0.5$. The reweighted
+flow-matching loss applies the weight to the per-step squared error:
+%
+\begin{equation}
+  \mathcal{L}_{\text{vel}}
   = \mathbb{E}_{t,\boldsymbol{\epsilon}}
-    \bigl\|
-      \sqrt{w_\tau}\,
-      \bigl(\hat{\mathbf{v}}_\tau - \mathbf{u}_{t,\tau}\bigr)
-    \bigr\|_2^2.
-  \label{eq:weighted_flow_loss}
+    \left[
+      \frac{1}{T_a} \sum_{\tau=1}^{T_a}
+      w_\tau \,
+      \bigl\|\hat{\mathbf{v}}_\tau - \mathbf{u}_{t,\tau}\bigr\|_2^2
+    \right].
+  \label{eq:weighted_loss}
 \end{equation}
 
-An auxiliary \textbf{chunk boundary head} --- a two-layer MLP
-($d_h \!\to\! d_h/2 \!\to\! 1$, SiLU activation, zero-initialized output layer)
-applied to the action features --- regresses the stop-gradient change rate $r_\tau$:
+\subsection{Boundary Prediction Head}
+
+To let the model explicitly model the transition structure inside an action chunk, we
+attach a lightweight \textbf{chunk boundary head} on top of the action features. Let
+$\mathbf{f}_\tau \in \mathbb{R}^{d_h}$ denote the per-step action feature produced after
+the transformer's final layer norm (the same feature used to decode the velocity field).
+The boundary head is a two-layer MLP:
 %
 \begin{equation}
-  \mathcal{L}_{\text{boundary}}
-  = \operatorname{MSE}\!\bigl(\hat{r}_\tau,\; \operatorname{sg}(r_\tau)\bigr),
+  \hat{r}_\tau
+  = \mathbf{W}_2\,\operatorname{SiLU}(\mathbf{W}_1 \mathbf{f}_\tau),
+  \quad
+  \mathbf{W}_1 \in \mathbb{R}^{(d_h/2) \times d_h},\
+  \mathbf{W}_2 \in \mathbb{R}^{1 \times (d_h/2)}.
+  \label{eq:boundary_head}
+\end{equation}
+%
+Its output layer weights and bias are zero-initialized so that boundary predictions start
+neutral. The head regresses the stop-gradient normalized change rate $\tilde{c}_\tau$:
+%
+\begin{equation}
+  \mathcal{L}_{\text{bnd}}
+  = \frac{1}{T_a}\sum_{\tau=1}^{T_a}
+    \bigl(\hat{r}_\tau - \operatorname{sg}(\tilde{c}_\tau)\bigr)^2,
   \label{eq:boundary_loss}
 \end{equation}
 %
-where $\operatorname{sg}(\cdot)$ denotes the stop-gradient operator.
-The total loss is:
+where $\operatorname{sg}(\cdot)$ is the stop-gradient operator, ensuring the boundary
+supervision does not back-propagate into the change rate itself.
+
+\subsection{Total Objective}
+
+The overall training loss is the sum of the weighted flow-matching loss and the auxiliary
+boundary loss:
 %
 \begin{equation}
   \mathcal{L}
-  = \mathcal{L}_{\text{flow}}^{*} + \lambda\,\mathcal{L}_{\text{boundary}},
-  \qquad \lambda = 0.1.
+  = \mathcal{L}_{\text{vel}} + \lambda\, \mathcal{L}_{\text{bnd}},
+  \qquad \lambda = 0.1,
   \label{eq:total_loss}
 \end{equation}
 %
-Disabling this option recovers the standard uniform-MSE objective
-(Eq.~\ref{eq:flow_loss}), remaining fully backward compatible.
-
-% -----------------------------------------------------------------------------
-\subsection{Inference}
-\label{sec:inference}
-
-At inference time, actions are generated by solving the learned flow ODE with 10 Euler
-steps. Starting from $\mathbf{x}_1 \sim \mathcal{N}(\mathbf{0}, \mathbf{I})$:
-%
-\begin{equation}
-  \mathbf{x}_{t-\Delta t}
-  = \mathbf{x}_t
-    + \Delta t \cdot \hat{\mathbf{v}}(\mathbf{x}_t, t, \mathbf{z}, \mathbf{s}),
-  \qquad \Delta t = \tfrac{1}{10}.
-  \label{eq:euler}
-\end{equation}
-%
-The resulting $\mathbf{x}_0$ is denormalized using the stored dataset statistics to
-recover the final action chunk, which is sent to the robot controller at a replanning
-interval of 5 steps.
-
-% -----------------------------------------------------------------------------
-\subsection{Training Details}
-\label{sec:training}
-
-We train SimVLA with the \textbf{AdamW} optimizer
-($\beta_1{=}0.9$, $\beta_2{=}0.95$, weight decay $= 0$, gradient clipping $= 1.0$).
-The learning rate follows a linear warmup over 2{,}000 steps to $10^{-4}$, followed by
-cosine decay to $10^{-5}$.
-We use a batch size of 32 and train for up to $10^{6}$ iterations using
-HuggingFace Accelerate~\cite{accelerate} for multi-GPU distributed training.
-Checkpoints are saved every 50{,}000 steps.
-
-\begin{table}[h]
-  \centering
-  \caption{SimVLA architecture and training hyperparameters.}
-  \label{tab:hparams}
-  \begin{tabular}{lc}
-    \toprule
-    \textbf{Hyperparameter} & \textbf{Value} \\
-    \midrule
-    VLM backbone            & SmolVLM-500M-Instruct \\
-    Image resolution        & $512 \times 512$ \\
-    Number of camera views  & 3 \\
-    Action horizon $T_a$    & 10 \\
-    Action dimension $d_a$  & 7 \\
-    Proprioception dim $d_s$& 8 \\
-    Transformer hidden size $d_h$ & 768 \\
-    Transformer depth $L$   & 12 \\
-    Attention heads $N_h$   & 12 \\
-    MLP expansion ratio     & 4 \\
-    Time embedding dim      & 32 \\
-    Flow time distribution  & Beta(1.5, 1.0) \\
-    Inference steps         & 10 (Euler) \\
-    Replanning interval     & 5 steps \\
-    \midrule
-    Optimizer               & AdamW \\
-    Learning rate           & $10^{-4}$ \\
-    LR schedule             & Linear warmup + cosine decay \\
-    Warmup steps            & 2{,}000 \\
-    Batch size              & 32 \\
-    Gradient clipping       & 1.0 \\
-    Training iterations     & $10^{6}$ \\
-    Boundary loss weight $\lambda$ & 0.1 \\
-    \bottomrule
-  \end{tabular}
-\end{table}
+where $\lambda$ is the boundary auxiliary loss weight (default $0.1$). When adaptive
+chunking is disabled, all $w_\tau \equiv 1$ and the boundary head is removed, recovering
+the standard uniform-MSE objective and guaranteeing backward compatibility with the
+baseline.

@@ -1,93 +1,47 @@
-# 3. 方法
+# 自适应动作分块 (Adaptive Action Chunking)
 
-## 3.1 整体框架
+## 动机
 
-我们提出 **SimVLA**，一种面向机器人操作任务的视觉-语言-动作（Vision-Language-Action, VLA）模型。给定自然语言指令和多相机观测图像，SimVLA 以端到端方式预测一段未来动作序列（action chunk）。模型由三个核心组件构成：（1）用于视觉与语言联合理解的 VLM 骨干网络；（2）以 VLM 特征为条件、基于扩散风格的动作变换器；（3）以流匹配（Flow Matching）为基础的训练目标，实现高质量、高效率的动作生成。
+标准流匹配（Flow Matching）目标对动作序列中的每一步施加均匀的均方误差（MSE）损失，隐含假设序列内所有时刻同等重要。然而在机器人操作中，关键运动时刻（如发生接触、运动方向翻转）往往集中在序列的少数几步上；对这些步施加与平稳步相同的权重，会使模型在精细控制阶段学习不足。为此，我们提出**自适应动作分块**（Adaptive Action Chunking），依据真实动作的逐步变化率对流匹配损失进行重加权，并引入一个辅助边界预测头，使模型显式感知动作序列内部的转折结构。该模块为可选项；关闭时即退化为标准均匀 MSE 目标，与原始训练完全兼容。
 
----
+## 预备记号
 
-## 3.2 视觉-语言骨干网络
+设归一化后的真实动作序列为 $\mathbf{a} \in \mathbb{R}^{T_a \times d_a}$，其中 $T_a$ 为动作步数、$d_a$ 为单步动作维度。在条件流匹配框架下，模型预测速度场 $\hat{\mathbf{v}}_\tau$，回归目标为 $\mathbf{u}_{t,\tau} = \boldsymbol{\epsilon}_\tau - \mathbf{a}_\tau$，基线损失为均匀加权的均方误差。本文的创新在于对该损失的逐步加权及辅助边界监督。
 
-我们采用 **SmolVLM-500M-Instruct** 作为视觉-语言骨干网络。该模型将最多 $V=3$ 路相机图像与自然语言任务指令联合编码。每张图像首先经双三次插值缩放至 $512 \times 512$ 像素，再以 ImageNet 统计量进行归一化（$\mu = [0.485, 0.456, 0.406]$，$\sigma = [0.229, 0.224, 0.225]$）。多视角图像在序列维度拼接后送入模型，输出统一的视觉-语言特征序列 $\mathbf{z} \in \mathbb{R}^{T_\text{vlm} \times d_\text{vlm}}$，其中 $d_\text{vlm} = 576$。
+## 逐步变化率加权
 
-训练初期（前 $10^3$ 步），骨干网络参数保持冻结，待动作头建立稳定梯度后再开放联合微调。
+我们以相邻动作步之间的 L2 距离度量动作的"变化剧烈程度"。逐步变化率定义为：
 
----
+$$c_\tau = \|\mathbf{a}_{\tau+1} - \mathbf{a}_\tau\|_2, \quad \tau = 1, \ldots, T_a - 1, \qquad c_{T_a} = 0$$
 
-## 3.3 动作变换器
+即对长度为 $T_a$ 的序列计算 $T_a - 1$ 个相邻差的范数，并对末步以 $0$ 填充，使变化率长度与动作序列对齐。随后对每个样本以其自身最大值进行归一化：
 
-动作变换器接收加噪动作序列、机器人本体感受状态以及 VLM 条件特征，预测去噪速度场，遵循流匹配范式。
+$$\tilde{c}_\tau = \frac{c_\tau}{\max_{\tau'} c_{\tau'} + \varepsilon}, \quad \varepsilon = 10^{-6}, \qquad \tilde{c}_\tau \in [0, 1]$$
 
-**输入编码。** 在每个去噪步，令 $\mathbf{x}_t \in \mathbb{R}^{T_a \times d_a}$ 为带噪动作序列，其中 $T_a = 10$ 为预测的动作步数，$d_a = 7$ 为 LIBERO 关节空间动作维度（末端执行器 $\Delta x, \Delta y, \Delta z, \Delta\text{roll}, \Delta\text{pitch}, \Delta\text{yaw}$ 及夹爪指令）。本体感受状态 $\mathbf{s} \in \mathbb{R}^{d_s}$（$d_s = 8$：末端位置、姿态、夹爪状态）和正弦时间嵌入 $\mathbf{e}_t \in \mathbb{R}^{32}$ 沿动作序列维度平铺后与 $\mathbf{x}_t$ 拼接，经线性投影得到初始隐表示：
+归一化后的变化率映射为逐步损失权重：
 
-$$\mathbf{h}_0 = \text{Linear}([\mathbf{x}_t \| \tilde{\mathbf{s}} \| \tilde{\mathbf{e}}_t]) \in \mathbb{R}^{T_a \times d_h}$$
+$$w_\tau = 0.5 + \tilde{c}_\tau \in [0.5,\, 1.5]$$
 
-其中 $d_h = 768$ 为变换器隐层维度，$[\cdot\|\cdot]$ 表示通道维拼接。
+变化最剧烈的步获得最高权重 $1.5$，平稳步（含填充末步）获得最低权重 $0.5$。加权后的流匹配损失为（权重作用于逐步平方误差）：
 
-**VLM 条件融合。** VLM 输出 $\mathbf{z}$ 经线性层投影至 $d_h$ 维后追加至动作 token 序列，形成长度为 $T_a + T_\text{vlm}$ 的联合序列：
+$$\mathcal{L}_\text{vel} = \mathbb{E}_{t,\boldsymbol{\epsilon}} \left[ \frac{1}{T_a} \sum_{\tau=1}^{T_a} w_\tau \,\bigl\|\hat{\mathbf{v}}_\tau - \mathbf{u}_{t,\tau}\bigr\|_2^2 \right]$$
 
-$$\mathbf{H} = [\mathbf{h}_0 \| \mathbf{W}_z \mathbf{z}] + \mathbf{E}_\text{pos}$$
+## 边界预测头
 
-其中 $\mathbf{E}_\text{pos}$ 为可学习位置嵌入。
+为使模型显式建模动作序列内部的转折结构，我们在动作特征上附加一个轻量的**边界预测头**（Chunk Boundary Head）。设变换器最后一层归一化后输出的逐步动作特征为 $\mathbf{f}_\tau \in \mathbb{R}^{d_h}$（即用于解码速度场的同一特征），边界头为两层 MLP：
 
-**变换器主干。** $\mathbf{H}$ 经 $L = 12$ 个标准 Pre-LayerNorm 变换器块处理，每块包含 $N_h = 12$ 个注意力头（头维度 64）、MLP 扩展比 4（$d_\text{mlp} = 3072$）、GELU 激活函数及 Dropout（0.1）。最终取前 $T_a$ 个动作位置的输出，经线性映射层得到速度预测 $\hat{\mathbf{v}} \in \mathbb{R}^{T_a \times d_a}$。
+$$\hat{r}_\tau = \mathbf{W}_2\,\operatorname{SiLU}(\mathbf{W}_1 \mathbf{f}_\tau), \quad \mathbf{W}_1 \in \mathbb{R}^{(d_h/2) \times d_h},\ \mathbf{W}_2 \in \mathbb{R}^{1 \times (d_h/2)}$$
 
----
+其输出层权重与偏置零初始化，使边界预测在训练初期保持中性。边界头以 stop-gradient 的归一化变化率 $\tilde{c}_\tau$ 为回归目标：
 
-## 3.4 流匹配训练目标
+$$\mathcal{L}_\text{bnd} = \frac{1}{T_a}\sum_{\tau=1}^{T_a} \bigl(\hat{r}_\tau - \operatorname{sg}(\tilde{c}_\tau)\bigr)^2$$
 
-我们采用**条件流匹配**（Conditional Flow Matching, CFM）框架训练动作变换器。给定归一化后的真实动作序列 $\mathbf{a} \in \mathbb{R}^{T_a \times d_a}$ 及高斯噪声 $\boldsymbol{\epsilon} \sim \mathcal{N}(\mathbf{0}, \mathbf{I})$，定义线性插值：
+其中 $\operatorname{sg}(\cdot)$ 为 stop-gradient 算子，确保边界监督不反向影响变化率本身。
 
-$$\mathbf{x}_t = t\,\boldsymbol{\epsilon} + (1-t)\,\mathbf{a}, \quad t \sim \text{Beta}(1.5,\; 1.0)$$
+## 总目标
 
-其中 $t$ 截断至 $[0.001, 0.999]$。回归目标（速度场）为：
+总训练损失为加权流匹配损失与边界辅助损失之和：
 
-$$\mathbf{u}_t = \boldsymbol{\epsilon} - \mathbf{a}$$
+$$\mathcal{L} = \mathcal{L}_\text{vel} + \lambda\, \mathcal{L}_\text{bnd}, \qquad \lambda = 0.1$$
 
-训练损失为预测速度与目标速度的均方误差：
-
-$$\mathcal{L}_\text{flow} = \mathbb{E}_{t,\boldsymbol{\epsilon}} \left\| \hat{\mathbf{v}}(\mathbf{x}_t, t, \mathbf{z}, \mathbf{s}) - \mathbf{u}_t \right\|_2^2$$
-
-**动作归一化。** 训练前，所有动作维度以数据集统计量进行 Z-score 归一化：
-
-$$\mathbf{a}_\text{norm} = \frac{\mathbf{a} - \boldsymbol{\mu}}{\boldsymbol{\sigma} + \epsilon}, \quad \epsilon = 10^{-6}$$
-
-本体感受状态采用相同方式归一化。
-
----
-
-## 3.5 自适应动作分块（可选）
-
-为使模型在关键运动时刻（如接触、方向翻转）投入更多学习资源，我们提出**自适应动作分块**（Adaptive Action Chunking），以每步动作变化率对流匹配损失进行重加权。对于真实动作序列 $\mathbf{a} \in \mathbb{R}^{T_a \times d_a}$，计算归一化的逐步变化率：
-
-$$r_\tau = \frac{\|\mathbf{a}_{\tau+1} - \mathbf{a}_\tau\|_2}{\max_{\tau'}\|\mathbf{a}_{\tau'+1} - \mathbf{a}_{\tau'}\|_2}, \quad \tau = 1, \ldots, T_a - 1$$
-
-各步的损失权重定义为 $w_\tau = 0.5 + r_\tau \in [0.5, 1.5]$，加权流匹配损失为：
-
-$$\mathcal{L}_\text{flow}^* = \mathbb{E}_{t,\boldsymbol{\epsilon}} \left\| \sqrt{w_\tau}\left(\hat{\mathbf{v}}_\tau - \mathbf{u}_{t,\tau}\right) \right\|_2^2$$
-
-此外，我们引入辅助**动作边界预测头**——一个作用于动作特征的两层 MLP（$d_h \to d_h/2 \to 1$，SiLU 激活，输出层零初始化），对 stop-gradient 的变化率 $r_\tau$ 进行回归：
-
-$$\mathcal{L}_\text{boundary} = \text{MSE}(\hat{r}_\tau,\; r_\tau^\text{stop-grad})$$
-
-总训练损失为：
-
-$$\mathcal{L} = \mathcal{L}_\text{flow}^* + \lambda\,\mathcal{L}_\text{boundary}, \quad \lambda = 0.1$$
-
-关闭此选项时退化为标准均匀 MSE 目标，与原始设置完全兼容。
-
----
-
-## 3.6 推理
-
-推理阶段，通过 10 步欧拉积分求解学习到的流 ODE 生成动作。从 $\mathbf{x}_1 \sim \mathcal{N}(\mathbf{0}, \mathbf{I})$ 出发：
-
-$$\mathbf{x}_{t - \Delta t} = \mathbf{x}_t + \Delta t \cdot \hat{\mathbf{v}}(\mathbf{x}_t, t, \mathbf{z}, \mathbf{s}), \quad \Delta t = \frac{1}{10}$$
-
-最终 $\mathbf{x}_0$ 经数据集统计量反归一化，得到最终动作序列，以每 5 步重规划一次的频率发送至机器人控制器。
-
----
-
-## 3.7 训练细节
-
-我们使用 **AdamW** 优化器（$\beta_1 = 0.9$，$\beta_2 = 0.95$，权重衰减为 0，梯度裁剪阈值为 1.0）。学习率在前 2,000 步线性预热至 $10^{-4}$，之后余弦衰减至 $10^{-5}$。批大小为 32，使用 HuggingFace Accelerate 进行多卡分布式训练，最长训练 $10^6$ 步，每 $5 \times 10^4$ 步保存一次检查点。
+其中 $\lambda$ 为边界辅助损失权重（默认 $0.1$）。当关闭自适应分块时，所有 $w_\tau \equiv 1$ 且移除边界头，目标退化为标准均匀 MSE，保证与基线设置的向后兼容性。
