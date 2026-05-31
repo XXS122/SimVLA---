@@ -12,17 +12,17 @@ Let $\mathbf{a} \in \mathbb{R}^{T_a \times d_a}$ denote the normalized ground-tr
 
 We measure how abruptly the action evolves by the L2 distance between consecutive action steps. The per-step change rate is defined as:
 
-$$c_\tau = \|\mathbf{a}_{\tau+1} - \mathbf{a}_\tau\|_2, \quad \tau = 1, \ldots, T_a - 1, \qquad c_{T_a} = 0$$
+$$c_\tau = \begin{cases} \|\mathbf{a}_2 - \mathbf{a}_1\|_2, & \tau = 1,\\ \|\mathbf{a}_\tau - \mathbf{a}_{\tau-1}\|_2, & \tau = 2, \ldots, T_a, \end{cases}$$
 
-That is, we compute the norm of the $T_a - 1$ consecutive differences over a chunk of length $T_a$ and zero-pad the last step so that the change rate aligns with the action sequence length. The change rate is then normalized per sample by its own maximum:
+That is, we take the L2 norm of the $T_a - 1$ consecutive (backward) differences over a chunk of length $T_a$ and prepend a copy of the first difference so that the change rate aligns with the action sequence length (for a chunk of length $T_a = 1$ the change rate degenerates to all zeros). The change rate is then normalized per sample by its own maximum:
 
-$$\tilde{c}_\tau = \frac{c_\tau}{\max_{\tau'} c_{\tau'} + \varepsilon}, \quad \varepsilon = 10^{-6}, \qquad \tilde{c}_\tau \in [0, 1]$$
+$$\tilde{c}_\tau = \frac{c_\tau}{\max\!\bigl(\max_{\tau'} c_{\tau'},\ \varepsilon\bigr)}, \quad \varepsilon = 10^{-6}, \qquad \tilde{c}_\tau \in [0, 1]$$
 
 The normalized change rate is mapped to per-step loss weights:
 
 $$w_\tau = 0.5 + \tilde{c}_\tau \in [0.5,\, 1.5]$$
 
-The most rapidly changing step receives the highest weight $1.5$, while quasi-static steps (including the padded last step) receive the lowest weight $0.5$. The reweighted flow-matching loss applies the weight to the per-step squared error:
+The most rapidly changing step receives the highest weight $1.5$, while the smoothest step receives the lowest weight $0.5$. The reweighted flow-matching loss applies the weight to the per-step squared error:
 
 $$\mathcal{L}_\text{vel} = \mathbb{E}_{t,\boldsymbol{\epsilon}} \left[ \frac{1}{T_a} \sum_{\tau=1}^{T_a} w_\tau \,\bigl\|\hat{\mathbf{v}}_\tau - \mathbf{u}_{t,\tau}\bigr\|_2^2 \right]$$
 

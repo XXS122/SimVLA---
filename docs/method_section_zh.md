@@ -12,17 +12,17 @@
 
 我们以相邻动作步之间的 L2 距离度量动作的"变化剧烈程度"。逐步变化率定义为：
 
-$$c_\tau = \|\mathbf{a}_{\tau+1} - \mathbf{a}_\tau\|_2, \quad \tau = 1, \ldots, T_a - 1, \qquad c_{T_a} = 0$$
+$$c_\tau = \begin{cases} \|\mathbf{a}_2 - \mathbf{a}_1\|_2, & \tau = 1,\\[2pt] \|\mathbf{a}_\tau - \mathbf{a}_{\tau-1}\|_2, & \tau = 2, \ldots, T_a, \end{cases}$$
 
-即对长度为 $T_a$ 的序列计算 $T_a - 1$ 个相邻差的范数，并对末步以 $0$ 填充，使变化率长度与动作序列对齐。随后对每个样本以其自身最大值进行归一化：
+即对长度为 $T_a$ 的序列计算 $T_a - 1$ 个相邻步的后向差分 L2 范数，并将首步以第一个差分值复制填充，使变化率长度与动作序列对齐（当 $T_a = 1$ 时变化率退化为全 $0$）。随后对每个样本以其自身最大值进行归一化：
 
-$$\tilde{c}_\tau = \frac{c_\tau}{\max_{\tau'} c_{\tau'} + \varepsilon}, \quad \varepsilon = 10^{-6}, \qquad \tilde{c}_\tau \in [0, 1]$$
+$$\tilde{c}_\tau = \frac{c_\tau}{\max\!\bigl(\max_{\tau'} c_{\tau'},\ \varepsilon\bigr)}, \quad \varepsilon = 10^{-6}, \qquad \tilde{c}_\tau \in [0, 1]$$
 
 归一化后的变化率映射为逐步损失权重：
 
 $$w_\tau = 0.5 + \tilde{c}_\tau \in [0.5,\, 1.5]$$
 
-变化最剧烈的步获得最高权重 $1.5$，平稳步（含填充末步）获得最低权重 $0.5$。加权后的流匹配损失为（权重作用于逐步平方误差）：
+变化最剧烈的步获得最高权重 $1.5$，变化最平缓的步获得最低权重 $0.5$。加权后的流匹配损失为（权重作用于逐步平方误差）：
 
 $$\mathcal{L}_\text{vel} = \mathbb{E}_{t,\boldsymbol{\epsilon}} \left[ \frac{1}{T_a} \sum_{\tau=1}^{T_a} w_\tau \,\bigl\|\hat{\mathbf{v}}_\tau - \mathbf{u}_{t,\tau}\bigr\|_2^2 \right]$$
 
