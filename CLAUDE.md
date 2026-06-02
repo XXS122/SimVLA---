@@ -2,149 +2,160 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Overview
+## Project Overview
 
-SimVLA is a Vision-Language-Action (VLA) policy for robot manipulation. It pairs a
-**SmolVLM-500M-Instruct** vision-language backbone with a **flow-matching action
-transformer** head. The only fully wired-up dataset/benchmark is **LIBERO**.
+SimVLA is a Vision-Language-Action (VLA) baseline for robotic manipulation, built on top of HuggingFace's SmolVLM-500M-Instruct vision-language model with a diffusion/flow-matching style action transformer head.
 
-## Environment
-
-Two separate conda environments are used (they are incompatible — different PyTorch/CUDA):
-
-- `simvla` (python 3.10): training, the norm-stats/meta scripts, and the policy server.
-  Requires `transformers>=4.57.0` and `flash-attn==2.5.6`. See `readme.md` for the full
-  `pip install` line (`requirements.txt` is intentionally minimal and not sufficient on its own).
-- `libero` (python 3.8.13): only for running evaluation rollouts. Needs the
-  [LIBERO repo](https://github.com/Lifelong-Robot-Learning/LIBERO) installed plus
-  `openpi_client`. See `evaluation/libero/README.md`.
-
-There is no test suite, linter config, or packaging (`setup.py`/`pyproject.toml`) in this repo.
-
-## Common Commands
-
-End-to-end LIBERO workflow (run from repo root in the `simvla` env). The two `.sh` scripts
-auto-run steps 1–2 if their output files are missing, so usually you just run the script.
+## Installation
 
 ```bash
-# 1. Build training metadata (scans HDF5 files -> JSON)
-python create_libero_meta.py \
-    --data_dir ./datasets/metas \
-    --subsets libero_10 libero_goal libero_object libero_spatial \
-    --output ./datasets/metas/libero_train.json
-
-# 2. Compute action/state normalization stats
-python compute_libero_norm_stats.py \
-    --data_dir ./datasets/metas \
-    --subsets libero_10 libero_goal libero_object libero_spatial \
-    --output ./norm_stats/libero_norm.json
-
-# 3. Train (multi-GPU via accelerate). Args: BATCH_SIZE LEARNING_COEF OUTPUT_DIR [RESUME_CKPT]
-bash train_smolvlm_small.sh        # hidden=768,  depth=12, heads=12
-bash train_smolvlm_large.sh        # hidden=1024, depth=24, heads=16
-
-# Train directly (single config) — see train_smolvlm.py for all flags
-accelerate launch --num_processes=4 --mixed_precision bf16 train_smolvlm.py \
-    --train_metas_path ./datasets/metas/libero_train.json \
-    --norm_stats_path ./norm_stats/libero_norm.json \
-    --action_mode libero_joint --num_actions 10 --output_dir ./runs/exp
+conda create -n simvla python=3.11
+conda activate simvla
+pip install torch torchvision
+pip install transformers>=4.57.0
+pip install flash-attn==2.5.6 --no-build-isolation
+pip install -r requirements.txt
 ```
 
-Serving + evaluation:
+## Key Commands
+
+### Local Machine Configuration (`paths.env`)
+
+Machine-specific paths, GPU config, and secrets live in a **git-ignored** `paths.env`
+(copy from `paths.env.example`). `source paths.env` before training/eval; the scripts
+read these with fallbacks to the previous hard-coded defaults:
 
 ```bash
-# Start policy server (simvla env). --checkpoint is an HF repo or a local ckpt-XXXX dir.
-cd evaluation/libero
-python serve_smolvlm_libero.py --checkpoint <repo_or_ckpt_dir> \
-    --norm_stats ../../norm_stats/libero_norm.json --port 8102
+cp paths.env.example paths.env   # then fill in real values
+source paths.env
+```
 
-# Run rollouts (libero env, separate terminal). Args: PORT NUM_TRIALS OUT_PREFIX "GPUs"
-bash run_eval_all.sh 8102 50 "eval_simvla" "0 1 2 3"
+| Variable | Used for |
+|----------|----------|
+| `SIMVLA_SMOLVLM_MODEL` | SmolVLM backbone path (train scripts, serve, `train_smolvlm.py` default) |
+| `LIBERO_DATASETS` | LIBERO data root (`--data_dir` for metadata/norm-stats) |
+| `SIMVLA_CHECKPOINTS` | Default training output dir / serve `--checkpoint` |
+| `SIMVLA_RESUME_CKPT` | Default resume checkpoint |
+| `CUDA_DEVICES` / `NUM_GPUS` | GPU ids + `accelerate --num_processes` (single-GPU capable) |
+| `WANDB_API_KEY` / `WANDB_PROJECT` | WandB tracking |
+
+`paths.env` is in `.gitignore` (it holds `WANDB_API_KEY`) — never commit it.
+
+### Data Preparation (LIBERO)
+```bash
+# Create training metadata
+python create_libero_meta.py \
+  --data_dir ./datasets/metas \
+  --subsets libero_10 libero_goal libero_object libero_spatial \
+  --output ./datasets/metas/libero_train.json
+
+# Compute normalization statistics
+python compute_libero_norm_stats.py \
+  --data_dir ./datasets/metas \
+  --subsets libero_10 libero_goal libero_object libero_spatial \
+  --output ./norm_stats/libero_norm.json
+```
+
+### Training
+```bash
+source paths.env   # loads paths, GPU config, WANDB_API_KEY
+
+# Small model (768 hidden, 12 layers, 12 heads, 384x384 images)
+bash train_smolvlm_small.sh [batch_size] [learning_coef] [output_dir] [resume_ckpt]
+
+# Large model (1024 hidden, 24 layers, 16 heads)
+bash train_smolvlm_large.sh [batch_size] [learning_coef] [output_dir] [resume_ckpt]
+
+# Enable Adaptive Action Chunking (change-rate-weighted loss + boundary head)
+USE_ADAPTIVE_CHUNKING=true CHUNK_LOSS_WEIGHT=0.1 bash train_smolvlm_small.sh
+
+# Direct training script invocation
+python train_smolvlm.py --help
+```
+
+Training logs are saved for later review:
+- Full console output → `OUTPUT_DIR/train_console_<timestamp>.log` (tee'd by the shell script)
+- Structured logger → `OUTPUT_DIR/train_smolvlm_<timestamp>.log` (per-run, not clobbered)
+- WandB: auto-enabled when `WANDB_API_KEY` is set; the log prints whether it is active
+
+### Evaluation (LIBERO)
+```bash
+source paths.env
+
+# Start inference server (checkpoint/backbone default to env vars if set)
+CUDA_VISIBLE_DEVICES=0 python evaluation/libero/serve_smolvlm_libero.py \
+  --checkpoint YuankaiLuo/SimVLA-LIBERO \
+  --norm_stats ./norm_stats/libero_norm.json \
+  --port 8102
+
+# Run evaluation
+bash evaluation/libero/run_eval_all.sh [port] [num_episodes] [run_name] [seeds]
 ```
 
 ## Architecture
 
-### Model (`models/`)
+### Model Stack (`models/`)
 
-`SmolVLMVLA` (`modeling_smolvlm_vla.py`) is a HuggingFace `PreTrainedModel` composed of three parts:
+**`modeling_smolvlm_vla.py`** — `SmolVLMVLA` (main model class)
+- Wraps HuggingFace `SmolVLMForConditionalGeneration` as the vision-language backbone
+- Attaches a `SmolVLMActionTransformer` action head
+- Extracts VLM hidden states as conditioning for the action head
+- `SmolVLMVLAConfig` controls both the VLM backbone and the action transformer dimensions
 
-1. **VLM backbone** (`self.vlm`): SmolVLM-500M-Instruct, loaded in float32. Frozen for the
-   first `freeze_steps`, then trained at `learning_rate * learning_coef`.
-2. **Action head** (`self.transformer`): `SmolVLMActionTransformer` (`transformer_smolvlm.py`),
-   a flow-matching velocity predictor.
-3. **Action space** (`self.action_space`): handles normalization + loss, built from a registry
-   (`action_hub.py`).
+**`transformer_smolvlm.py`** — `SmolVLMActionTransformer`
+- DiT-style (Diffusion Transformer) action decoder with timestep and conditioning embeddings
+- Components: `TransformerBlock`, `DiTBlock`, `FinalLayer`, `Attention`, `Mlp`
+- Used for flow-matching / diffusion-based action prediction
+- Optional `ChunkBoundaryHead` (when `use_adaptive_chunking=True`): predicts a per-step
+  boundary score from action features; `forward(..., return_boundary=True)` returns
+  `(velocity, boundary_logits)`
 
-**Flow matching** is the core training objective (`forward`): sample `t ~ Beta(1.5,1)`, interpolate
-`x_t = t·noise + (1-t)·action`, and regress the model output toward the velocity `u_t = noise - action`
-with MSE. Inference (`generate_actions`) is Euler integration from `t=1` to `t=0`, then
-`action_space.postprocess` un-normalizes.
+**Adaptive Action Chunking** (opt-in training innovation, off by default)
+- Config flags: `use_adaptive_chunking`, `chunk_loss_weight` (also `--use_adaptive_chunking`
+  / `--chunk_loss_weight` CLI; `USE_ADAPTIVE_CHUNKING` / `CHUNK_LOSS_WEIGHT` shell env)
+- In `SmolVLMVLA.forward` the flow-matching loss is weighted per-step by the ground-truth
+  action change rate (`||a[t+1]-a[t]||` → weights in `[0.5, 1.5]`), concentrating learning
+  on contact / direction-reversal moments; the boundary head regresses the (detached)
+  normalized change rate as an auxiliary loss
+- Setting the flag off recovers the exact original uniform-MSE objective (backward compatible)
+- Design notes / experiments: `docs/method_section_draft.md`, `docs/experiment_design.md`
 
-**VLM feature extraction has two methods — know which one runs.** Training and inference both call
-`forward_vlm_efficient`, which manually runs `vision_model → connector → concat with text embeddings →
-text_model` (the Idefics3 LM) to get *fused* vision-language features. The other method, `forward_vlm`,
-uses the SmolVLM chat template and is **not** on the train/inference path.
+**`action_hub.py`** — Action space registry
+- `BaseActionSpace` abstract class; subclasses define observation/action dimensions
+- `LiberoJointActionSpace` handles the 7-DoF arm + gripper used in LIBERO
+- Register custom action spaces via `ActionSpaceRegistry`
 
-**Two action-transformer modes** (toggle with `--use_adaln`, baked into the checkpoint and not
-changeable on resume):
-- **Concat mode** (default, `use_adaln=False`): projected VLM features are concatenated to the action
-  token sequence; action tokens carry `[action, proprio, time]`.
-- **AdaLN/DiT mode** (`use_adaln=True`): time + mean-pooled VLM + proprio are fused into one condition
-  vector injected via Adaptive LayerNorm (`DiTBlock`/`FinalLayer`).
+**`processing_smolvlm_vla.py`** — `SmolVLMVLAProcessor`
+- Extends SmolVLM's tokenizer/processor with action/proprio normalization and denormalization
+- Normalization stats are loaded from a JSON file (e.g., `norm_stats/libero_norm.json`)
 
-### Training loop (`train_smolvlm.py`)
+**`configuration_smolvlm_vla.py`** — `SmolVLMVLAConfig`
+- HuggingFace-compatible config; controls `action_hidden_size`, `action_depth`, `action_num_heads`, `action_dim`, `proprio_dim`
 
-- Uses 🤗 `accelerate` (bf16, DDP with `find_unused_parameters=True` because the VLM is partially
-  frozen early).
-- Optimizer (`build_optimizer`) has **three param groups** — `vlm`, `transformer_core`, `action_heads` —
-  with independent LR schedules (`update_group_lrs`): action heads train from step 0; VLM + core are
-  frozen (lr=0) until `freeze_steps`. Cosine decay is off by default.
-- Checkpoints are written to `OUTPUT_DIR/ckpt-{step}/` containing `model.safetensors` + `state.json`
-  (`state.json` holds `global_step` for `--resume`).
+### Dataset Stack (`datasets/`)
 
-### Data pipeline (`datasets/`)
+**`dataset_smolvlm.py`** — `SmolVLMDataReader` / `SmolVLMDataReaderWithPadding`
+- `IterableDataset` implementations that stream episodes from HDF5 files
+- Multi-view image support (default 3 views); configurable image size (384×384 or 512×512)
+- ImageNet normalization applied to images
 
-- `create_smolvlm_dataloader` → `SmolVLMDataReader`, an **infinite `IterableDataset`** (re-iterates
-  forever in training; the training loop stops by step count, not epoch).
-- Per-dataset decoding is delegated to **domain handlers** looked up by name in
-  `domain_handler/registry.py`. The handler is selected by the meta file's `dataset_name`
-  (`"libero_hdf5"` for LIBERO).
-- `LiberoHDF5Handler` reads LIBERO HDF5 directly. Important transforms it applies:
-  proprio orientation is converted **euler → axis-angle**, and both camera images are **rotated 180°**.
-- Sampling across multiple datasets is weighted by `domain_config.DATA_WEIGHTS`.
+**`domain_handler/`** — Plugin system for different dataset formats
+- `base.py` defines the `BaseDomainHandler` interface
+- `registry.py` provides handler lookup
+- `libero_hdf5.py` implements loading from LIBERO HDF5 files
 
-### Action spaces (`models/action_hub.py`)
+### Training (`train_smolvlm.py`)
+- Uses HuggingFace `Accelerate` for multi-GPU distributed training
+- Optional WandB integration
+- Supports checkpoint resumption via `--resume_from_checkpoint`
 
-Registry pattern via `@register_action(name)` + `build_action_space(name)`. **Only `libero_joint` is
-registered** — 7-dim action `[Δxyz, Δeuler, gripper]`, 8-dim proprio `[ee_pos, axis_angle, gripper(2)]`.
-Z-score normalization by default; quantile (`q01/q99`) normalization is available but off.
+## Data Flow
 
-### Processor (`models/processing_smolvlm_vla.py`)
+1. HDF5 episode files → `libero_hdf5.py` → raw observations/actions
+2. Raw data → `SmolVLMDataReader` → tokenized inputs + normalized actions
+3. Tokenized batch → `SmolVLMVLA.forward()` → VLM hidden states → action transformer → predicted actions
+4. Actions denormalized by `SmolVLMVLAProcessor` before sending to the robot
 
-`SmolVLMVLAProcessor` does *not* subclass `ProcessorMixin` (deliberately, to avoid tokenizer type
-checks). `encode_image` is a fast torch-based path; `encode_image_legacy` uses the HF image processor
-and is kept only for compatibility checks.
+## HuggingFace Compatibility
 
-### Serving (`evaluation/libero/`)
-
-Two independent inference interfaces exist:
-- `serve_smolvlm_libero.py` — a **WebSocket** server (msgpack_numpy) used for LIBERO eval. This is the
-  one the eval scripts talk to.
-- `SmolVLMVLA.run()` — a built-in **FastAPI `/act`** endpoint (separate, JSON-based), not used by the
-  LIBERO eval flow.
-
-## Gotchas
-
-- **`action_mode` default is `galaxea_joint`** in `train_smolvlm.py` and the config, but that space is
-  **not registered** — always pass `--action_mode libero_joint` (the `.sh` scripts already do).
-- **Image size is 384**, not 512. Many docstrings/comments say "512x512 (SmolVLM requirement)" but every
-  default and the training scripts use `image_size=384`. Trust the code, not the comments.
-- `image_size`, `use_adaln`, and the action-transformer dims are fixed at checkpoint creation; resuming
-  warns and ignores attempts to change `use_adaln`.
-- Both LIBERO camera views are rotated 180° during data loading (`libero_hdf5.py`) **and** the eval
-  client rotates images 180° — keep these consistent if you touch one.
-
-## Git
-
-Develop on branch `claude/gallant-wright-bV8c5`. Do not push to other branches without explicit
-permission, and do not open PRs unless asked.
+All model classes follow standard HuggingFace patterns (`PreTrainedModel`, `PretrainedConfig`, `ProcessorMixin`), so the model can be loaded with `from_pretrained` and pushed to the Hub with `push_to_hub`.

@@ -84,7 +84,11 @@ class SmolVLMVLA(PreTrainedModel):
 
         # DiT/AdaLN mode setting
         self.use_adaln = getattr(config, 'use_adaln', False)
-        
+
+        # Adaptive action chunking
+        self.use_adaptive_chunking = getattr(config, 'use_adaptive_chunking', False)
+        self.chunk_loss_weight = getattr(config, 'chunk_loss_weight', 0.1)
+
         # Flow matching action head (SmolVLM version - no aux_visual)
         self.transformer = SmolVLMActionTransformer(
             hidden_size=config.hidden_size,
@@ -97,6 +101,7 @@ class SmolVLMVLA(PreTrainedModel):
             dim_time=config.dim_time,
             max_len_seq=config.max_len_seq,
             use_adaln=self.use_adaln,
+            use_adaptive_chunking=self.use_adaptive_chunking,
         )
         
         if self.use_adaln:
@@ -370,17 +375,60 @@ class SmolVLMVLA(PreTrainedModel):
         x_t = t_expanded * noise + (1 - t_expanded) * action_norm
         u_t = noise - action_norm
 
-        # Model prediction (no aux_visual_inputs for SmolVLM)
+        if self.use_adaptive_chunking:
+            # Compute per-step change-rate weights from ground-truth actions.
+            # delta[b, t] = ||a[t+1] - a[t]|| measures how abruptly the
+            # trajectory changes at each timestep.  High-change moments
+            # (contact, direction reversal) get larger weights so the model is
+            # penalised more for errors there; smooth free-space motion gets
+            # smaller weights.
+            # Shape progression: [B,T,D] -> [B,T-1] -> [B,T]
+            T = action_norm.shape[1]
+            if T >= 2:
+                delta = action_norm[:, 1:] - action_norm[:, :-1]      # [B, T-1, D]
+                change_rate = delta.norm(dim=-1)                       # [B, T-1]
+                # Prepend the first step's rate so length == T
+                change_rate = torch.cat([change_rate[:, :1], change_rate], dim=1)  # [B, T]
+            else:
+                # Chunk of length 1: no notion of change rate, fall back to flat.
+                change_rate = torch.zeros_like(action_norm[..., 0])    # [B, T]
+            # Normalise per sample to [0, 1] (normalized_rate), then shift to
+            # [0.5, 1.5] so the minimum weight is 0.5 (never fully ignored)
+            # and the max is 1.5.
+            rate_max = change_rate.amax(dim=1, keepdim=True).clamp(min=1e-6)
+            normalized_rate = change_rate / rate_max                   # [B, T] in [0,1]
+            step_weights = 0.5 + normalized_rate                       # [B, T] in [0.5,1.5]
+
+            v_t, boundary_logits = self.transformer(
+                vlm_features=enc["vlm_features"],
+                action_with_noise=x_t,
+                t=t,
+                proprio=proprio_norm,
+                return_boundary=True,
+            )
+
+            # Change-rate-weighted velocity loss
+            sq_err = torch.square(v_t - u_t)                           # [B, T, D]
+            velocity_loss = (step_weights.unsqueeze(-1) * sq_err).mean()
+
+            # Boundary head regresses the (detached) normalised change rate so
+            # gradient only flows through the head, not the target.
+            boundary_loss = torch.nn.functional.mse_loss(
+                boundary_logits, normalized_rate.detach()
+            )
+            return {
+                "velocity_loss": velocity_loss,
+                "boundary_loss": self.chunk_loss_weight * boundary_loss,
+            }
+
+        # ----- Default path: uniform flow-matching loss -----
         v_t = self.transformer(
             vlm_features=enc["vlm_features"],
             action_with_noise=x_t,
             t=t,
             proprio=proprio_norm,
         )
-        
-        # MSE loss
         velocity_loss = torch.mean(torch.square(v_t - u_t))
-        
         return {"velocity_loss": velocity_loss}
 
     # ================================= inference =================================

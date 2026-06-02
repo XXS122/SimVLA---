@@ -14,30 +14,35 @@ set -e
 
 BATCH_SIZE=${1:-64}
 LEARNING_COEF=${2:-0.1}
-OUTPUT_DIR=${3:-./runs/simvla_libero_small}
-RESUME_CKPT=${4:-""}
+# Default output dir falls back to $SIMVLA_CHECKPOINTS (from paths.env) if set
+OUTPUT_DIR=${3:-${SIMVLA_CHECKPOINTS:-./runs/simvla_libero_small}}
+# Default resume checkpoint falls back to $SIMVLA_RESUME_CKPT (from paths.env)
+RESUME_CKPT=${4:-${SIMVLA_RESUME_CKPT:-""}}
+
+# GPU configuration (read from paths.env: CUDA_DEVICES / NUM_GPUS)
+export CUDA_VISIBLE_DEVICES=${CUDA_DEVICES:-0,1,2,3}
+NUM_PROCESSES=${NUM_GPUS:-4}
 
 echo "Training parameters:"
 echo "   batch_size: $BATCH_SIZE"
 echo "   learning_coef: $LEARNING_COEF"
 echo "   output_dir: $OUTPUT_DIR"
 echo "   resume_ckpt: ${RESUME_CKPT:-'None (training from scratch)'}"
-
-# GPU configuration
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+echo "   CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
+echo "   num_processes: $NUM_PROCESSES"
 
 # Suppress TensorFlow logs
 export TF_CPP_MIN_LOG_LEVEL=2
 
 # =============================================================================
-# Path configuration
+# Path configuration (read from paths.env where available)
 # =============================================================================
-LIBERO_DATA_DIR="./datasets/metas"
+LIBERO_DATA_DIR="${LIBERO_DATASETS:-./datasets/metas}"
 NORM_STATS_PATH="./norm_stats/libero_norm.json"
 TRAIN_METAS_PATH="./datasets/metas/libero_train.json"
 
-# SmolVLM backbone (can be local path or HuggingFace repo)
-SMOLVLM_MODEL="HuggingFaceTB/SmolVLM-500M-Instruct"
+# SmolVLM backbone (local path from paths.env, else HuggingFace repo)
+SMOLVLM_MODEL="${SIMVLA_SMOLVLM_MODEL:-HuggingFaceTB/SmolVLM-500M-Instruct}"
 
 # =============================================================================
 # Training hyperparameters
@@ -53,10 +58,12 @@ NUM_WORKERS=4
 MAX_GRAD_NORM=1.0
 
 # Model architecture (Small configuration)
-HIDDEN_SIZE=768         
-DEPTH=12                 
-NUM_HEADS=12             
+HIDDEN_SIZE=768
+DEPTH=12
+NUM_HEADS=12
 USE_ADALN=false          # DiT-style conditioning
+USE_ADAPTIVE_CHUNKING=${USE_ADAPTIVE_CHUNKING:-false}  # change-rate-weighted loss + boundary head
+CHUNK_LOSS_WEIGHT=${CHUNK_LOSS_WEIGHT:-0.1}            # weight of boundary auxiliary loss
 
 # =============================================================================
 # Step 1: Create training metadata (if not exists)
@@ -109,6 +116,12 @@ if [ "${USE_ADALN}" = true ]; then
     ARGS="${ARGS} --use_adaln"
 fi
 
+# Add adaptive action chunking if enabled
+if [ "${USE_ADAPTIVE_CHUNKING}" = true ]; then
+    ARGS="${ARGS} --use_adaptive_chunking --chunk_loss_weight ${CHUNK_LOSS_WEIGHT}"
+    echo "Adaptive action chunking ENABLED (chunk_loss_weight=${CHUNK_LOSS_WEIGHT})"
+fi
+
 # Add resume checkpoint if specified
 if [ -n "${RESUME_CKPT}" ]; then
     ARGS="${ARGS} --models ${RESUME_CKPT} --resume"
@@ -140,12 +153,17 @@ echo "============================================================"
 echo "Output directory: ${OUTPUT_DIR}"
 echo "============================================================"
 
-# Multi-GPU training
+# Save a full copy of stdout/stderr to a timestamped log for later review
+mkdir -p "${OUTPUT_DIR}"
+LOG_FILE="${OUTPUT_DIR}/train_console_$(date +%Y%m%d-%H%M%S).log"
+echo "Console log: ${LOG_FILE}"
+
+# Training (num_processes driven by NUM_GPUS from paths.env)
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 accelerate launch \
-    --num_processes=4 \
+    --num_processes=${NUM_PROCESSES} \
     --main_process_port 29504 \
     --mixed_precision bf16 \
-    train_smolvlm.py ${ARGS}
+    train_smolvlm.py ${ARGS} 2>&1 | tee "${LOG_FILE}"
 
 echo "Training completed!"

@@ -1,0 +1,13 @@
+__pycache__/
+
+# Local machine paths & secrets (never commit — contains WANDB_API_KEY etc.)
+paths.env
+
+# Training / evaluation outputs
+runs/
+eval_simvla_*/
+*.log
+eval_*.txt
+
+# WandB local cache
+wandb/

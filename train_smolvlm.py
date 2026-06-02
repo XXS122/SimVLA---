@@ -65,7 +65,10 @@ def get_logger(name="train_smolvlm", output_dir=None, accelerator=None, level=lo
         logger.addHandler(ch)
     if output_dir and is_main:
         os.makedirs(output_dir, exist_ok=True)
-        fh = logging.FileHandler(os.path.join(output_dir, "train_smolvlm.log"), mode="a")
+        # Timestamped per-run log file so reruns/resumes don't clobber history,
+        # making it easy to review any past run later.
+        log_path = os.path.join(output_dir, f"train_smolvlm_{time.strftime('%Y%m%d-%H%M%S')}.log")
+        fh = logging.FileHandler(log_path, mode="a")
         fh.setFormatter(formatter)
         fh.setLevel(level)
         logger.addHandler(fh)
@@ -84,10 +87,12 @@ def get_args_parser():
     parser.add_argument("--output_dir", type=str, default="runnings_smolvlm", 
                         help="Directory to save checkpoints")
 
-    # SmolVLM backbone
-    parser.add_argument("--smolvlm_model_path", type=str, 
-                        default="HuggingFaceTB/SmolVLM-500M-Instruct",
-                        help="Path or HF repo for SmolVLM backbone")
+    # SmolVLM backbone (defaults to $SIMVLA_SMOLVLM_MODEL from paths.env if set)
+    parser.add_argument("--smolvlm_model_path", type=str,
+                        default=os.environ.get("SIMVLA_SMOLVLM_MODEL",
+                                               "HuggingFaceTB/SmolVLM-500M-Instruct"),
+                        help="Path or HF repo for SmolVLM backbone "
+                             "(env: SIMVLA_SMOLVLM_MODEL)")
     
     # Data
     parser.add_argument("--train_metas_path", type=str, required=True, 
@@ -145,7 +150,13 @@ def get_args_parser():
     # DiT/AdaLN mode
     parser.add_argument("--use_adaln", action="store_true", default=False,
                         help="Use DiT-style AdaLN conditioning")
-    
+
+    # Adaptive action chunking
+    parser.add_argument("--use_adaptive_chunking", action="store_true", default=False,
+                        help="Enable change-rate-weighted loss + boundary prediction head")
+    parser.add_argument("--chunk_loss_weight", type=float, default=0.1,
+                        help="Weight for the boundary prediction auxiliary loss")
+
     # Model architecture
     parser.add_argument("--hidden_size", type=int, default=768,
                         help="Hidden size for action transformer")
@@ -243,10 +254,10 @@ def update_group_lrs(optim, step, args):
 def main(args):
     output_dir = Path(args.output_dir)
     
-    # WandB setup
+    # WandB setup (API key & project come from paths.env: WANDB_API_KEY / WANDB_PROJECT)
     wandb_api_key = os.environ.get("WANDB_API_KEY") or args.wandb_api_key
-    wandb_project = os.environ.get("WANDB_PROJECT") or args.wandb_project
-    use_wandb = WANDB_AVAILABLE and wandb_api_key
+    wandb_project = os.environ.get("WANDB_PROJECT") or args.wandb_project or "simvla"
+    use_wandb = WANDB_AVAILABLE and bool(wandb_api_key)
 
     log_with = ["tensorboard"]
     if use_wandb:
@@ -276,6 +287,8 @@ def main(args):
         "hidden_size": args.hidden_size,
         "depth": args.depth,
         "use_adaln": args.use_adaln,
+        "use_adaptive_chunking": args.use_adaptive_chunking,
+        "chunk_loss_weight": args.chunk_loss_weight,
     }
     
     if use_wandb:
@@ -294,6 +307,13 @@ def main(args):
     logger.info(f"Args: {args}")
     logger.info(f"Using SmolVLM backbone: {args.smolvlm_model_path}")
     logger.info(f"Image size: {args.image_size}x{args.image_size}")
+    if use_wandb:
+        logger.info(f"WandB logging ENABLED -> project='{wandb_project}'")
+    elif WANDB_AVAILABLE:
+        logger.info("WandB installed but WANDB_API_KEY not set -> logging to TensorBoard only "
+                    "(did you `source paths.env`?)")
+    else:
+        logger.info("WandB not installed -> logging to TensorBoard only")
 
     # Load model
     from models.configuration_smolvlm_vla import SmolVLMVLAConfig
@@ -341,6 +361,8 @@ def main(args):
             num_actions=args.num_actions,
             use_adaln=args.use_adaln,
             image_size=args.image_size,
+            use_adaptive_chunking=args.use_adaptive_chunking,
+            chunk_loss_weight=args.chunk_loss_weight,
         )
         model = SmolVLMVLA(config)
         
@@ -420,9 +442,15 @@ def main(args):
             if accelerator.is_main_process:
                 dt = (time.time() - t0) / args.log_interval
                 t0 = time.time()
+                boundary_str = (
+                    f" boundary={logs['boundary_loss']:.4f}"
+                    if "boundary_loss" in logs else ""
+                )
                 logger.info(
                     f"[{global_step}/{args.iters}] "
                     f"loss={logs['loss_total']:.4f} "
+                    f"vel={logs['velocity_loss']:.4f}"
+                    f"{boundary_str} "
                     f"lr_core={logs['lr_transformer_core']:.2e} "
                     f"lr_action={logs['lr_action_heads']:.2e} "
                     f"lr_vlm={logs['lr_vlm']:.2e} ({dt:.2f}s/it)"

@@ -46,7 +46,11 @@ class SmolVLMVLAConfig(PretrainedConfig):
         
         # === DiT/AdaLN Mode ===
         use_adaln: bool = False,
-        
+
+        # === Adaptive Action Chunking ===
+        use_adaptive_chunking: bool = False,
+        chunk_loss_weight: float = 0.1,
+
         # === Image settings ===
         image_size: int = 384,  # Can be 384 or 512
         num_views: int = 3,  # Number of camera views
@@ -71,7 +75,11 @@ class SmolVLMVLAConfig(PretrainedConfig):
         
         # DiT/AdaLN settings
         self.use_adaln = use_adaln
-        
+
+        # Adaptive action chunking
+        self.use_adaptive_chunking = use_adaptive_chunking
+        self.chunk_loss_weight = chunk_loss_weight
+
         # Image settings
         self.image_size = image_size
         self.num_views = num_views
