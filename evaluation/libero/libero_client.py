@@ -98,7 +98,8 @@ class WebSocketClient:
     """
     def __init__(self, host: str, port: int, replan_steps: int = 5, resize_size: int = 224,
                  adaptive_replan: bool = False, beta: float = 0.5,
-                 max_horizon: "int | None" = None, min_commit: int = 1):
+                 max_horizon: "int | None" = None, min_commit: int = 1,
+                 log_boundary: "str | None" = None):
         if not HAS_WS_CLIENT:
             raise ImportError("openpi_client not installed. Run: pip install openpi-client")
         self.client = ws_client.WebsocketClientPolicy(host, port)
@@ -112,18 +113,31 @@ class WebSocketClient:
                   "falling back to fixed replan_steps.")
         self._controller = None
         if self.adaptive_replan:
+            # Default cap = replan_steps (the proven-safe horizon). By default the
+            # adaptive policy never commits LONGER open-loop than the fixed baseline,
+            # so it cannot regress success on the unreliable chunk tail; raise
+            # --max_horizon (toward the full chunk length) to chase more speed.
             self._controller = AdaptiveReplanController(
                 beta=beta,
-                max_horizon=max_horizon if max_horizon is not None else 10 ** 6,
+                max_horizon=max_horizon if max_horizon is not None else replan_steps,
                 min_commit=min_commit,
                 mode="adaptive",
             )
         self.num_queries = 0     # server (VLM) forwards -- the speed metric
         self.num_act_calls = 0   # env steps served
+        # Optional diagnostic: dump per-executed-step boundary + action to JSONL.
+        self._blog_f = open(log_boundary, "w") if log_boundary else None
         self.reset()
 
     def reset(self) -> None:
         self.action_plan: Deque[np.ndarray] = collections.deque()
+        self.boundary_plan: Deque = collections.deque()
+        if getattr(self, "_blog_f", None) is not None:
+            try:
+                self._blog_f.write(json.dumps({"event": "reset"}) + "\n")
+                self._blog_f.flush()
+            except Exception:
+                pass
 
     def step(self, obs: Dict, goal: str) -> np.ndarray:
         if not self.action_plan:
@@ -149,20 +163,39 @@ class WebSocketClient:
             action_chunk = result["actions"]
             if not isinstance(action_chunk, np.ndarray):
                 action_chunk = np.array(action_chunk)
+            boundary = result.get("boundary")
+            if boundary is not None and not isinstance(boundary, np.ndarray):
+                boundary = np.array(boundary)
 
             # Decide how many steps to commit before the next re-plan: boundary-driven
             # when adaptive, else the fixed replan_steps baseline.
-            if self.adaptive_replan and result.get("boundary") is not None:
-                commit = self._controller.decide_commit_length(result["boundary"])
+            if self.adaptive_replan and boundary is not None:
+                commit = self._controller.decide_commit_length(boundary)
             else:
                 commit = self.replan_steps
             commit = max(1, min(commit, len(action_chunk)))
 
             for i in range(commit):
                 self.action_plan.append(action_chunk[i])
+                self.boundary_plan.append(
+                    float(boundary[i]) if (boundary is not None and i < len(boundary)) else None
+                )
 
         self.num_act_calls += 1
-        return self.action_plan.popleft()
+        action = self.action_plan.popleft()
+        bval = self.boundary_plan.popleft() if self.boundary_plan else None
+        if self._blog_f is not None:
+            try:
+                arr = np.asarray(action).ravel()
+                self._blog_f.write(json.dumps({
+                    "b": bval,
+                    "grip": float(arr[6]) if arr.size > 6 else None,
+                    "a": [float(x) for x in arr.tolist()],
+                }) + "\n")
+                self._blog_f.flush()
+            except Exception:
+                pass
+        return action
 
 
 class HTTPClient:
@@ -373,6 +406,8 @@ def main():
                         help="Hard cap on open-loop length (default: action chunk length)")
     parser.add_argument("--min_commit", type=int, default=1,
                         help="Minimum steps to execute before re-planning")
+    parser.add_argument("--log_boundary", type=str, default=None,
+                        help="Dump per-step boundary+action to this JSONL (for H1 diagnosis)")
 
     args = parser.parse_args()
 
@@ -407,6 +442,7 @@ def main():
             args.host, args.port, replan_steps=args.replan_steps,
             adaptive_replan=args.adaptive_replan, beta=args.beta,
             max_horizon=args.max_horizon, min_commit=args.min_commit,
+            log_boundary=args.log_boundary,
         )
     else:
         client = HTTPClient(args.host, args.port, replan_steps=args.replan_steps)
