@@ -21,6 +21,12 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+# Respect paths.env GPU config: if the user sourced paths.env (which sets
+# CUDA_DEVICES) but did not export CUDA_VISIBLE_DEVICES, honor it here -- this
+# must run before `import torch` so CUDA initializes on the chosen device(s).
+if "CUDA_VISIBLE_DEVICES" not in os.environ and os.environ.get("CUDA_DEVICES"):
+    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["CUDA_DEVICES"]
+
 import numpy as np
 import torch
 from PIL import Image
