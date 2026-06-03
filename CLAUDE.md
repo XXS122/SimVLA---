@@ -78,19 +78,62 @@ Training logs are saved for later review:
 - Structured logger → `OUTPUT_DIR/train_smolvlm_<timestamp>.log` (per-run, not clobbered)
 - WandB: auto-enabled when `WANDB_API_KEY` is set; the log prints whether it is active
 
-### Evaluation (LIBERO)
+### 评估（LIBERO）
+
+#### 第一步 — 启动推理服务器（单独开一个终端）
+
 ```bash
 source paths.env
 
-# Start inference server (checkpoint/backbone default to env vars if set)
+# checkpoint 默认读取 $SIMVLA_CHECKPOINTS，也可以手动指定
 CUDA_VISIBLE_DEVICES=0 python evaluation/libero/serve_smolvlm_libero.py \
-  --checkpoint YuankaiLuo/SimVLA-LIBERO \
+  --checkpoint ./runs/simvla_libero_small/step_200000 \
   --norm_stats ./norm_stats/libero_norm.json \
   --port 8102
-
-# Run evaluation
-bash evaluation/libero/run_eval_all.sh [port] [num_episodes] [run_name] [seeds]
 ```
+
+等到日志出现 `SimVLA server listening on 0.0.0.0:8102` 后再运行评估。
+
+#### 第二步 — 运行评估（另开一个终端）
+
+**全量评估（4 个任务集并行，需要 4 块 GPU）：**
+```bash
+cd evaluation/libero
+bash run_eval_all.sh <端口> <每任务回合数> <结果前缀> "<gpu0> <gpu1> <gpu2> <gpu3>"
+
+# 示例：
+bash run_eval_all.sh 8102 10 eval_step200k "4 5 6 7"
+```
+
+**单独评估某个任务集（例如只评 libero_goal，1 块 GPU）：**
+```bash
+cd evaluation/libero
+CUDA_VISIBLE_DEVICES=0 python libero_client.py \
+  --host 127.0.0.1 \
+  --port 8102 \
+  --client_type websocket \
+  --task_suite libero_goal \
+  --num_trials 20 \
+  --video_out ./eval_videos
+```
+
+#### 第三步 — 查看结果
+
+```bash
+# 查看各任务集成功率
+grep -E "Success Rate|Average" eval_step200k_*.txt
+
+# 实时监控评估进度
+tail -f eval_step200k_goal.txt
+```
+
+结果文件保存在 `eval_simvla_<端口>/` 目录下，文件名格式：
+`<结果前缀>_spatial.txt` / `_object.txt` / `_goal.txt` / `_10.txt`
+
+#### 注意事项
+- `--num_trials 10` 速度快但噪声大；正式对比实验建议用 `20–50`
+- 评估期间推理服务器必须保持运行
+- `run_eval_all.sh` 4 个任务集并行运行，每个任务集占用一块 GPU
 
 ## Architecture
 
