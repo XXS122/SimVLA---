@@ -37,6 +37,13 @@ except ImportError:
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 
+# Make the project root importable so we can reuse the adaptive-replan controller.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+try:
+    from models.adaptive_inference import AdaptiveReplanController
+except Exception:
+    AdaptiveReplanController = None
+
 # -----------------------------------------------------------------------------
 # Constants
 # -----------------------------------------------------------------------------
@@ -89,12 +96,30 @@ class WebSocketClient:
     
     Requires: pip install openpi-client
     """
-    def __init__(self, host: str, port: int, replan_steps: int = 5, resize_size: int = 224):
+    def __init__(self, host: str, port: int, replan_steps: int = 5, resize_size: int = 224,
+                 adaptive_replan: bool = False, beta: float = 0.5,
+                 max_horizon: "int | None" = None, min_commit: int = 1):
         if not HAS_WS_CLIENT:
             raise ImportError("openpi_client not installed. Run: pip install openpi-client")
         self.client = ws_client.WebsocketClientPolicy(host, port)
         self.replan_steps = replan_steps
         self.resize_size = resize_size
+        # Optional boundary-driven adaptive re-planning (ours). When off, the fixed
+        # replan_steps path runs unchanged and serves as the comparison baseline.
+        self.adaptive_replan = adaptive_replan and (AdaptiveReplanController is not None)
+        if adaptive_replan and AdaptiveReplanController is None:
+            print("WARNING: --adaptive_replan requested but controller import failed; "
+                  "falling back to fixed replan_steps.")
+        self._controller = None
+        if self.adaptive_replan:
+            self._controller = AdaptiveReplanController(
+                beta=beta,
+                max_horizon=max_horizon if max_horizon is not None else 10 ** 6,
+                min_commit=min_commit,
+                mode="adaptive",
+            )
+        self.num_queries = 0     # server (VLM) forwards -- the speed metric
+        self.num_act_calls = 0   # env steps served
         self.reset()
 
     def reset(self) -> None:
@@ -118,20 +143,25 @@ class WebSocketClient:
                 "prompt": goal,
             }
             
-            # Query server
+            # Query server (one VLM forward)
             result = self.client.infer(element)
+            self.num_queries += 1
             action_chunk = result["actions"]
-            
-            # Ensure numpy array
             if not isinstance(action_chunk, np.ndarray):
                 action_chunk = np.array(action_chunk)
-            
-            assert len(action_chunk) >= self.replan_steps, \
-                f"Need {self.replan_steps} steps but got {len(action_chunk)}"
-            
-            for i in range(min(self.replan_steps, len(action_chunk))):
+
+            # Decide how many steps to commit before the next re-plan: boundary-driven
+            # when adaptive, else the fixed replan_steps baseline.
+            if self.adaptive_replan and result.get("boundary") is not None:
+                commit = self._controller.decide_commit_length(result["boundary"])
+            else:
+                commit = self.replan_steps
+            commit = max(1, min(commit, len(action_chunk)))
+
+            for i in range(commit):
                 self.action_plan.append(action_chunk[i])
 
+        self.num_act_calls += 1
         return self.action_plan.popleft()
 
 
@@ -305,7 +335,13 @@ def eval_libero(
     
     success_rate = total_successes / max(total_episodes, 1)
     print(f"\nTotal success rate: {total_successes}/{total_episodes} ({success_rate*100:.1f}%)")
-    
+
+    nq = getattr(client, "num_queries", None)
+    na = getattr(client, "num_act_calls", None)
+    if nq and na:
+        print(f"VLM calls (re-plans): {nq} over {na} env steps "
+              f"(avg commit {na / max(nq, 1):.2f} steps/call)")
+
     return success_rate
 
 
@@ -328,6 +364,15 @@ def main():
     parser.add_argument("--replan_steps", type=int, default=5)
     parser.add_argument("--video_out", type=str, default="./eval_results")
     parser.add_argument("--no_video", action="store_true", help="Disable video recording for faster evaluation")
+    # Boundary-driven adaptive re-planning (ours). Off => fixed replan_steps baseline.
+    parser.add_argument("--adaptive_replan", action="store_true",
+                        help="Use boundary scores to choose re-plan timing (ours)")
+    parser.add_argument("--beta", type=float, default=0.5,
+                        help="Decisiveness threshold for adaptive re-planning")
+    parser.add_argument("--max_horizon", type=int, default=None,
+                        help="Hard cap on open-loop length (default: action chunk length)")
+    parser.add_argument("--min_commit", type=int, default=1,
+                        help="Minimum steps to execute before re-planning")
 
     args = parser.parse_args()
 
@@ -350,11 +395,19 @@ def main():
     print(f"   Server: {protocol}://{args.host}:{args.port}")
     print(f"   Task suite: {args.task_suite}")
     print(f"   Replan steps: {args.replan_steps}")
+    if args.adaptive_replan:
+        print(f"   Adaptive re-plan: ON (beta={args.beta}, max_horizon={args.max_horizon}, min_commit={args.min_commit})")
+    else:
+        print(f"   Adaptive re-plan: OFF (fixed replan baseline)")
     print()
     
     # Initialize client
     if args.client_type == "websocket":
-        client = WebSocketClient(args.host, args.port, replan_steps=args.replan_steps)
+        client = WebSocketClient(
+            args.host, args.port, replan_steps=args.replan_steps,
+            adaptive_replan=args.adaptive_replan, beta=args.beta,
+            max_horizon=args.max_horizon, min_commit=args.min_commit,
+        )
     else:
         client = HTTPClient(args.host, args.port, replan_steps=args.replan_steps)
     

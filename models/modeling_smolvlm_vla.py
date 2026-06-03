@@ -440,15 +440,30 @@ class SmolVLMVLA(PreTrainedModel):
         image_mask: torch.Tensor,
         proprio: torch.Tensor,
         steps: int = 10,
-    ) -> torch.Tensor:
+        return_boundary: bool = False,
+        adaptive_steps: bool = False,
+        draft_steps: int = 2,
+        step_boundary_threshold: float = 0.5,
+    ):
         """
         Flow Matching inference (Euler integration).
-        
+
         1) Initialize x_t = noise (t=1)
-        2) Loop t from 1 to 0:
-           - Model predicts velocity v_t
-           - Euler update: x_t = x_t + dt * v_t
+        2) Loop t from 1 to 0: predict velocity v_t, Euler update x_t += dt * v_t
         3) Final x_0 ≈ target action
+
+        Inference-side adaptive computation (reuses the trained ChunkBoundaryHead,
+        no retraining):
+        - ``return_boundary``: also return per-step boundary scores in [0, 1]
+          (high = decisive / contact moment). Consumed by AdaptiveReplanController
+          to decide when to re-run the expensive VLM (variable-length execution).
+        - ``adaptive_steps``: "draft-then-refine" denoising. Integrate a cheap
+          ``draft_steps``-step draft; if the whole chunk looks smooth
+          (max boundary < ``step_boundary_threshold``) keep it, otherwise refine
+          with the full ``steps``. Saves denoising compute on smooth chunks.
+
+        Returns ``actions`` ([B, T, D]), or ``(actions, boundary)`` with
+        ``boundary`` of shape [B, T] when ``return_boundary=True``.
         """
         self.eval()
         enc = self.forward_vlm_efficient(image_input, image_mask, input_ids)
@@ -466,27 +481,63 @@ class SmolVLMVLA(PreTrainedModel):
         else:
             proprio_norm = proprio
 
-        # Euler integration
-        steps = max(1, int(steps))
-        dt = -1.0 / steps
-        
-        x_t = torch.randn(B, self.num_actions, D, device=device, dtype=dtype)
-        t = 1.0
-        
-        while t > -dt / 2:
-            t_tensor = torch.full((B,), t, device=device, dtype=dtype)
-            
-            v_t = self.transformer(
+        has_boundary = getattr(self.transformer, "chunk_boundary_head", None) is not None
+
+        # Shared noise so the cheap draft and the full integration start from the
+        # same point (keeps the draft-then-refine decision meaningful).
+        noise = torch.randn(B, self.num_actions, D, device=device, dtype=dtype)
+
+        def _integrate(num_steps: int) -> torch.Tensor:
+            num_steps = max(1, int(num_steps))
+            dt = -1.0 / num_steps
+            x_t = noise.clone()
+            t = 1.0
+            while t > -dt / 2:
+                t_tensor = torch.full((B,), t, device=device, dtype=dtype)
+                v_t = self.transformer(
+                    vlm_features=enc["vlm_features"],
+                    action_with_noise=x_t,
+                    proprio=proprio_norm,
+                    t=t_tensor,
+                )
+                x_t = x_t + dt * v_t
+                t = t + dt
+            return x_t
+
+        def _boundary_of(x_clean: torch.Tensor) -> torch.Tensor:
+            # One extra (cheap) action-head forward at t=0 to read boundary scores
+            # from the (near-)clean action features.
+            t0 = torch.zeros(B, device=device, dtype=dtype)
+            _, b = self.transformer(
                 vlm_features=enc["vlm_features"],
-                action_with_noise=x_t,
+                action_with_noise=x_clean,
                 proprio=proprio_norm,
-                t=t_tensor,
+                t=t0,
+                return_boundary=True,
             )
-        
-            x_t = x_t + dt * v_t
-            t = t + dt
-        
-        return self.action_space.postprocess(x_t)
+            return b.clamp(0.0, 1.0)  # training target was normalized change-rate in [0, 1]
+
+        boundary = None
+        if adaptive_steps and has_boundary:
+            x_t = _integrate(draft_steps)
+            boundary = _boundary_of(x_t)
+            if boundary.amax(dim=1).max().item() >= step_boundary_threshold:
+                # Chunk contains a decisive moment -> refine with the full budget.
+                x_t = _integrate(steps)
+                boundary = _boundary_of(x_t)
+        else:
+            x_t = _integrate(steps)
+            if return_boundary and has_boundary:
+                boundary = _boundary_of(x_t)
+
+        actions = self.action_space.postprocess(x_t)
+
+        if return_boundary:
+            if boundary is None:
+                # Model trained without adaptive chunking: keep a stable signature.
+                boundary = torch.zeros(B, self.num_actions, device=device, dtype=dtype)
+            return actions, boundary
+        return actions
 
     # =============================== FastAPI service =============================
     def _build_app(self, processor):

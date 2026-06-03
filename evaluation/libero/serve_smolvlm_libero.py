@@ -173,24 +173,33 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
         # Proprioception
         proprio_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
         
-        # Inference
+        # Inference (also returns per-step boundary scores from the trained
+        # ChunkBoundaryHead, used by the client for adaptive re-planning).
         with torch.no_grad():
-            actions = model.generate_actions(
+            actions, boundary = model.generate_actions(
                 input_ids=lang['input_ids'],
                 image_input=images,
                 image_mask=image_mask,
                 proprio=proprio_tensor,
                 steps=CONFIG["action_horizon"],
+                return_boundary=True,
+                adaptive_steps=CONFIG.get("adaptive_steps", False),
+                draft_steps=CONFIG.get("draft_steps", 2),
+                step_boundary_threshold=CONFIG.get("step_threshold", 0.5),
             )
-        
+
         actions = actions.cpu().numpy()[0]
-        
-        return {"actions": actions}
-        
+        boundary = boundary.cpu().numpy()[0]
+
+        return {"actions": actions, "boundary": boundary}
+
     except Exception as e:
         logger.error(f"Inference error: {e}")
         traceback.print_exc()
-        return {"actions": np.zeros((CONFIG["action_horizon"], CONFIG["action_dim"]))}
+        return {
+            "actions": np.zeros((CONFIG["action_horizon"], CONFIG["action_dim"])),
+            "boundary": np.zeros((CONFIG["action_horizon"],)),
+        }
 
 
 async def handle_connection(websocket, path=None):
@@ -228,8 +237,11 @@ async def handle_connection(websocket, path=None):
                 actions = result["actions"]
                 if isinstance(actions, np.ndarray):
                     actions = actions.tolist()
-                
-                response_data = {"actions": actions}
+                boundary = result.get("boundary")
+                if isinstance(boundary, np.ndarray):
+                    boundary = boundary.tolist()
+
+                response_data = {"actions": actions, "boundary": boundary}
                 
                 if HAS_MSGPACK:
                     import msgpack
@@ -276,17 +288,30 @@ def main():
                         help="SmolVLM model path or HF repo (env: SIMVLA_SMOLVLM_MODEL)")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
-    
+    # L2: draft-then-refine adaptive denoising steps (uses the boundary head)
+    parser.add_argument("--adaptive_steps", action="store_true",
+                        help="Enable draft-then-refine adaptive denoising steps")
+    parser.add_argument("--draft_steps", type=int, default=2,
+                        help="Draft denoising steps when --adaptive_steps is set")
+    parser.add_argument("--step_threshold", type=float, default=0.5,
+                        help="Max boundary above which a draft chunk is refined to full steps")
+
     args = parser.parse_args()
-    
+
+    CONFIG["adaptive_steps"] = args.adaptive_steps
+    CONFIG["draft_steps"] = args.draft_steps
+    CONFIG["step_threshold"] = args.step_threshold
+
     if not HAS_MSGPACK:
         logger.warning("msgpack_numpy not installed! Install with: pip install msgpack-numpy")
-    
+
     load_model(args.checkpoint, args.norm_stats, args.smolvlm_model)
-    
+
     logger.info(f"Starting SimVLA server on {args.host}:{args.port}")
     logger.info(f"  Image size: {CONFIG['image_size']}x{CONFIG['image_size']}")
     logger.info(f"  Action horizon: {CONFIG['action_horizon']}")
+    logger.info(f"  Adaptive denoising steps: {CONFIG['adaptive_steps']} "
+                f"(draft={CONFIG['draft_steps']}, threshold={CONFIG['step_threshold']})")
     
     asyncio.run(serve(args.host, args.port))
 
