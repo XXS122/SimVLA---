@@ -29,6 +29,21 @@ fi
 export LIBERO_ROOT="${SCRIPT_DIR}/LIBERO"
 export PYTHONPATH="${LIBERO_ROOT}:${PYTHONPATH:-}"
 
+# ---------- conda 环境 ----------
+# 服务端（SimVLA 策略模型）跑在 base，客户端（LIBERO 评估）跑在 libero。
+# 可用环境变量覆盖：SIMVLA_SERVER_ENV / SIMVLA_CLIENT_ENV
+SERVER_ENV="${SIMVLA_SERVER_ENV:-base}"
+CLIENT_ENV="${SIMVLA_CLIENT_ENV:-libero}"
+
+# 加载 conda（让 conda activate 在脚本里可用）
+CONDA_BASE="$(conda info --base 2>/dev/null)"
+if [ -n "$CONDA_BASE" ] && [ -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]; then
+    # shellcheck disable=SC1091
+    source "${CONDA_BASE}/etc/profile.d/conda.sh"
+else
+    echo "⚠️  找不到 conda，假设当前环境已正确（服务端和客户端将用同一个 python）"
+fi
+
 # ---------- 参数 ----------
 NUM_TRIALS=${1:-20}
 GPU=${2:-0}
@@ -51,6 +66,8 @@ echo "   norm_stats : $NORM"
 echo "   task_suite : $TASK_SUITE"
 echo "   num_trials : $NUM_TRIALS"
 echo "   GPU        : $GPU"
+echo "   服务端环境 : $SERVER_ENV"
+echo "   客户端环境 : $CLIENT_ENV"
 echo "   输出目录   : $OUT_DIR"
 echo "========================================================"
 echo ""
@@ -73,7 +90,8 @@ run_one() {
     echo "[$(date +%H:%M:%S)] 开始实验: ${name}  (port ${port})"
     echo "   服务端参数: ${server_args[*]:-<无, baseline>}"
 
-    # 1) 后台启动服务端
+    # 1) 切到服务端环境(base)，后台启动服务端
+    conda activate "$SERVER_ENV" 2>/dev/null || echo "   (无法 activate $SERVER_ENV，沿用当前环境)"
     CUDA_VISIBLE_DEVICES="$GPU" python -u "$SERVE" \
         --checkpoint "$CKPT" \
         --norm_stats "$NORM" \
@@ -103,7 +121,9 @@ run_one() {
     fi
     echo "   ✓ 服务端就绪，开始评估..."
 
-    # 3) 跑客户端（libero_goal，单连接）
+    # 3) 切到客户端环境(libero)，跑客户端（libero_goal，单连接）
+    #    服务端已作为独立进程在跑，这里切换环境不影响它。
+    conda activate "$CLIENT_ENV" 2>/dev/null || echo "   (无法 activate $CLIENT_ENV，沿用当前环境)"
     ( cd "$SCRIPT_DIR" && CUDA_VISIBLE_DEVICES="$GPU" python -u libero_client.py \
         --host 127.0.0.1 --port "$port" --client_type websocket \
         --task_suite "$TASK_SUITE" --num_trials "$NUM_TRIALS" --no_video ) \
