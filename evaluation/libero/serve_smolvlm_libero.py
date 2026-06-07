@@ -75,11 +75,25 @@ def load_model(checkpoint_path: str, norm_stats_path: str = None, smolvlm_model_
 
     logger.info(f"Loading SimVLA from {checkpoint_path}...")
 
-    model = SmolVLMVLA.from_pretrained(checkpoint_path)
+    smolvlm_path = smolvlm_model_path or "HuggingFaceTB/SmolVLM-500M-Instruct"
+
+    # The checkpoint's config stores `smolvlm_model_path` as the absolute path on
+    # the TRAINING machine, which usually doesn't exist on the eval machine.
+    # Override it with the local path (--smolvlm_model / SIMVLA_SMOLVLM_MODEL)
+    # before constructing the model, so the SmolVLM backbone loads correctly.
+    from models.configuration_smolvlm_vla import SmolVLMVLAConfig
+    config = SmolVLMVLAConfig.from_pretrained(checkpoint_path)
+    if getattr(config, "smolvlm_model_path", None) != smolvlm_path:
+        logger.info(
+            f"Overriding backbone path: config had "
+            f"'{getattr(config, 'smolvlm_model_path', None)}' → using '{smolvlm_path}'"
+        )
+        config.smolvlm_model_path = smolvlm_path
+
+    model = SmolVLMVLA.from_pretrained(checkpoint_path, config=config)
     model = model.to(device)
     model.eval()
 
-    smolvlm_path = smolvlm_model_path or "HuggingFaceTB/SmolVLM-500M-Instruct"
     processor = SmolVLMVLAProcessor.from_pretrained(smolvlm_path)
 
     if norm_stats_path and os.path.exists(norm_stats_path):
