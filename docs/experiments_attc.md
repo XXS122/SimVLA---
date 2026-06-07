@@ -2,11 +2,17 @@
 
 **模型检查点**：`./runs/simvla_libero_small/step_200000`（根据实际路径修改）
 **评估轮数**：每个任务集 20 trials（快速验证），正式发表用 50 trials
-**GPU 分配**：服务端占 1 块，评估端 4 块并行（4 个任务集）
+**GPU 分配**：服务端独占 1 块（如 GPU0），评估端 4 块并行（如 GPU1-4，跑 4 个任务集）
+
+> ⚠️ **重要：成功率和延迟要分开测**
+> - **成功率（SR%）**：用 `run_eval_all.sh` 4 路并行测（快）。
+> - **延迟（latency）**：必须用**单任务集、单连接**单独测（见下方"延迟测量"）。
+>   因为 4 路并行时 4 个 client 共用一个 server 串行排队，测出的延迟约是真实单流的
+>   4 倍且失真，**不能用并行跑的日志延迟**。
 
 ---
 
-## 运行方式说明
+## 运行方式说明（成功率）
 
 每个实验分两步：先开服务端（终端1），再跑评估（终端2）。
 
@@ -19,19 +25,43 @@ CUDA_VISIBLE_DEVICES=0 python evaluation/libero/serve_smolvlm_libero.py \
   --port [端口] [实验参数]
 # 等待日志出现 "SimVLA server listening on 0.0.0.0:XXXX" 再执行终端2
 
-# 终端2：跑评估（替换端口和结果前缀）
+# 终端2：跑评估（GPU 用 1-4，避开服务端的 GPU0）
 cd evaluation/libero
-bash run_eval_all.sh [端口] 20 [结果前缀] "0 1 2 3"
+bash run_eval_all.sh [端口] 20 [结果前缀] "1 2 3 4"
 
-# 查看结果
-grep -E "success|Success|Total" [结果前缀]_*.txt
+# 查看成功率（client 打印的是 "Total success rate"）
+grep -i "Total success rate" [结果前缀]_*.txt
 ```
 
-从服务端日志读取延迟（连接关闭时打印）：
+从服务端日志读取缓存命中率（连接关闭时打印）：
 ```
-[Latency summary] n=XX  avg=XXXms  p50=XXXms  p95=XXXms
 [ATTC] cumulative hit rate: XX.X%
 ```
+
+---
+
+## 延迟测量（单连接，必须单独测）
+
+延迟实验只跑**一个任务集、一个 client**，避免排队干扰。每个配置都要单独测一次延迟：
+
+```bash
+# 终端1：启动服务（同上，换对应实验参数和端口）
+CUDA_VISIBLE_DEVICES=0 python evaluation/libero/serve_smolvlm_libero.py \
+  --checkpoint ./runs/simvla_libero_small/step_200000 \
+  --norm_stats ./norm_stats/libero_norm.json \
+  --port [端口] [实验参数]
+
+# 终端2：只跑一个任务集、10 trials（GPU 与服务端错开）
+cd evaluation/libero
+CUDA_VISIBLE_DEVICES=1 python libero_client.py \
+  --host 127.0.0.1 --port [端口] --client_type websocket \
+  --task_suite libero_goal --num_trials 10 --no_video
+
+# client 跑完后，从【服务端终端】日志读取：
+#   [Latency summary] n=XX  avg=XXXms  p50=XXXms  p95=XXXms
+```
+
+> 所有配置的延迟都用**同一个任务集（libero_goal）+ 同样 trials**测，才可横向对比。
 
 ---
 
@@ -48,29 +78,34 @@ CUDA_VISIBLE_DEVICES=0 python evaluation/libero/serve_smolvlm_libero.py \
 
 # 终端2
 cd evaluation/libero
-bash run_eval_all.sh 8100 20 exp_B0 "0 1 2 3"
+bash run_eval_all.sh 8100 20 exp_B0 "1 2 3 4"
 ```
 
 ---
 
 ### C1 — Fixed-τ（固定阈值，对标 VLA-Cache）
 
-> 用极大的 β（0.999）和极小的 α（0.01）模拟固定阈值：EMA 几乎不更新，τ ≈ 初始值 0.1。
+> 用专门的 `--cache_fixed_threshold` 参数启用固定阈值模式（绕过自适应公式，
+> 阈值恒为常数）。这才是真正的固定阈值基线。
+>
+> **如何选 τ 值（公平对比的关键）**：先跑完 C2（自适应）拿到它的平均 hit rate，
+> 然后调 `--cache_fixed_threshold` 让 C1 的 hit rate 与 C2 **尽量接近**（即同等加速比），
+> 再比成功率——这叫 "iso-speedup" 对比，最公平。
+> 起始可试 `0.02`，hit rate 太低就调大、太高就调小。
 
 ```bash
-# 终端1
+# 终端1（先用 0.02 起步，再根据 hit rate 调整）
 CUDA_VISIBLE_DEVICES=0 python evaluation/libero/serve_smolvlm_libero.py \
   --checkpoint ./runs/simvla_libero_small/step_200000 \
   --norm_stats ./norm_stats/libero_norm.json \
   --port 8101 \
   --use_cache \
-  --cache_alpha 0.01 \
-  --cache_beta 0.999 \
-  --cache_warmup 1
+  --cache_fixed_threshold 0.02 \
+  --cache_warmup 3
 
 # 终端2
 cd evaluation/libero
-bash run_eval_all.sh 8101 20 exp_C1 "0 1 2 3"
+bash run_eval_all.sh 8101 20 exp_C1 "1 2 3 4"
 ```
 
 ---
@@ -90,7 +125,7 @@ CUDA_VISIBLE_DEVICES=0 python evaluation/libero/serve_smolvlm_libero.py \
 
 # 终端2
 cd evaluation/libero
-bash run_eval_all.sh 8102 20 exp_C2 "0 1 2 3"
+bash run_eval_all.sh 8102 20 exp_C2 "1 2 3 4"
 ```
 
 ---
@@ -111,7 +146,7 @@ CUDA_VISIBLE_DEVICES=0 python evaluation/libero/serve_smolvlm_libero.py \
 
 # 终端2
 cd evaluation/libero
-bash run_eval_all.sh 8110 20 exp_A_alpha05 "0 1 2 3"
+bash run_eval_all.sh 8110 20 exp_A_alpha05 "1 2 3 4"
 ```
 
 ---
@@ -134,7 +169,7 @@ CUDA_VISIBLE_DEVICES=0 python evaluation/libero/serve_smolvlm_libero.py \
 
 # 终端2
 cd evaluation/libero
-bash run_eval_all.sh 8111 20 exp_A_alpha15 "0 1 2 3"
+bash run_eval_all.sh 8111 20 exp_A_alpha15 "1 2 3 4"
 ```
 
 ---
@@ -153,7 +188,7 @@ CUDA_VISIBLE_DEVICES=0 python evaluation/libero/serve_smolvlm_libero.py \
 
 # 终端2
 cd evaluation/libero
-bash run_eval_all.sh 8112 20 exp_A_alpha20 "0 1 2 3"
+bash run_eval_all.sh 8112 20 exp_A_alpha20 "1 2 3 4"
 ```
 
 ---
@@ -174,7 +209,7 @@ CUDA_VISIBLE_DEVICES=0 python evaluation/libero/serve_smolvlm_libero.py \
 
 # 终端2
 cd evaluation/libero
-bash run_eval_all.sh 8120 20 exp_A_beta07 "0 1 2 3"
+bash run_eval_all.sh 8120 20 exp_A_beta07 "1 2 3 4"
 ```
 
 ---
@@ -197,7 +232,7 @@ CUDA_VISIBLE_DEVICES=0 python evaluation/libero/serve_smolvlm_libero.py \
 
 # 终端2
 cd evaluation/libero
-bash run_eval_all.sh 8121 20 exp_A_beta099 "0 1 2 3"
+bash run_eval_all.sh 8121 20 exp_A_beta099 "1 2 3 4"
 ```
 
 ---

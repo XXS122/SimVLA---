@@ -63,10 +63,9 @@ CONFIG = {
     "cache_alpha": 1.0,
     "cache_beta": 0.9,
     "cache_warmup": 3,
+    "cache_fixed_threshold": None,   # None = adaptive; float = fixed-τ baseline
     "cache_log_interval": 20,
-    # Latency tracking (populated at runtime)
-    "_latency_warmup": 5,       # skip first N steps (GPU warm-up)
-    "_latency_samples": [],     # per-step latencies (ms)
+    "latency_warmup": 5,             # skip first N steps (GPU warm-up) in latency stats
 }
 
 
@@ -95,10 +94,17 @@ def load_model(checkpoint_path: str, norm_stats_path: str = None, smolvlm_model_
 
     logger.info(f"Model loaded! Device: {device}, Image size: {CONFIG['image_size']}x{CONFIG['image_size']}")
     if CONFIG["use_cache"]:
-        logger.info(
-            f"  ATTC cache ENABLED: alpha={CONFIG['cache_alpha']}, "
-            f"beta={CONFIG['cache_beta']}, warmup={CONFIG['cache_warmup']}"
-        )
+        if CONFIG["cache_fixed_threshold"] is not None:
+            logger.info(
+                f"  Cache ENABLED [FIXED-τ baseline]: "
+                f"threshold={CONFIG['cache_fixed_threshold']}, "
+                f"warmup={CONFIG['cache_warmup']}"
+            )
+        else:
+            logger.info(
+                f"  ATTC cache ENABLED [adaptive]: alpha={CONFIG['cache_alpha']}, "
+                f"beta={CONFIG['cache_beta']}, warmup={CONFIG['cache_warmup']}"
+            )
     else:
         logger.info("  ATTC cache DISABLED (pass --use_cache to enable)")
 
@@ -219,6 +225,7 @@ def infer(observation: Dict[str, Any], cache: dict = None):
                     alpha=CONFIG["cache_alpha"],
                     beta=CONFIG["cache_beta"],
                     warmup_steps=CONFIG["cache_warmup"],
+                    fixed_threshold=CONFIG["cache_fixed_threshold"],
                 )
                 actions = model.generate_actions_from_enc(
                     enc, proprio_tensor, steps=CONFIG["action_horizon"]
@@ -245,28 +252,16 @@ def infer(observation: Dict[str, Any], cache: dict = None):
 
         actions = actions.cpu().numpy()[0]
 
-        # Track latency (skip warm-up steps)
+        # Measure end-to-end latency (preprocess + encode + ODE), returned to
+        # the caller which accumulates per-connection stats.
         elapsed_ms = (time.perf_counter() - t_start) * 1000
-        samples = CONFIG["_latency_samples"]
-        if len(samples) >= CONFIG["_latency_warmup"]:
-            samples.append(elapsed_ms)
-            if len(samples) % 20 == 0:
-                avg = sum(samples) / len(samples)
-                p50 = sorted(samples)[len(samples) // 2]
-                p95 = sorted(samples)[int(len(samples) * 0.95)]
-                logger.info(
-                    f"[Latency] n={len(samples)}  "
-                    f"avg={avg:.0f}ms  p50={p50:.0f}ms  p95={p95:.0f}ms"
-                )
-        else:
-            samples.append(elapsed_ms)  # count toward warm-up
-
-        return {"actions": actions}, cache
+        return {"actions": actions, "latency_ms": elapsed_ms}, cache
 
     except Exception as e:
         logger.error(f"Inference error: {e}")
         traceback.print_exc()
-        return {"actions": np.zeros((CONFIG["action_horizon"], CONFIG["action_dim"]))}, cache
+        return {"actions": np.zeros((CONFIG["action_horizon"], CONFIG["action_dim"])),
+                "latency_ms": None}, cache
 
 
 async def handle_connection(websocket, path=None):
@@ -275,6 +270,9 @@ async def handle_connection(websocket, path=None):
 
     # Each connection gets its own cache (supports concurrent multi-suite eval)
     vision_cache = None
+    # Per-connection latency samples (ms); isolated so concurrent eval suites
+    # don't contaminate each other's stats.
+    latency_samples = []
 
     try:
         # Send server metadata on connection
@@ -303,6 +301,21 @@ async def handle_connection(websocket, path=None):
 
                 # Run inference (cache maintained across steps within connection)
                 result, vision_cache = infer(request, cache=vision_cache)
+
+                # Accumulate per-connection latency (skip warm-up steps)
+                lat = result.get("latency_ms")
+                if lat is not None:
+                    latency_samples.append(lat)
+                    n = len(latency_samples) - CONFIG["latency_warmup"]
+                    if n > 0 and n % 20 == 0:
+                        valid = latency_samples[CONFIG["latency_warmup"]:]
+                        avg = sum(valid) / len(valid)
+                        p50 = sorted(valid)[len(valid) // 2]
+                        p95 = sorted(valid)[int(len(valid) * 0.95)]
+                        logger.info(
+                            f"[Latency] n={len(valid)}  "
+                            f"avg={avg:.0f}ms  p50={p50:.0f}ms  p95={p95:.0f}ms"
+                        )
 
                 # Send response (convert numpy to list for compatibility)
                 actions = result["actions"]
@@ -337,8 +350,7 @@ async def handle_connection(websocket, path=None):
                     f"hit rate={hits/total:.1%} ({hits}/{total} views cached)"
                 )
         # Print final latency summary for this connection
-        samples = CONFIG["_latency_samples"]
-        valid = samples[CONFIG["_latency_warmup"]:]
+        valid = latency_samples[CONFIG["latency_warmup"]:]
         if valid:
             avg = sum(valid) / len(valid)
             p50 = sorted(valid)[len(valid) // 2]
@@ -382,13 +394,18 @@ def main():
                         help="ATTC EMA decay factor (default: 0.9 ≈ 10-frame window)")
     parser.add_argument("--cache_warmup", type=int, default=3,
                         help="ATTC warmup steps before caching activates (default: 3)")
+    parser.add_argument("--cache_fixed_threshold", type=float, default=None,
+                        help="Fixed-τ ablation baseline (VLA-Cache style). "
+                             "If set, overrides the adaptive threshold with this "
+                             "constant value (e.g. 0.02). Default: None (adaptive)")
 
     args = parser.parse_args()
 
-    CONFIG["use_cache"]      = args.use_cache
-    CONFIG["cache_alpha"]    = args.cache_alpha
-    CONFIG["cache_beta"]     = args.cache_beta
-    CONFIG["cache_warmup"]   = args.cache_warmup
+    CONFIG["use_cache"]            = args.use_cache
+    CONFIG["cache_alpha"]          = args.cache_alpha
+    CONFIG["cache_beta"]           = args.cache_beta
+    CONFIG["cache_warmup"]         = args.cache_warmup
+    CONFIG["cache_fixed_threshold"] = args.cache_fixed_threshold
 
     if not HAS_MSGPACK:
         logger.warning("msgpack_numpy not installed! Install with: pip install msgpack-numpy")

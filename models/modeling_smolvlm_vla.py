@@ -503,6 +503,7 @@ class SmolVLMVLA(PreTrainedModel):
         alpha: float = 1.0,
         beta: float = 0.9,
         warmup_steps: int = 3,
+        fixed_threshold: float = None,
     ):
         """
         Adaptive Temporal Token Cache (ATTC) forward.
@@ -518,10 +519,13 @@ class SmolVLMVLA(PreTrainedModel):
         speed vs. accuracy without manual tuning.
 
         Args:
-            cache:         None on episode start, else dict returned by previous call
-            alpha:         threshold multiplier (higher → more caching)
-            beta:          EMA decay (~0.9 = 10-frame window)
-            warmup_steps:  encode fully for first N steps to warm up EMA stats
+            cache:           None on episode start, else dict returned by previous call
+            alpha:           threshold multiplier (higher → more caching)
+            beta:            EMA decay (~0.9 = 10-frame window)
+            warmup_steps:    encode fully for first N steps to warm up EMA stats
+            fixed_threshold: if not None, use this CONSTANT threshold instead of
+                             the adaptive τ (ablation baseline, e.g. VLA-Cache).
+                             EMA stats are still tracked for logging but ignored.
 
         Returns:
             enc:          {"vlm_features": [B, T, D]}
@@ -583,7 +587,12 @@ class SmolVLMVLA(PreTrainedModel):
             cache["ema_mean"][b_idx, v_idx] = new_em
             cache["ema_std"][b_idx,  v_idx] = new_es
 
-            threshold = new_em + alpha * new_es
+            if fixed_threshold is not None:
+                # Ablation baseline: constant threshold (VLA-Cache style)
+                threshold = fixed_threshold
+            else:
+                # Adaptive threshold τ = EMA_mean + α·EMA_std
+                threshold = new_em + alpha * new_es
             view_needs_encode[bv_idx] = frame_mean > threshold
 
         encode_indices = [i for i in valid_indices if     view_needs_encode[i]]
