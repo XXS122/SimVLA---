@@ -18,6 +18,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 import traceback
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -63,6 +64,9 @@ CONFIG = {
     "cache_beta": 0.9,
     "cache_warmup": 3,
     "cache_log_interval": 20,
+    # Latency tracking (populated at runtime)
+    "_latency_warmup": 5,       # skip first N steps (GPU warm-up)
+    "_latency_samples": [],     # per-step latencies (ms)
 }
 
 
@@ -163,6 +167,8 @@ def infer(observation: Dict[str, Any], cache: dict = None):
     """
     global model, processor
 
+    t_start = time.perf_counter()
+
     try:
         # Extract observation fields
         image0 = observation.get("observation/image")
@@ -238,6 +244,23 @@ def infer(observation: Dict[str, Any], cache: dict = None):
                 cache = None
 
         actions = actions.cpu().numpy()[0]
+
+        # Track latency (skip warm-up steps)
+        elapsed_ms = (time.perf_counter() - t_start) * 1000
+        samples = CONFIG["_latency_samples"]
+        if len(samples) >= CONFIG["_latency_warmup"]:
+            samples.append(elapsed_ms)
+            if len(samples) % 20 == 0:
+                avg = sum(samples) / len(samples)
+                p50 = sorted(samples)[len(samples) // 2]
+                p95 = sorted(samples)[int(len(samples) * 0.95)]
+                logger.info(
+                    f"[Latency] n={len(samples)}  "
+                    f"avg={avg:.0f}ms  p50={p50:.0f}ms  p95={p95:.0f}ms"
+                )
+        else:
+            samples.append(elapsed_ms)  # count toward warm-up
+
         return {"actions": actions}, cache
 
     except Exception as e:
@@ -313,6 +336,17 @@ async def handle_connection(websocket, path=None):
                     f"Connection closed — ATTC session stats: "
                     f"hit rate={hits/total:.1%} ({hits}/{total} views cached)"
                 )
+        # Print final latency summary for this connection
+        samples = CONFIG["_latency_samples"]
+        valid = samples[CONFIG["_latency_warmup"]:]
+        if valid:
+            avg = sum(valid) / len(valid)
+            p50 = sorted(valid)[len(valid) // 2]
+            p95 = sorted(valid)[int(len(valid) * 0.95)]
+            logger.info(
+                f"[Latency summary] n={len(valid)}  "
+                f"avg={avg:.1f}ms  p50={p50:.1f}ms  p95={p95:.1f}ms"
+            )
         logger.info(f"Connection from {websocket.remote_address} closed")
 
 
