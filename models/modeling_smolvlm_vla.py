@@ -443,7 +443,7 @@ class SmolVLMVLA(PreTrainedModel):
     ) -> torch.Tensor:
         """
         Flow Matching inference (Euler integration).
-        
+
         1) Initialize x_t = noise (t=1)
         2) Loop t from 1 to 0:
            - Model predicts velocity v_t
@@ -452,13 +452,22 @@ class SmolVLMVLA(PreTrainedModel):
         """
         self.eval()
         enc = self.forward_vlm_efficient(image_input, image_mask, input_ids)
+        return self.generate_actions_from_enc(enc, proprio, steps=steps)
 
-        B = input_ids.shape[0]
+    @torch.no_grad()
+    def generate_actions_from_enc(
+        self,
+        enc: Dict[str, torch.Tensor],
+        proprio: torch.Tensor,
+        steps: int = 10,
+    ) -> torch.Tensor:
+        """Euler flow matching from pre-computed VLM features."""
+        self.eval()
+        B = enc["vlm_features"].shape[0]
         D = self.action_space.dim_action
         device = proprio.device
         dtype = proprio.dtype
 
-        # Normalize proprio
         if hasattr(self.action_space, 'normalize_state'):
             proprio_norm = self.action_space.normalize_state(proprio)
         elif hasattr(self.action_space, 'normalize'):
@@ -466,27 +475,209 @@ class SmolVLMVLA(PreTrainedModel):
         else:
             proprio_norm = proprio
 
-        # Euler integration
         steps = max(1, int(steps))
         dt = -1.0 / steps
-        
         x_t = torch.randn(B, self.num_actions, D, device=device, dtype=dtype)
         t = 1.0
-        
+
         while t > -dt / 2:
             t_tensor = torch.full((B,), t, device=device, dtype=dtype)
-            
             v_t = self.transformer(
                 vlm_features=enc["vlm_features"],
                 action_with_noise=x_t,
                 proprio=proprio_norm,
                 t=t_tensor,
             )
-        
             x_t = x_t + dt * v_t
             t = t + dt
-        
+
         return self.action_space.postprocess(x_t)
+
+    @torch.no_grad()
+    def forward_vlm_with_cache(
+        self,
+        pixel_values: torch.FloatTensor,
+        image_mask: torch.Tensor,
+        input_ids: torch.LongTensor,
+        cache: dict = None,
+        alpha: float = 1.0,
+        beta: float = 0.9,
+        warmup_steps: int = 3,
+    ):
+        """
+        Adaptive Temporal Token Cache (ATTC) forward.
+
+        Per-view caching: for each camera view, computes patch-level pixel
+        differences against the previous frame.  An EMA-tracked adaptive
+        threshold τ = EMA_mean + α·EMA_std decides per-view:
+          - diff > τ  →  re-encode with SigLIP  (scene changed)
+          - diff ≤ τ  →  reuse cached features  (cache hit)
+
+        The adaptive threshold rises automatically during fast arm motion /
+        contact events and falls during slow free-space travel, trading off
+        speed vs. accuracy without manual tuning.
+
+        Args:
+            cache:         None on episode start, else dict returned by previous call
+            alpha:         threshold multiplier (higher → more caching)
+            beta:          EMA decay (~0.9 = 10-frame window)
+            warmup_steps:  encode fully for first N steps to warm up EMA stats
+
+        Returns:
+            enc:          {"vlm_features": [B, T, D]}
+            updated_cache: pass to next call; reset to None on episode start
+            stats:        {"cache_hits": int, "total_views": int, "hit_rate": float}
+        """
+        if pixel_values.dim() == 6:
+            pixel_values = pixel_values.squeeze(2) if pixel_values.size(2) == 1 \
+                else pixel_values[:, :, 0]
+        B, V, C, H, W = pixel_values.shape
+        device = pixel_values.device
+        dtype = pixel_values.dtype
+
+        try:
+            patch_size = self.vlm.model.vision_model.config.patch_size
+        except AttributeError:
+            patch_size = 14
+        h_p = max(1, H // patch_size)
+        w_p = max(1, W // patch_size)
+
+        # Initialise cache on first call
+        if cache is None:
+            cache = {
+                "step_count": 0,
+                "patch_features": None,      # [B*V, num_patches, lm_hidden] on CPU
+                "prev_pixel_values": None,   # [B*V, C, H, W] on CPU float32
+                "ema_mean": np.zeros((B, V), dtype=np.float32),
+                "ema_std":  np.ones((B, V),  dtype=np.float32) * 0.1,
+                "cache_hits": 0,
+                "total_views": 0,
+            }
+        cache = {k: v for k, v in cache.items()}  # shallow copy
+
+        step = cache["step_count"]
+        flat_images = pixel_values.flatten(0, 1)   # [B*V, C, H, W]
+        flat_mask   = image_mask.view(-1).bool()   # [B*V]
+        valid_indices = [i for i in range(B * V) if flat_mask[i]]
+
+        # ---- Decide which views need re-encoding --------------------------------
+        view_needs_encode = {}  # bv_idx -> bool
+        for bv_idx in valid_indices:
+            b_idx = bv_idx // V
+            v_idx = bv_idx  % V
+
+            if step < warmup_steps or cache["prev_pixel_values"] is None:
+                view_needs_encode[bv_idx] = True
+                continue
+
+            curr = flat_images[bv_idx]                                   # [C,H,W]
+            prev = cache["prev_pixel_values"][bv_idx].to(device=device, dtype=dtype)
+            diff = (curr - prev).abs()                                   # [C,H,W]
+            diff_patches = diff.reshape(C, h_p, patch_size, w_p, patch_size)
+            frame_mean = diff_patches.mean().item()
+
+            em = float(cache["ema_mean"][b_idx, v_idx])
+            es = float(cache["ema_std"][b_idx,  v_idx])
+            new_em = beta * em + (1 - beta) * frame_mean
+            new_es = beta * es + (1 - beta) * abs(frame_mean - em)
+            cache["ema_mean"][b_idx, v_idx] = new_em
+            cache["ema_std"][b_idx,  v_idx] = new_es
+
+            threshold = new_em + alpha * new_es
+            view_needs_encode[bv_idx] = frame_mean > threshold
+
+        encode_indices = [i for i in valid_indices if     view_needs_encode[i]]
+        cached_indices = [i for i in valid_indices if not view_needs_encode[i]]
+        num_valid      = len(valid_indices)
+        cache_hits     = len(cached_indices)
+        cache["cache_hits"]   += cache_hits
+        cache["total_views"]  += num_valid
+
+        # ---- Encode views that changed ------------------------------------------
+        if encode_indices:
+            imgs_to_encode = flat_images[encode_indices]
+            vis_out = self.vlm.model.vision_model(
+                pixel_values=imgs_to_encode,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            new_feats = vis_out.last_hidden_state   # [n_enc, num_patches, vis_hid]
+            if hasattr(self.vlm.model, 'connector'):
+                new_feats = self.vlm.model.connector(new_feats)
+            elif hasattr(self.vlm.model, 'multi_modal_projector'):
+                new_feats = self.vlm.model.multi_modal_projector(new_feats)
+        else:
+            new_feats = None
+
+        # ---- Determine num_patches / hidden_size --------------------------------
+        if new_feats is not None:
+            num_patches = new_feats.shape[1]
+            hidden_size = new_feats.shape[2]
+        else:
+            num_patches = cache["patch_features"].shape[1]
+            hidden_size = cache["patch_features"].shape[2]
+
+        # ---- Assemble image_features [num_valid, num_patches, hidden_size] ------
+        flat_to_rank = {bv: r for r, bv in enumerate(valid_indices)}
+        image_features = torch.zeros(
+            num_valid, num_patches, hidden_size, device=device, dtype=dtype
+        )
+        for enc_rank, bv_idx in enumerate(encode_indices):
+            image_features[flat_to_rank[bv_idx]] = new_feats[enc_rank]
+        for bv_idx in cached_indices:
+            image_features[flat_to_rank[bv_idx]] = \
+                cache["patch_features"][bv_idx].to(device=device, dtype=dtype)
+
+        # ---- Update feature cache & prev pixels ---------------------------------
+        if cache["patch_features"] is None:
+            cache["patch_features"] = torch.zeros(
+                B * V, num_patches, hidden_size, dtype=torch.float32
+            )
+        for enc_rank, bv_idx in enumerate(encode_indices):
+            cache["patch_features"][bv_idx] = new_feats[enc_rank].cpu().float()
+        cache["prev_pixel_values"] = flat_images.cpu().float()
+        cache["step_count"] = step + 1
+
+        # ---- Continue with text model (same as forward_vlm_efficient) -----------
+        text_embeds = self.vlm.model.text_model.get_input_embeddings()(input_ids)
+
+        full_image_features = image_features.new_zeros(B * V, num_patches, hidden_size)
+        full_image_features[flat_mask] = image_features
+        full_image_features = full_image_features.view(B, V, num_patches, hidden_size)
+
+        valid_per_sample = image_mask.sum(dim=1).int()
+        batch_inputs_embeds = []
+        max_seq_len = 0
+        for b in range(B):
+            n_valid = valid_per_sample[b].item()
+            img_feats = full_image_features[b, :n_valid].reshape(-1, hidden_size)
+            combined = torch.cat([img_feats, text_embeds[b]], dim=0)
+            batch_inputs_embeds.append(combined)
+            max_seq_len = max(max_seq_len, combined.shape[0])
+
+        padded = torch.zeros(B, max_seq_len, hidden_size, device=device, dtype=dtype)
+        attn_mask = torch.zeros(B, max_seq_len, device=device, dtype=torch.long)
+        for b, emb in enumerate(batch_inputs_embeds):
+            padded[b, :emb.shape[0]] = emb
+            attn_mask[b, :emb.shape[0]] = 1
+
+        lm_out = self.vlm.model.text_model(
+            inputs_embeds=padded,
+            attention_mask=attn_mask,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        vlm_features = lm_out.last_hidden_state
+
+        enc = {"vlm_features": vlm_features}
+        hit_rate = cache_hits / num_valid if num_valid > 0 else 0.0
+        stats = {
+            "cache_hits": cache_hits,
+            "total_views": num_valid,
+            "hit_rate": hit_rate,
+            "encode_count": len(encode_indices),
+        }
+        return enc, cache, stats
 
     # =============================== FastAPI service =============================
     def _build_app(self, processor):

@@ -86,8 +86,11 @@ def _quat2axisangle(quat: np.ndarray) -> np.ndarray:
 class WebSocketClient:
     """
     WebSocket client for SimVLA server.
-    
+
     Requires: pip install openpi-client
+
+    On each episode boundary, call reset() so the server clears its
+    Adaptive Temporal Token Cache (ATTC) for the new episode.
     """
     def __init__(self, host: str, port: int, replan_steps: int = 5, resize_size: int = 224):
         if not HAS_WS_CLIENT:
@@ -99,6 +102,7 @@ class WebSocketClient:
 
     def reset(self) -> None:
         self.action_plan: Deque[np.ndarray] = collections.deque()
+        self._send_reset = True   # signal server to clear vision cache on next step
 
     def step(self, obs: Dict, goal: str) -> np.ndarray:
         if not self.action_plan:
@@ -109,7 +113,7 @@ class WebSocketClient:
             wrist_img = image_tools.convert_to_uint8(
                 image_tools.resize_with_pad(obs["wrist_image"], self.resize_size, self.resize_size)
             )
-            
+
             # Build observation dict
             element = {
                 "observation/image": img,
@@ -117,18 +121,23 @@ class WebSocketClient:
                 "observation/state": obs["state"],
                 "prompt": goal,
             }
-            
+
+            # Attach episode-reset flag once (cleared after first inference of episode)
+            if self._send_reset:
+                element["reset"] = True
+                self._send_reset = False
+
             # Query server
             result = self.client.infer(element)
             action_chunk = result["actions"]
-            
+
             # Ensure numpy array
             if not isinstance(action_chunk, np.ndarray):
                 action_chunk = np.array(action_chunk)
-            
+
             assert len(action_chunk) >= self.replan_steps, \
                 f"Need {self.replan_steps} steps but got {len(action_chunk)}"
-            
+
             for i in range(min(self.replan_steps, len(action_chunk))):
                 self.action_plan.append(action_chunk[i])
 

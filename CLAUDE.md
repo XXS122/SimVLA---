@@ -85,11 +85,19 @@ Training logs are saved for later review:
 ```bash
 source paths.env
 
-# checkpoint 默认读取 $SIMVLA_CHECKPOINTS，也可以手动指定
+# 标准模式（无缓存）
 CUDA_VISIBLE_DEVICES=0 python evaluation/libero/serve_smolvlm_libero.py \
   --checkpoint ./runs/simvla_libero_small/step_200000 \
   --norm_stats ./norm_stats/libero_norm.json \
   --port 8102
+
+# 启用 ATTC 时序缓存（加速推理）
+CUDA_VISIBLE_DEVICES=0 python evaluation/libero/serve_smolvlm_libero.py \
+  --checkpoint ./runs/simvla_libero_small/step_200000 \
+  --norm_stats ./norm_stats/libero_norm.json \
+  --port 8102 \
+  --use_cache \
+  --cache_alpha 1.0    # 阈值系数：越大缓存越激进
 ```
 
 等到日志出现 `SimVLA server listening on 0.0.0.0:8102` 后再运行评估。
