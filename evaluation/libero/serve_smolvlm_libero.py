@@ -178,6 +178,8 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
         proprio_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
         
         # Inference
+        import time as _time
+        _t0 = _time.perf_counter()
         with torch.no_grad():
             gen = model.generate_actions(
                 input_ids=lang['input_ids'],
@@ -188,6 +190,10 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
                 solver=CONFIG["solver"],
                 return_boundary=CONFIG["send_boundary"],
             )
+
+        _latency_ms = (_time.perf_counter() - _t0) * 1000
+        logger.info(f"[LATENCY] solver={CONFIG['solver']} nfe={CONFIG['nfe_steps']} "
+                    f"=> {_latency_ms:.1f}ms")
 
         if isinstance(gen, tuple):
             actions, boundary = gen
