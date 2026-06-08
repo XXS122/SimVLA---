@@ -233,7 +233,12 @@ def eval_libero(
     print(f"   Max steps: {max_steps}")
     
     total_episodes, total_successes = 0, 0
-    
+    # Trajectory-efficiency tracking: how many env steps each episode took.
+    # Stale-feature caching (ATTC) can keep success rate at 100% while making
+    # the arm "wander", so step count is a key quality metric alongside SR.
+    total_steps = 0          # steps over all episodes
+    success_steps = 0        # steps over successful episodes only
+
     task_ids = [task_id] if task_id is not None else range(num_tasks - 1, -1, -1)
     for task_id in tqdm(task_ids, desc="Tasks"):
         task = task_suite.get_task(task_id)
@@ -299,7 +304,10 @@ def eval_libero(
                     break
 
             total_episodes += 1
-            
+            total_steps += t
+            if done:
+                success_steps += t
+
             # Save video
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")[:50]
@@ -316,7 +324,13 @@ def eval_libero(
     
     success_rate = total_successes / max(total_episodes, 1)
     print(f"\nTotal success rate: {total_successes}/{total_episodes} ({success_rate*100:.1f}%)")
-    
+
+    # Trajectory efficiency: lower steps = better. ATTC trades this off against
+    # cache hit rate, so report both all-episode and success-only averages.
+    avg_steps = total_steps / max(total_episodes, 1)
+    avg_steps_succ = success_steps / max(total_successes, 1)
+    print(f"Average steps per episode: {avg_steps:.1f} (success-only: {avg_steps_succ:.1f})")
+
     return success_rate
 
 

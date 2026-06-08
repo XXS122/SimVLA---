@@ -139,6 +139,7 @@ run_one() {
     # 6) 打印本实验关键结果
     echo "   结果:"
     grep -i "Total success rate" "$client_log" | tail -1 | sed 's/^/      SR: /'
+    grep    "Average steps per episode" "$client_log" | tail -1 | sed 's/^/      /'
     grep    "Latency summary"    "$server_log" | tail -1 | sed 's/^.*\[Latency/      [Latency/'
     grep    "cumulative hit rate" "$server_log" | tail -1 | sed 's/^.*\[ATTC/      [ATTC/'
     echo "[$(date +%H:%M:%S)] 完成实验: ${name}"
@@ -175,13 +176,14 @@ SUMMARY="${OUT_DIR}/SUMMARY.txt"
     echo "checkpoint: $CKPT"
     echo "时间: $(date)"
     echo ""
-    printf "%-14s | %-22s | %-50s | %s\n" "实验" "成功率" "延迟" "命中率"
-    echo "-------------------------------------------------------------------------------------------------"
+    printf "%-14s | %-22s | %-18s | %-50s | %s\n" "实验" "成功率" "平均步数" "延迟" "命中率"
+    echo "-----------------------------------------------------------------------------------------------------------------------"
     for name in B0_baseline C2_attc C1_fixed A_alpha05 A_alpha15 A_alpha20 A_beta07 A_beta099; do
         sr=$(grep -i "Total success rate" "${OUT_DIR}/${name}_goal.txt" 2>/dev/null | tail -1 | sed 's/Total success rate: //I')
+        steps=$(grep "Average steps per episode" "${OUT_DIR}/${name}_goal.txt" 2>/dev/null | tail -1 | sed 's/Average steps per episode: //')
         lat=$(grep "Latency summary" "${OUT_DIR}/${name}_server.log" 2>/dev/null | tail -1 | sed 's/^.*\[Latency summary\] //')
         hr=$(grep "cumulative hit rate" "${OUT_DIR}/${name}_server.log" 2>/dev/null | tail -1 | sed 's/^.*cumulative hit rate: //;s/ .*//')
-        printf "%-14s | %-22s | %-50s | %s\n" "$name" "${sr:-N/A}" "${lat:-N/A}" "${hr:-—}"
+        printf "%-14s | %-22s | %-18s | %-50s | %s\n" "$name" "${sr:-N/A}" "${steps:-N/A}" "${lat:-N/A}" "${hr:-—}"
     done
 } | tee "$SUMMARY"
 
