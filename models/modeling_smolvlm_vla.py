@@ -19,6 +19,7 @@ from typing import Any, Dict
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from PIL import Image
@@ -504,15 +505,23 @@ class SmolVLMVLA(PreTrainedModel):
         beta: float = 0.9,
         warmup_steps: int = 3,
         fixed_threshold: float = None,
+        max_cache_age: int = 8,
     ):
         """
         Adaptive Temporal Token Cache (ATTC) forward.
 
-        Per-view caching: for each camera view, computes patch-level pixel
-        differences against the previous frame.  An EMA-tracked adaptive
-        threshold τ = EMA_mean + α·EMA_std decides per-view:
-          - diff > τ  →  re-encode with SigLIP  (scene changed)
-          - diff ≤ τ  →  reuse cached features  (cache hit)
+        Per-view caching: for each camera view, computes a localized motion
+        signal against the frame at which the view was last encoded.  An
+        EMA-tracked adaptive threshold τ = EMA_mean + α·EMA_std decides per-view:
+          - motion > τ  →  re-encode with SigLIP  (scene changed)
+          - motion ≤ τ  →  reuse cached features  (cache hit)
+
+        Motion signal: the per-pixel diff is pooled onto the SigLIP patch grid
+        and the MAXIMUM patch diff is taken as the motion signal.  A frame-wide mean
+        or even high-percentile is diluted by the static background (~90% of pixels)
+        — numerical tests show that for a 40×40px arm region (1.1% of a 384×384 frame),
+        even pct98 = 0.118 while patch_max = 1.0.  Only the patch maximum reliably
+        catches small localized arm motion at all arm sizes.
 
         The adaptive threshold rises automatically during fast arm motion /
         contact events and falls during slow free-space travel, trading off
@@ -526,6 +535,10 @@ class SmolVLMVLA(PreTrainedModel):
             fixed_threshold: if not None, use this CONSTANT threshold instead of
                              the adaptive τ (ablation baseline, e.g. VLA-Cache).
                              EMA stats are still tracked for logging but ignored.
+            max_cache_age:   hard cap on consecutive cache hits per view; a view is
+                             force-re-encoded at least every max_cache_age steps,
+                             bounding worst-case staleness even if motion stays low.
+                             Set None to disable.
 
         Returns:
             enc:          {"vlm_features": [B, T, D]}
@@ -558,6 +571,8 @@ class SmolVLMVLA(PreTrainedModel):
                 # far above typical ImageNet-normalised frame diffs (~0.05), causing
                 # near-total caching and catastrophic failure.
                 "ema_std":  np.zeros((B, V), dtype=np.float32),
+                # consecutive cache-hit count per view (for max_cache_age cap)
+                "age": np.zeros((B, V), dtype=np.int32),
                 "cache_hits": 0,
                 "total_views": 0,
             }
@@ -583,16 +598,28 @@ class SmolVLMVLA(PreTrainedModel):
                 continue
 
             curr = flat_images[bv_idx]                                   # [C,H,W]
-            # `ref` is the frame at which this view was last ENCODED, so frame_mean
+            # `ref` is the frame at which this view was last ENCODED, so the diff
             # measures cumulative drift since the cached features were computed.
             ref = cache["prev_pixel_values"][bv_idx].to(device=device, dtype=dtype)
-            frame_mean = (curr - ref).abs().mean().item()
+            # Localized motion signal: pool per-pixel diff onto the patch grid and
+            # take a high percentile, so a small but important moving region (the
+            # arm/gripper) drives the decision instead of being diluted by the
+            # static background in a frame-wide mean.  avg_pool2d floors the output
+            # size, so it tolerates H/W not being an exact multiple of patch_size.
+            diff = (curr - ref).abs().unsqueeze(0)                       # [1,C,H,W]
+            patch_diff = F.avg_pool2d(diff, kernel_size=patch_size, stride=patch_size)
+            patch_diff = patch_diff.mean(dim=1).flatten()                # [h_p*w_p]
+            # patch_max: most-changed patch drives the decision.
+            # A frame-mean or high-percentile is dominated by static background
+            # (~90% pixels) and misses small arm motion — patch_max detects any
+            # localized change regardless of arm size.
+            motion = patch_diff.max().item()
 
             # Always update EMA (even during warmup) for calibration
             em = float(cache["ema_mean"][b_idx, v_idx])
             es = float(cache["ema_std"][b_idx,  v_idx])
-            new_em = beta * em + (1 - beta) * frame_mean
-            new_es = beta * es + (1 - beta) * abs(frame_mean - em)
+            new_em = beta * em + (1 - beta) * motion
+            new_es = beta * es + (1 - beta) * abs(motion - em)
             cache["ema_mean"][b_idx, v_idx] = new_em
             cache["ema_std"][b_idx,  v_idx] = new_es
 
@@ -607,7 +634,12 @@ class SmolVLMVLA(PreTrainedModel):
             else:
                 # Adaptive threshold τ = EMA_mean + α·EMA_std
                 threshold = new_em + alpha * new_es
-            view_needs_encode[bv_idx] = frame_mean > threshold
+            drift_exceeded = motion > threshold
+            # Hard time cap: force a refresh if this view has been cached for
+            # max_cache_age consecutive steps, bounding worst-case staleness.
+            age = int(cache["age"][b_idx, v_idx])
+            age_exceeded = (max_cache_age is not None) and (age >= max_cache_age)
+            view_needs_encode[bv_idx] = drift_exceeded or age_exceeded
 
         encode_indices = [i for i in valid_indices if     view_needs_encode[i]]
         cached_indices = [i for i in valid_indices if not view_needs_encode[i]]
@@ -673,6 +705,14 @@ class SmolVLMVLA(PreTrainedModel):
             cache["prev_pixel_values"] = ref
         for enc_rank, bv_idx in enumerate(encode_indices):
             cache["patch_features"][bv_idx] = new_feats[enc_rank].cpu().float()
+        # Update per-view age: reset on re-encode, increment on cache hit.
+        for bv_idx in valid_indices:
+            b_idx = bv_idx // V
+            v_idx = bv_idx  % V
+            if view_needs_encode[bv_idx]:
+                cache["age"][b_idx, v_idx] = 0
+            else:
+                cache["age"][b_idx, v_idx] += 1
         cache["step_count"] = step + 1
 
         # ---- Continue with text model (same as forward_vlm_efficient) -----------

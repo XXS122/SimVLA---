@@ -64,6 +64,7 @@ CONFIG = {
     "cache_beta": 0.9,
     "cache_warmup": 3,
     "cache_fixed_threshold": None,   # None = adaptive; float = fixed-τ baseline
+    "cache_max_age": 8,              # force re-encode a view every N steps (None=off)
     "cache_log_interval": 20,
     "latency_warmup": 5,             # skip first N steps (GPU warm-up) in latency stats
 }
@@ -108,16 +109,17 @@ def load_model(checkpoint_path: str, norm_stats_path: str = None, smolvlm_model_
 
     logger.info(f"Model loaded! Device: {device}, Image size: {CONFIG['image_size']}x{CONFIG['image_size']}")
     if CONFIG["use_cache"]:
+        common = (f"patch_max_motion, "
+                  f"max_age={CONFIG['cache_max_age']}, warmup={CONFIG['cache_warmup']}")
         if CONFIG["cache_fixed_threshold"] is not None:
             logger.info(
                 f"  Cache ENABLED [FIXED-τ baseline]: "
-                f"threshold={CONFIG['cache_fixed_threshold']}, "
-                f"warmup={CONFIG['cache_warmup']}"
+                f"threshold={CONFIG['cache_fixed_threshold']}, {common}"
             )
         else:
             logger.info(
                 f"  ATTC cache ENABLED [adaptive]: alpha={CONFIG['cache_alpha']}, "
-                f"beta={CONFIG['cache_beta']}, warmup={CONFIG['cache_warmup']}"
+                f"beta={CONFIG['cache_beta']}, {common}"
             )
     else:
         logger.info("  ATTC cache DISABLED (pass --use_cache to enable)")
@@ -240,6 +242,7 @@ def infer(observation: Dict[str, Any], cache: dict = None):
                     beta=CONFIG["cache_beta"],
                     warmup_steps=CONFIG["cache_warmup"],
                     fixed_threshold=CONFIG["cache_fixed_threshold"],
+                    max_cache_age=CONFIG["cache_max_age"],
                 )
                 actions = model.generate_actions_from_enc(
                     enc, proprio_tensor, steps=CONFIG["action_horizon"]
@@ -411,7 +414,10 @@ def main():
     parser.add_argument("--cache_fixed_threshold", type=float, default=None,
                         help="Fixed-τ ablation baseline (VLA-Cache style). "
                              "If set, overrides the adaptive threshold with this "
-                             "constant value (e.g. 0.02). Default: None (adaptive)")
+                             "constant value (e.g. 0.10). Default: None (adaptive)")
+    parser.add_argument("--cache_max_age", type=int, default=8,
+                        help="Force re-encode a view at least every N steps to bound "
+                             "staleness (default: 8). Set <=0 to disable the cap.")
 
     args = parser.parse_args()
 
@@ -420,6 +426,7 @@ def main():
     CONFIG["cache_beta"]           = args.cache_beta
     CONFIG["cache_warmup"]         = args.cache_warmup
     CONFIG["cache_fixed_threshold"] = args.cache_fixed_threshold
+    CONFIG["cache_max_age"]        = args.cache_max_age if args.cache_max_age > 0 else None
 
     if not HAS_MSGPACK:
         logger.warning("msgpack_numpy not installed! Install with: pip install msgpack-numpy")
