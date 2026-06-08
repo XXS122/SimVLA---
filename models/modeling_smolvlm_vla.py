@@ -440,15 +440,28 @@ class SmolVLMVLA(PreTrainedModel):
         image_mask: torch.Tensor,
         proprio: torch.Tensor,
         steps: int = 10,
-    ) -> torch.Tensor:
+        solver: str = "euler",
+        return_boundary: bool = False,
+    ):
         """
-        Flow Matching inference (Euler integration).
-        
+        Flow Matching inference (ODE integration).
+
         1) Initialize x_t = noise (t=1)
-        2) Loop t from 1 to 0:
-           - Model predicts velocity v_t
-           - Euler update: x_t = x_t + dt * v_t
+        2) Loop t from 1 to 0, predicting velocity v_t and integrating
         3) Final x_0 ≈ target action
+
+        Args
+        ----
+        steps : number of integration steps (NFE for Euler; 2*NFE for Heun).
+        solver : "euler" (1st-order, default, original behaviour) or
+                 "heun" (2nd-order predictor-corrector). Heun has O(dt^3) local
+                 error so it reaches Euler-quality actions at roughly half the
+                 steps -> lower inference latency.
+        return_boundary : if True, additionally query the trained adaptive
+                 chunking boundary head on the final actions and return
+                 (actions, boundary_scores). boundary_scores is [B, T] with high
+                 values at high-change (contact / reversal) steps. Returns
+                 (actions, None) when the checkpoint has no boundary head.
         """
         self.eval()
         enc = self.forward_vlm_efficient(image_input, image_mask, input_ids)
@@ -466,27 +479,55 @@ class SmolVLMVLA(PreTrainedModel):
         else:
             proprio_norm = proprio
 
-        # Euler integration
+        def velocity(x, t_scalar):
+            t_tensor = torch.full((B,), t_scalar, device=device, dtype=dtype)
+            return self.transformer(
+                vlm_features=enc["vlm_features"],
+                action_with_noise=x,
+                proprio=proprio_norm,
+                t=t_tensor,
+            )
+
+        # ODE integration (t: 1 -> 0)
         steps = max(1, int(steps))
         dt = -1.0 / steps
-        
+        solver = (solver or "euler").lower()
+
         x_t = torch.randn(B, self.num_actions, D, device=device, dtype=dtype)
         t = 1.0
-        
-        while t > -dt / 2:
-            t_tensor = torch.full((B,), t, device=device, dtype=dtype)
-            
-            v_t = self.transformer(
+        for _ in range(steps):
+            if solver == "heun":
+                v1 = velocity(x_t, t)
+                x_pred = x_t + dt * v1
+                v2 = velocity(x_pred, t + dt)
+                x_t = x_t + dt * 0.5 * (v1 + v2)
+            else:
+                x_t = x_t + dt * velocity(x_t, t)
+            t = t + dt
+
+        actions = self.action_space.postprocess(x_t)
+
+        if not return_boundary:
+            return actions
+
+        # Adaptive Action Chunking signal from the trained boundary head, read
+        # off the final denoised actions (t ~ 0). High score => high local
+        # change rate (contact / reversal) => the client should replan sooner;
+        # low score => smooth motion => the client can commit further.
+        boundary = None
+        head = getattr(self.transformer, "chunk_boundary_head", None)
+        if head is not None:
+            t_tensor = torch.full((B,), max(t, 0.0), device=device, dtype=dtype)
+            out = self.transformer(
                 vlm_features=enc["vlm_features"],
                 action_with_noise=x_t,
                 proprio=proprio_norm,
                 t=t_tensor,
+                return_boundary=True,
             )
-        
-            x_t = x_t + dt * v_t
-            t = t + dt
-        
-        return self.action_space.postprocess(x_t)
+            if isinstance(out, tuple):
+                boundary = out[1]
+        return actions, boundary
 
     # =============================== FastAPI service =============================
     def _build_app(self, processor):

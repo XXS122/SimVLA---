@@ -56,6 +56,10 @@ CONFIG = {
     "action_dim": 7,
     "action_horizon": 10,
     "image_size": 384,
+    # Inference-time knobs (set from CLI in main()):
+    "solver": "euler",        # "euler" (baseline) or "heun" (2nd-order)
+    "nfe_steps": 10,          # number of ODE integration steps
+    "send_boundary": False,   # also return adaptive-chunking boundary scores
 }
 
 
@@ -175,17 +179,25 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
         
         # Inference
         with torch.no_grad():
-            actions = model.generate_actions(
+            gen = model.generate_actions(
                 input_ids=lang['input_ids'],
                 image_input=images,
                 image_mask=image_mask,
                 proprio=proprio_tensor,
-                steps=CONFIG["action_horizon"],
+                steps=CONFIG["nfe_steps"],
+                solver=CONFIG["solver"],
+                return_boundary=CONFIG["send_boundary"],
             )
-        
-        actions = actions.cpu().numpy()[0]
-        
-        return {"actions": actions}
+
+        if isinstance(gen, tuple):
+            actions, boundary = gen
+        else:
+            actions, boundary = gen, None
+
+        result = {"actions": actions.cpu().numpy()[0]}
+        if boundary is not None:
+            result["boundary"] = boundary.cpu().numpy()[0]
+        return result
         
     except Exception as e:
         logger.error(f"Inference error: {e}")
@@ -228,8 +240,13 @@ async def handle_connection(websocket, path=None):
                 actions = result["actions"]
                 if isinstance(actions, np.ndarray):
                     actions = actions.tolist()
-                
+
                 response_data = {"actions": actions}
+                boundary = result.get("boundary")
+                if boundary is not None:
+                    response_data["boundary"] = (
+                        boundary.tolist() if isinstance(boundary, np.ndarray) else boundary
+                    )
                 
                 if HAS_MSGPACK:
                     import msgpack
@@ -276,17 +293,32 @@ def main():
                         help="SmolVLM model path or HF repo (env: SIMVLA_SMOLVLM_MODEL)")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
-    
+    parser.add_argument("--solver", type=str, default="euler",
+                        choices=["euler", "heun"],
+                        help="ODE solver for flow-matching inference. "
+                             "'heun' is 2nd-order (lower latency at equal quality).")
+    parser.add_argument("--nfe_steps", type=int, default=10,
+                        help="Number of ODE integration steps (denoising NFE).")
+    parser.add_argument("--send_boundary", action="store_true",
+                        help="Also return per-step adaptive-chunking boundary "
+                             "scores (requires an adaptive-chunking checkpoint).")
+
     args = parser.parse_args()
-    
+
     if not HAS_MSGPACK:
         logger.warning("msgpack_numpy not installed! Install with: pip install msgpack-numpy")
-    
+
+    CONFIG["solver"] = args.solver
+    CONFIG["nfe_steps"] = args.nfe_steps
+    CONFIG["send_boundary"] = args.send_boundary
+
     load_model(args.checkpoint, args.norm_stats, args.smolvlm_model)
-    
+
     logger.info(f"Starting SimVLA server on {args.host}:{args.port}")
     logger.info(f"  Image size: {CONFIG['image_size']}x{CONFIG['image_size']}")
     logger.info(f"  Action horizon: {CONFIG['action_horizon']}")
+    logger.info(f"  Solver: {CONFIG['solver']}  |  NFE steps: {CONFIG['nfe_steps']}  |  "
+                f"Send boundary: {CONFIG['send_boundary']}")
     
     asyncio.run(serve(args.host, args.port))
 

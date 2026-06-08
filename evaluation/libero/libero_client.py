@@ -89,16 +89,46 @@ class WebSocketClient:
     
     Requires: pip install openpi-client
     """
-    def __init__(self, host: str, port: int, replan_steps: int = 5, resize_size: int = 224):
+    def __init__(self, host: str, port: int, replan_steps: int = 5, resize_size: int = 224,
+                 adaptive_chunking: bool = False, boundary_threshold: float = 0.5,
+                 min_replan: int = 2, max_replan: Optional[int] = None):
         if not HAS_WS_CLIENT:
             raise ImportError("openpi_client not installed. Run: pip install openpi-client")
         self.client = ws_client.WebsocketClientPolicy(host, port)
         self.replan_steps = replan_steps
         self.resize_size = resize_size
+        # Adaptive Action Chunking (AAC): when enabled, the number of actions
+        # executed before replanning is chosen from the server's per-step
+        # boundary scores instead of the fixed `replan_steps`.
+        self.adaptive_chunking = adaptive_chunking
+        self.boundary_threshold = boundary_threshold
+        self.min_replan = min_replan
+        self.max_replan = max_replan
         self.reset()
 
     def reset(self) -> None:
         self.action_plan: Deque[np.ndarray] = collections.deque()
+
+    def _num_to_execute(self, action_chunk: np.ndarray, boundary) -> int:
+        """How many actions of the chunk to commit before replanning.
+
+        Fixed `replan_steps` unless adaptive chunking is on and the server
+        returned boundary scores. With AAC we commit through the smooth prefix
+        and stop right before the first high-change (contact / reversal) step,
+        clamped to [min_replan, max_replan]."""
+        horizon = len(action_chunk)
+        if not self.adaptive_chunking or boundary is None:
+            return min(self.replan_steps, horizon)
+
+        boundary = np.asarray(boundary).reshape(-1)
+        lo = max(1, min(self.min_replan, horizon))
+        hi = min(self.max_replan or horizon, horizon)
+        n = hi
+        for i in range(lo, hi):
+            if boundary[i] >= self.boundary_threshold:
+                n = i
+                break
+        return int(max(lo, min(n, hi)))
 
     def step(self, obs: Dict, goal: str) -> np.ndarray:
         if not self.action_plan:
@@ -109,7 +139,7 @@ class WebSocketClient:
             wrist_img = image_tools.convert_to_uint8(
                 image_tools.resize_with_pad(obs["wrist_image"], self.resize_size, self.resize_size)
             )
-            
+
             # Build observation dict
             element = {
                 "observation/image": img,
@@ -117,19 +147,17 @@ class WebSocketClient:
                 "observation/state": obs["state"],
                 "prompt": goal,
             }
-            
+
             # Query server
             result = self.client.infer(element)
             action_chunk = result["actions"]
-            
+
             # Ensure numpy array
             if not isinstance(action_chunk, np.ndarray):
                 action_chunk = np.array(action_chunk)
-            
-            assert len(action_chunk) >= self.replan_steps, \
-                f"Need {self.replan_steps} steps but got {len(action_chunk)}"
-            
-            for i in range(min(self.replan_steps, len(action_chunk))):
+
+            n_exec = self._num_to_execute(action_chunk, result.get("boundary"))
+            for i in range(n_exec):
                 self.action_plan.append(action_chunk[i])
 
         return self.action_plan.popleft()
@@ -224,14 +252,16 @@ def eval_libero(
     print(f"   Max steps: {max_steps}")
     
     total_episodes, total_successes = 0, 0
-    
+    all_success_steps: List[int] = []  # physical sim steps for successful episodes
+
     task_ids = [task_id] if task_id is not None else range(num_tasks - 1, -1, -1)
     for task_id in tqdm(task_ids, desc="Tasks"):
         task = task_suite.get_task(task_id)
         initial_states = task_suite.get_task_init_states(task_id)
         env, task_description = get_libero_env(task, LIBERO_ENV_RESOLUTION, seed)
-        
+
         task_successes = 0
+        task_success_steps: List[int] = []
         for ep in tqdm(range(num_trials), desc=f"{task_description[:30]}...", leave=False):
             # Reset
             env.reset()
@@ -281,6 +311,8 @@ def eval_libero(
                     if done:
                         task_successes += 1
                         total_successes += 1
+                        task_success_steps.append(t)
+                        all_success_steps.append(t)
                         break
                     
                     t += 1
@@ -303,11 +335,15 @@ def eval_libero(
             print(f"  {status_icon} Task {task_id} Ep {ep}: {suffix.upper()} (steps={t})")
 
         env.close()
-        print(f"   Task {task_id}: {task_successes}/{num_trials} ({task_successes/num_trials*100:.1f}%)")
-    
+        mean_steps = (sum(task_success_steps) / len(task_success_steps)) if task_success_steps else float("nan")
+        print(f"   Task {task_id}: {task_successes}/{num_trials} "
+              f"({task_successes/num_trials*100:.1f}%)  |  avg steps (success): {mean_steps:.1f}")
+
     success_rate = total_successes / max(total_episodes, 1)
+    overall_mean_steps = (sum(all_success_steps) / len(all_success_steps)) if all_success_steps else float("nan")
     print(f"\nTotal success rate: {total_successes}/{total_episodes} ({success_rate*100:.1f}%)")
-    
+    print(f"Avg physical steps over {len(all_success_steps)} successful episodes: {overall_mean_steps:.1f}")
+
     return success_rate
 
 
@@ -332,6 +368,16 @@ def main():
     parser.add_argument("--no_video", action="store_true", help="Disable video recording for faster evaluation")
     parser.add_argument("--task_id", type=int, default=None,
                         help="If set, only evaluate this task index (0-based). Omit to run all tasks.")
+    # Adaptive Action Chunking (AAC) — needs the server started with --send_boundary
+    parser.add_argument("--adaptive_chunking", action="store_true",
+                        help="Use per-step boundary scores to adaptively size the "
+                             "executed chunk instead of fixed --replan_steps.")
+    parser.add_argument("--boundary_threshold", type=float, default=0.5,
+                        help="Replan when a step's boundary score reaches this value.")
+    parser.add_argument("--min_replan", type=int, default=2,
+                        help="Minimum actions to execute per chunk under AAC.")
+    parser.add_argument("--max_replan", type=int, default=None,
+                        help="Maximum actions to execute per chunk under AAC (default: full chunk).")
 
     args = parser.parse_args()
 
@@ -356,10 +402,21 @@ def main():
     print(f"   Replan steps: {args.replan_steps}")
     print()
     
+    if args.adaptive_chunking:
+        print(f"   Adaptive chunking: ON (threshold={args.boundary_threshold}, "
+              f"min={args.min_replan}, max={args.max_replan or 'full'})")
+
     # Initialize client
     if args.client_type == "websocket":
-        client = WebSocketClient(args.host, args.port, replan_steps=args.replan_steps)
+        client = WebSocketClient(
+            args.host, args.port, replan_steps=args.replan_steps,
+            adaptive_chunking=args.adaptive_chunking,
+            boundary_threshold=args.boundary_threshold,
+            min_replan=args.min_replan, max_replan=args.max_replan,
+        )
     else:
+        if args.adaptive_chunking:
+            print("   [warn] adaptive chunking is only supported on the websocket client; ignoring.")
         client = HTTPClient(args.host, args.port, replan_steps=args.replan_steps)
     
     # Run evaluation
