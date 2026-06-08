@@ -553,7 +553,11 @@ class SmolVLMVLA(PreTrainedModel):
                 "patch_features": None,      # [B*V, num_patches, lm_hidden] on CPU
                 "prev_pixel_values": None,   # [B*V, C, H, W] on CPU float32
                 "ema_mean": np.zeros((B, V), dtype=np.float32),
-                "ema_std":  np.ones((B, V),  dtype=np.float32) * 0.1,
+                # Start ema_std at zero so EMA converges from actual data before
+                # caching begins — ema_std=0.1 would make threshold ~0.1 which is
+                # far above typical ImageNet-normalised frame diffs (~0.05), causing
+                # near-total caching and catastrophic failure.
+                "ema_std":  np.zeros((B, V), dtype=np.float32),
                 "cache_hits": 0,
                 "total_views": 0,
             }
@@ -565,27 +569,35 @@ class SmolVLMVLA(PreTrainedModel):
         valid_indices = [i for i in range(B * V) if flat_mask[i]]
 
         # ---- Decide which views need re-encoding --------------------------------
+        # EMA is updated for EVERY step (including warmup) so that, by the time we
+        # start making cache decisions (step >= warmup_steps), the statistics
+        # reflect the actual per-view frame-diff distribution.
         view_needs_encode = {}  # bv_idx -> bool
         for bv_idx in valid_indices:
             b_idx = bv_idx // V
             v_idx = bv_idx  % V
 
-            if step < warmup_steps or cache["prev_pixel_values"] is None:
+            if cache["prev_pixel_values"] is None:
+                # Very first step: no previous frame to compare against
                 view_needs_encode[bv_idx] = True
                 continue
 
             curr = flat_images[bv_idx]                                   # [C,H,W]
             prev = cache["prev_pixel_values"][bv_idx].to(device=device, dtype=dtype)
-            diff = (curr - prev).abs()                                   # [C,H,W]
-            diff_patches = diff.reshape(C, h_p, patch_size, w_p, patch_size)
-            frame_mean = diff_patches.mean().item()
+            frame_mean = (curr - prev).abs().mean().item()
 
+            # Always update EMA (even during warmup) for calibration
             em = float(cache["ema_mean"][b_idx, v_idx])
             es = float(cache["ema_std"][b_idx,  v_idx])
             new_em = beta * em + (1 - beta) * frame_mean
             new_es = beta * es + (1 - beta) * abs(frame_mean - em)
             cache["ema_mean"][b_idx, v_idx] = new_em
             cache["ema_std"][b_idx,  v_idx] = new_es
+
+            # During warmup: always encode (EMA is being calibrated)
+            if step < warmup_steps:
+                view_needs_encode[bv_idx] = True
+                continue
 
             if fixed_threshold is not None:
                 # Ablation baseline: constant threshold (VLA-Cache style)

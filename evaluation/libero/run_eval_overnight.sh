@@ -152,16 +152,16 @@ run_one() {
 # ---- 主实验 ----
 run_one "B0_baseline"   8200
 run_one "C2_attc"       8201  --use_cache --cache_alpha 1.0 --cache_beta 0.9 --cache_warmup 3
-run_one "C1_fixed"      8202  --use_cache --cache_fixed_threshold 0.02 --cache_warmup 3
+run_one "C1_fixed"      8202  --use_cache --cache_fixed_threshold 0.10 --cache_warmup 3
 
 # ---- Ablation α（β=0.9 固定）----
-run_one "A_alpha05"     8210  --use_cache --cache_alpha 0.5 --cache_beta 0.9
-run_one "A_alpha15"     8211  --use_cache --cache_alpha 1.5 --cache_beta 0.9
-run_one "A_alpha20"     8212  --use_cache --cache_alpha 2.0 --cache_beta 0.9
+run_one "A_alpha05"     8210  --use_cache --cache_alpha 0.5 --cache_beta 0.9 --cache_warmup 3
+run_one "A_alpha15"     8211  --use_cache --cache_alpha 1.5 --cache_beta 0.9 --cache_warmup 3
+run_one "A_alpha20"     8212  --use_cache --cache_alpha 2.0 --cache_beta 0.9 --cache_warmup 3
 
 # ---- Ablation β（α=1.0 固定）----
-run_one "A_beta07"      8220  --use_cache --cache_alpha 1.0 --cache_beta 0.7
-run_one "A_beta099"     8221  --use_cache --cache_alpha 1.0 --cache_beta 0.99
+run_one "A_beta07"      8220  --use_cache --cache_alpha 1.0 --cache_beta 0.7 --cache_warmup 3
+run_one "A_beta099"     8221  --use_cache --cache_alpha 1.0 --cache_beta 0.99 --cache_warmup 3
 
 # =============================================================================
 # 汇总
