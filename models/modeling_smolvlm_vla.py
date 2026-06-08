@@ -505,6 +505,7 @@ class SmolVLMVLA(PreTrainedModel):
         beta: float = 0.9,
         warmup_steps: int = 3,
         fixed_threshold: float = None,
+        motion_percentile: float = 0.9,
         max_cache_age: int = 8,
     ):
         """
@@ -517,14 +518,31 @@ class SmolVLMVLA(PreTrainedModel):
           - motion ≤ τ  →  reuse cached features  (cache hit)
 
         Motion signal: the per-pixel diff is pooled onto the SigLIP patch grid
-        and the MAXIMUM patch diff is taken as the motion signal.  A frame-wide mean
-        or even high-percentile is diluted by the static background (~90% of pixels)
-        — numerical tests show that for a 40×40px arm region (1.1% of a 384×384 frame),
-        even pct98 = 0.118 while patch_max = 1.0.  Only the patch maximum reliably
-        catches small localized arm motion at all arm sizes.
+        and a high percentile is taken.  The percentile keeps the signal range
+        consistent (background-dominated, ~0.02–0.10) so the EMA threshold stays
+        well-calibrated.  patch_diff.max() has too large a dynamic range (0.017
+        to 1.5) — after EMA adapts to fast-motion peaks, fine-positioning phases
+        fall well below threshold and get cached, causing the robot to miss grasps.
 
-        The adaptive threshold rises automatically during fast arm motion /
-        contact events and falls during slow free-space travel, trading off
+        The adaptive threshold rises automatically during active motion and falls
+        during slow free-space travel, trading off speed vs. accuracy without
+        manual tuning.
+
+        Args:
+            cache:             None on episode start, else dict returned by previous call
+            alpha:             threshold multiplier (higher → more caching)
+            beta:              EMA decay (~0.9 = 10-frame window)
+            warmup_steps:      encode fully for first N steps to warm up EMA stats
+            fixed_threshold:   if not None, use this CONSTANT threshold instead of
+                               the adaptive τ (ablation baseline, e.g. VLA-Cache).
+                               EMA stats are still tracked for logging but ignored.
+            motion_percentile: percentile of per-patch diffs used as the motion
+                               signal (default 0.9). Keeps the signal in a consistent
+                               range that the EMA threshold can track reliably.
+            max_cache_age:     hard cap on consecutive cache hits per view; a view is
+                               force-re-encoded at least every max_cache_age steps,
+                               bounding worst-case staleness even if motion stays low.
+                               Set None to disable.
         speed vs. accuracy without manual tuning.
 
         Args:
@@ -609,11 +627,7 @@ class SmolVLMVLA(PreTrainedModel):
             diff = (curr - ref).abs().unsqueeze(0)                       # [1,C,H,W]
             patch_diff = F.avg_pool2d(diff, kernel_size=patch_size, stride=patch_size)
             patch_diff = patch_diff.mean(dim=1).flatten()                # [h_p*w_p]
-            # patch_max: most-changed patch drives the decision.
-            # A frame-mean or high-percentile is dominated by static background
-            # (~90% pixels) and misses small arm motion — patch_max detects any
-            # localized change regardless of arm size.
-            motion = patch_diff.max().item()
+            motion = torch.quantile(patch_diff, motion_percentile).item()
 
             # Always update EMA (even during warmup) for calibration
             em = float(cache["ema_mean"][b_idx, v_idx])

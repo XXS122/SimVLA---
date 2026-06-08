@@ -64,6 +64,7 @@ CONFIG = {
     "cache_beta": 0.9,
     "cache_warmup": 3,
     "cache_fixed_threshold": None,   # None = adaptive; float = fixed-τ baseline
+    "cache_motion_pct": 0.9,         # percentile of per-patch diffs as motion signal
     "cache_max_age": 8,              # force re-encode a view every N steps (None=off)
     "cache_log_interval": 20,
     "latency_warmup": 5,             # skip first N steps (GPU warm-up) in latency stats
@@ -109,7 +110,7 @@ def load_model(checkpoint_path: str, norm_stats_path: str = None, smolvlm_model_
 
     logger.info(f"Model loaded! Device: {device}, Image size: {CONFIG['image_size']}x{CONFIG['image_size']}")
     if CONFIG["use_cache"]:
-        common = (f"patch_max_motion, "
+        common = (f"motion_pct={CONFIG['cache_motion_pct']}, "
                   f"max_age={CONFIG['cache_max_age']}, warmup={CONFIG['cache_warmup']}")
         if CONFIG["cache_fixed_threshold"] is not None:
             logger.info(
@@ -242,6 +243,7 @@ def infer(observation: Dict[str, Any], cache: dict = None):
                     beta=CONFIG["cache_beta"],
                     warmup_steps=CONFIG["cache_warmup"],
                     fixed_threshold=CONFIG["cache_fixed_threshold"],
+                    motion_percentile=CONFIG["cache_motion_pct"],
                     max_cache_age=CONFIG["cache_max_age"],
                 )
                 actions = model.generate_actions_from_enc(
@@ -415,6 +417,8 @@ def main():
                         help="Fixed-τ ablation baseline (VLA-Cache style). "
                              "If set, overrides the adaptive threshold with this "
                              "constant value (e.g. 0.10). Default: None (adaptive)")
+    parser.add_argument("--cache_motion_pct", type=float, default=0.9,
+                        help="Percentile of per-patch diffs used as motion signal (default: 0.9).")
     parser.add_argument("--cache_max_age", type=int, default=8,
                         help="Force re-encode a view at least every N steps to bound "
                              "staleness (default: 8). Set <=0 to disable the cap.")
@@ -426,6 +430,7 @@ def main():
     CONFIG["cache_beta"]           = args.cache_beta
     CONFIG["cache_warmup"]         = args.cache_warmup
     CONFIG["cache_fixed_threshold"] = args.cache_fixed_threshold
+    CONFIG["cache_motion_pct"]     = args.cache_motion_pct
     CONFIG["cache_max_age"]        = args.cache_max_age if args.cache_max_age > 0 else None
 
     if not HAS_MSGPACK:
