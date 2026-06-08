@@ -108,6 +108,7 @@ class WebSocketClient:
 
     def reset(self) -> None:
         self.action_plan: Deque[np.ndarray] = collections.deque()
+        self.latency_log: List[float] = []
 
     def _num_to_execute(self, action_chunk: np.ndarray, boundary) -> int:
         """How many actions of the chunk to commit before replanning.
@@ -155,6 +156,10 @@ class WebSocketClient:
             # Ensure numpy array
             if not isinstance(action_chunk, np.ndarray):
                 action_chunk = np.array(action_chunk)
+
+            lat = result.get("latency_ms")
+            if lat is not None:
+                self.latency_log.append(float(lat))
 
             n_exec = self._num_to_execute(action_chunk, result.get("boundary"))
             for i in range(n_exec):
@@ -341,8 +346,16 @@ def eval_libero(
 
     success_rate = total_successes / max(total_episodes, 1)
     overall_mean_steps = (sum(all_success_steps) / len(all_success_steps)) if all_success_steps else float("nan")
+    # Collect latency from websocket client if available
+    all_latencies: List[float] = []
+    if hasattr(client, "latency_log"):
+        all_latencies = client.latency_log
+
     print(f"\nTotal success rate: {total_successes}/{total_episodes} ({success_rate*100:.1f}%)")
     print(f"Avg physical steps over {len(all_success_steps)} successful episodes: {overall_mean_steps:.1f}")
+    if all_latencies:
+        avg_lat = sum(all_latencies) / len(all_latencies)
+        print(f"Avg inference latency over {len(all_latencies)} requests: {avg_lat:.1f}ms")
 
     return success_rate
 

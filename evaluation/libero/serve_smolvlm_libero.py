@@ -200,7 +200,7 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
         else:
             actions, boundary = gen, None
 
-        result = {"actions": actions.cpu().numpy()[0]}
+        result = {"actions": actions.cpu().numpy()[0], "latency_ms": float(_latency_ms)}
         if boundary is not None:
             result["boundary"] = boundary.cpu().numpy()[0]
         return result
@@ -247,7 +247,7 @@ async def handle_connection(websocket, path=None):
                 if isinstance(actions, np.ndarray):
                     actions = actions.tolist()
 
-                response_data = {"actions": actions}
+                response_data = {"actions": actions, "latency_ms": result.get("latency_ms", 0.0)}
                 boundary = result.get("boundary")
                 if boundary is not None:
                     response_data["boundary"] = (
