@@ -583,8 +583,10 @@ class SmolVLMVLA(PreTrainedModel):
                 continue
 
             curr = flat_images[bv_idx]                                   # [C,H,W]
-            prev = cache["prev_pixel_values"][bv_idx].to(device=device, dtype=dtype)
-            frame_mean = (curr - prev).abs().mean().item()
+            # `ref` is the frame at which this view was last ENCODED, so frame_mean
+            # measures cumulative drift since the cached features were computed.
+            ref = cache["prev_pixel_values"][bv_idx].to(device=device, dtype=dtype)
+            frame_mean = (curr - ref).abs().mean().item()
 
             # Always update EMA (even during warmup) for calibration
             em = float(cache["ema_mean"][b_idx, v_idx])
@@ -649,14 +651,28 @@ class SmolVLMVLA(PreTrainedModel):
             image_features[flat_to_rank[bv_idx]] = \
                 cache["patch_features"][bv_idx].to(device=device, dtype=dtype)
 
-        # ---- Update feature cache & prev pixels ---------------------------------
+        # ---- Update feature cache & reference frames ----------------------------
+        # IMPORTANT: each view's reference frame is the frame at which its features
+        # were last *encoded*.  Future frames are compared against this reference
+        # (NOT the immediately-preceding frame) so that slow CUMULATIVE drift is
+        # detected.  Comparing against the previous frame lets tiny step-to-step
+        # diffs keep a view cached indefinitely while the true scene drifts far
+        # from the stale cached features — which collapses task success.
         if cache["patch_features"] is None:
             cache["patch_features"] = torch.zeros(
                 B * V, num_patches, hidden_size, dtype=torch.float32
             )
+        if cache["prev_pixel_values"] is None:
+            cache["prev_pixel_values"] = flat_images.cpu().float()
+        else:
+            # Only refresh the reference frame for views we re-encoded this step;
+            # cached views keep their old reference so drift keeps accumulating.
+            ref = cache["prev_pixel_values"]
+            for bv_idx in encode_indices:
+                ref[bv_idx] = flat_images[bv_idx].cpu().float()
+            cache["prev_pixel_values"] = ref
         for enc_rank, bv_idx in enumerate(encode_indices):
             cache["patch_features"][bv_idx] = new_feats[enc_rank].cpu().float()
-        cache["prev_pixel_values"] = flat_images.cpu().float()
         cache["step_count"] = step + 1
 
         # ---- Continue with text model (same as forward_vlm_efficient) -----------
