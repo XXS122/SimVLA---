@@ -270,9 +270,17 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
         # Trigger B: image-change gate. The RMS is ALWAYS computed (cheap) so it
         # shows up in the diagnostic log even when the gate is disabled — this is
         # how we calibrate vlm_img_thresh. img_rms = -1 means "no cached frame".
+        #
+        # IMPORTANT: compute RMS on the AGENTVIEW (third-person, view 0) ONLY.
+        # The wrist camera (view 1) is arm-mounted, so it changes drastically on
+        # every step regardless of scene content — including it saturates the RMS
+        # and the gate fires every step (~10% cache ceiling). The static agentview
+        # only changes when the scene/arm actually moves through it, which is the
+        # signal we want for "does the VLM need to re-look".
+        # images: [B, num_views, C, H, W]; view 0 = agentview.
         img_rms = -1.0
         if _VLM_CACHE["last_image"] is not None:
-            _diff = (images - _VLM_CACHE["last_image"]).float()
+            _diff = (images[:, 0] - _VLM_CACHE["last_image"][:, 0]).float()
             img_rms = torch.sqrt(torch.mean(_diff * _diff)).item()
         img_changed = (img_thresh > 0.0 and img_rms > img_thresh)
 
