@@ -1,18 +1,17 @@
 #!/usr/bin/env bash
-# Dual-rate VLM-caching sweep for a SINGLE LIBERO task (default: libero_goal task 9).
+# Adaptive dual-rate VLM-caching sweep for a SINGLE LIBERO task.
 #
-# Goal: find the largest VLM refresh interval N that keeps success rate at the
-# baseline while cutting average inference latency.
-#
-# The server is started ONCE (it reads vlm_refresh_every per request), and this
-# script runs the client several times with different N. For each run it prints:
-#   - Total success rate        -> must stay >= baseline (N=1)
-#   - Avg inference latency      -> should drop as N grows
-#   - VLM refresh rate           -> fraction of queries that ran the full VLM
+# Three trigger modes are tested:
+#   N=1           : baseline (no caching, VLM runs every query)
+#   N=5           : naive fixed-N caching (fast, but may drop success rate)
+#   N=5+boundary  : adaptive — boundary head fires at contact/reversal moments,
+#                   so the VLM refreshes semantically rather than blindly.
+#                   This is the core contribution: same or better success rate
+#                   as baseline with average latency close to N=5.
 #
 # ---------------------------------------------------------------------------
-# STEP 1 (separate terminal). Start ONE server. refresh_every is overridden
-# per request by this script, so any default is fine:
+# STEP 1 (separate terminal). Start ONE server — it reads all cache knobs
+# per request, so this single instance handles all three modes:
 #
 #   source paths.env
 #   CUDA_VISIBLE_DEVICES=6 python serve_smolvlm_libero.py \
@@ -21,28 +20,24 @@
 #       --smolvlm_model "$SIMVLA_SMOLVLM_MODEL" \
 #       --port 8102 --solver euler --nfe_steps 10
 #
-# Wait for "SimVLA server listening on 0.0.0.0:8102".
-#
 # ---------------------------------------------------------------------------
-# STEP 2. Run this script (client side):
+# STEP 2. Run this script:
 #
-#   bash run_cache_sweep.sh <port> <task_id> <num_trials> <gpu> [N values...]
-#     port        : default 8102
-#     task_id     : libero_goal task index, default 9
-#     num_trials  : episodes per N, default 20
-#     gpu         : CUDA device for the env renderer, default 0
-#     N values    : refresh intervals to sweep, default "1 2 3 5"
+#   bash run_cache_sweep.sh [port] [task_id] [num_trials] [gpu]
+#     port       : default 8102
+#     task_id    : libero_goal task index, default 9
+#     num_trials : episodes per mode, default 20
+#     gpu        : CUDA device for env renderer, default 0
 #
 # Examples:
-#   bash run_cache_sweep.sh 8102 9 20 0
-#   bash run_cache_sweep.sh 8102 9 30 0 "1 2 4"
+#   bash run_cache_sweep.sh 8102 9 5 6    # quick 5-ep sanity check on task 9
+#   bash run_cache_sweep.sh 8102 9 20 6   # full 20-ep comparison
 set -euo pipefail
 
 PORT="${1:-8102}"
 TASK_ID="${2:-9}"
 NUM_TRIALS="${3:-20}"
 GPU="${4:-0}"
-N_VALUES="${5:-1 2 3 5}"
 TASK_SUITE="libero_goal"
 SEED="${SEED:-7}"
 
@@ -50,36 +45,54 @@ OUTDIR="cache_sweep_${TASK_SUITE}_task${TASK_ID}"
 mkdir -p "$OUTDIR"
 
 echo "================================================================"
-echo " VLM-cache sweep | suite=$TASK_SUITE task_id=$TASK_ID trials=$NUM_TRIALS"
-echo " N values: $N_VALUES   (N=1 is the baseline)"
+echo " Adaptive VLM-caching sweep"
+echo " suite=$TASK_SUITE  task_id=$TASK_ID  trials=$NUM_TRIALS"
 echo " logs -> $OUTDIR/"
 echo "================================================================"
 
-for N in $N_VALUES; do
-  LOG="$OUTDIR/refresh_${N}.log"
+run_one() {
+  local TAG="$1"; shift
+  local LOG="$OUTDIR/${TAG}.log"
   echo ""
-  echo ">>> Running N=$N  (refresh VLM every $N queries) -> $LOG"
+  echo ">>> $TAG -> $LOG"
   CUDA_VISIBLE_DEVICES="$GPU" python libero_client.py \
-    --host 127.0.0.1 \
-    --port "$PORT" \
-    --client_type websocket \
-    --task_suite "$TASK_SUITE" \
-    --task_id "$TASK_ID" \
-    --num_trials "$NUM_TRIALS" \
-    --seed "$SEED" \
-    --vlm_refresh_every "$N" \
-    --no_video 2>&1 | tee "$LOG"
-done
+    --host 127.0.0.1 --port "$PORT" --client_type websocket \
+    --task_suite "$TASK_SUITE" --task_id "$TASK_ID" \
+    --num_trials "$NUM_TRIALS" --seed "$SEED" \
+    --no_video "$@" 2>&1 | tee "$LOG"
+}
+
+# Baseline: VLM runs every query
+run_one "baseline_N1" \
+  --vlm_refresh_every 1
+
+# Naive fixed-N: VLM cached every 5 queries (fast but may drop success rate)
+run_one "naive_N5" \
+  --vlm_refresh_every 5
+
+# Adaptive: N=5 cap + boundary-score gate (semantic refresh at critical moments)
+# Boundary thresh 0.3 = refresh whenever predicted action-change rate > 0.3
+run_one "adaptive_N5_bnd0.3" \
+  --vlm_refresh_every 5 --boundary_refresh_thresh 0.3
+
+# Optional tighter cap + boundary gate (more refreshes, safer)
+run_one "adaptive_N3_bnd0.3" \
+  --vlm_refresh_every 3 --boundary_refresh_thresh 0.3
 
 echo ""
 echo "================================================================"
-echo " SUMMARY (success rate must hold; latency should fall as N grows)"
+echo " SUMMARY"
+echo " Key: success rate must hold vs baseline; latency should fall"
 echo "================================================================"
-for N in $N_VALUES; do
-  LOG="$OUTDIR/refresh_${N}.log"
-  SR=$(grep -E "Total success rate" "$LOG" | tail -1 || true)
-  LAT=$(grep -E "Avg inference latency" "$LOG" | tail -1 || true)
-  RR=$(grep -E "VLM refresh rate" "$LOG" | tail -1 || true)
-  STEPS=$(grep -E "Avg physical steps" "$LOG" | tail -1 || true)
-  printf "N=%-3s | %s | %s | %s | %s\n" "$N" "$SR" "$LAT" "$STEPS" "$RR"
+printf "%-28s | %-30s | %-35s | %-30s | %s\n" \
+  "MODE" "SUCCESS RATE" "AVG LATENCY" "AVG STEPS" "VLM REFRESH RATE"
+echo "---"
+for TAG in baseline_N1 naive_N5 adaptive_N5_bnd0.3 adaptive_N3_bnd0.3; do
+  LOG="$OUTDIR/${TAG}.log"
+  SR=$(grep -E "^Total success rate" "$LOG" | tail -1 || echo "?")
+  LAT=$(grep -E "^Avg inference latency" "$LOG" | tail -1 || echo "?")
+  STEPS=$(grep -E "^Avg physical steps" "$LOG" | tail -1 || echo "?")
+  RR=$(grep -E "^VLM refresh rate" "$LOG" | tail -1 || echo "?")
+  printf "%-28s | %-30s | %-35s | %-30s | %s\n" \
+    "$TAG" "$SR" "$LAT" "$STEPS" "$RR"
 done

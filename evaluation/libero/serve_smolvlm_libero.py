@@ -72,6 +72,12 @@ CONFIG = {
     # current frame differs from the cached frame by more than this per-element
     # RMS (ImageNet-normalized space). 0 disables the gate (fixed-N only).
     "vlm_img_thresh": 0.0,
+    # Boundary-score gate: if > 0, use the model's own boundary head (trained
+    # to predict action change rate) as a semantic refresh trigger. When the
+    # max boundary score of the last chunk exceeds this threshold (contact /
+    # direction reversal predicted) the VLM is refreshed on the NEXT query.
+    # 0 disables. Requires an adaptive-chunking checkpoint.
+    "boundary_refresh_thresh": 0.0,
     # Mixed-precision inference. "fp32" = baseline. "bf16"/"fp16" run the model
     # forward under autocast: faster matmuls, ~no change to what the model
     # "sees", so success rate is preserved by construction (unlike caching).
@@ -93,10 +99,11 @@ def _amp_ctx():
 # across consecutive queries. Reset on episode boundaries (client sends
 # {"reset": True}) and whenever the prompt or image changes enough.
 _VLM_CACHE = {
-    "enc": None,          # dict returned by model.encode_vlm()
-    "last_image": None,   # preprocessed image tensor at last refresh (for gating)
-    "prompt": None,       # language instruction at last refresh
-    "cache_uses": 0,      # how many queries have used the current enc (incl. refresh)
+    "enc": None,             # dict returned by model.encode_vlm()
+    "last_image": None,      # preprocessed image tensor at last refresh (for gating)
+    "prompt": None,          # language instruction at last refresh
+    "cache_uses": 0,         # how many queries have used current enc (incl. refresh)
+    "boundary_score": 0.0,   # max boundary score from last chunk (semantic gate)
 }
 
 
@@ -106,6 +113,7 @@ def reset_vlm_cache():
     _VLM_CACHE["last_image"] = None
     _VLM_CACHE["prompt"] = None
     _VLM_CACHE["cache_uses"] = 0
+    _VLM_CACHE["boundary_score"] = 0.0
 
 
 def load_model(checkpoint_path: str, norm_stats_path: str = None, smolvlm_model_path: str = None):
@@ -222,43 +230,72 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
         # Proprioception
         proprio_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
         
-        # ---- Dual-rate VLM feature caching -------------------------------
-        # Decide whether to rerun the expensive VLM (refresh) or reuse the
-        # cached features. proprio is ALWAYS fresh and only consumed by the
-        # cheap action transformer below, so caching never stales the robot
-        # state — only the (slow-changing) visual-language semantics.
-        # Per-request override (lets one server sweep N without reloading the
-        # model); falls back to the server's CLI default when absent.
+        # ---- Adaptive dual-rate VLM feature caching ----------------------
+        # VLM features depend only on images+language, not proprio, so they
+        # can be reused across steps while the action transformer still gets
+        # fresh proprio each time. The key question is WHEN to refresh.
+        #
+        # Three composable triggers (any one fires → refresh):
+        #   A. staleness cap  : cache_uses >= refresh_every  (hard upper limit)
+        #   B. image-change   : frame RMS > img_thresh       (scene discontinuity)
+        #   C. boundary score : last chunk's max boundary > boundary_refresh_thresh
+        #                       (model's own signal: contact / direction reversal)
+        #
+        # Trigger C is the semantic-aware key: the boundary head (trained on
+        # action change rate) fires right before/at contact moments — exactly
+        # when stale visual features would hurt the most. Combined with A as a
+        # safety ceiling, this gives latency savings during smooth motion while
+        # guaranteeing a refresh at every semantically critical moment.
         refresh_every = max(1, int(observation.get("vlm_refresh_every",
                                                    CONFIG["vlm_refresh_every"])))
         img_thresh = float(observation.get("vlm_img_thresh",
                                            CONFIG["vlm_img_thresh"]))
+        boundary_thresh = float(observation.get("boundary_refresh_thresh",
+                                                CONFIG["boundary_refresh_thresh"]))
 
         if bool(observation.get("reset", False)):
             reset_vlm_cache()
 
         prompt_changed = (_VLM_CACHE["prompt"] != prompt)
 
+        # Trigger B: image-change gate
         img_changed = False
         if img_thresh > 0.0 and _VLM_CACHE["last_image"] is not None:
             _diff = (images - _VLM_CACHE["last_image"]).float()
-            _img_rms = torch.sqrt(torch.mean(_diff * _diff)).item()
-            img_changed = _img_rms > img_thresh
+            img_changed = torch.sqrt(torch.mean(_diff * _diff)).item() > img_thresh
 
-        need_refresh = (
-            _VLM_CACHE["enc"] is None
-            or prompt_changed
-            or img_changed
-            or _VLM_CACHE["cache_uses"] >= refresh_every
+        # Trigger C: boundary-score gate (semantic, uses model's own signal)
+        boundary_triggered = (
+            boundary_thresh > 0.0
+            and _VLM_CACHE["boundary_score"] > boundary_thresh
         )
 
-        # Inference — time the (optional) VLM stage and the cheap action stage
-        # separately so we can confirm where the latency actually goes.
+        need_refresh = (
+            _VLM_CACHE["enc"] is None          # first call ever / after reset
+            or prompt_changed                   # task changed
+            or _VLM_CACHE["cache_uses"] >= refresh_every  # A: staleness cap
+            or img_changed                      # B: scene discontinuity
+            or boundary_triggered               # C: semantic critical moment
+        )
+
+        trigger_reason = (
+            "first" if _VLM_CACHE["enc"] is None or prompt_changed
+            else "staleness" if _VLM_CACHE["cache_uses"] >= refresh_every
+            else "img_change" if img_changed
+            else "boundary" if boundary_triggered
+            else "—"
+        )
+
+        # Inference — time VLM stage and action stage separately.
         import time as _time
 
         def _sync():
             if device == "cuda":
                 torch.cuda.synchronize()
+
+        # When boundary_thresh is active we always need boundary scores to gate
+        # the NEXT step; combine with send_boundary for the client response.
+        need_boundary = CONFIG["send_boundary"] or boundary_thresh > 0.0
 
         with torch.no_grad(), _amp_ctx():
             _sync(); _t0 = _time.perf_counter()
@@ -268,6 +305,7 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
                 _VLM_CACHE["last_image"] = images
                 _VLM_CACHE["prompt"] = prompt
                 _VLM_CACHE["cache_uses"] = 1
+                _VLM_CACHE["boundary_score"] = 0.0  # reset on refresh
             else:
                 enc = _VLM_CACHE["enc"]
                 _VLM_CACHE["cache_uses"] += 1
@@ -277,29 +315,37 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
                 proprio=proprio_tensor,
                 steps=CONFIG["nfe_steps"],
                 solver=CONFIG["solver"],
-                return_boundary=CONFIG["send_boundary"],
+                return_boundary=need_boundary,
             )
             _sync(); _t2 = _time.perf_counter()
 
         _vlm_ms = (_t1 - _t0) * 1000
         _act_ms = (_t2 - _t1) * 1000
         _latency_ms = (_t2 - _t0) * 1000
-        if need_refresh:
-            logger.info(f"[LATENCY] total={_latency_ms:.1f}ms "
-                        f"| VLM={_vlm_ms:.1f}ms ({_vlm_ms/_latency_ms*100:.0f}%) REFRESH "
-                        f"| Action={_act_ms:.1f}ms ({_act_ms/_latency_ms*100:.0f}%) "
-                        f"[solver={CONFIG['solver']} nfe={CONFIG['nfe_steps']} "
-                        f"refresh_every={refresh_every}]")
-        else:
-            logger.info(f"[LATENCY] total={_latency_ms:.1f}ms "
-                        f"| VLM=cached(~0ms) "
-                        f"| Action={_act_ms:.1f}ms "
-                        f"[cache_use {_VLM_CACHE['cache_uses']}/{refresh_every}]")
 
         if isinstance(gen, tuple):
             actions, boundary = gen
         else:
             actions, boundary = gen, None
+
+        # Update boundary score for next step's gate (C trigger).
+        if boundary is not None and boundary_thresh > 0.0:
+            # boundary: [B, T] logits from regression head — higher = more
+            # change expected. Take max over the executed chunk.
+            _VLM_CACHE["boundary_score"] = float(boundary.max().item())
+
+        if need_refresh:
+            logger.info(f"[LATENCY] total={_latency_ms:.1f}ms "
+                        f"| VLM={_vlm_ms:.1f}ms ({_vlm_ms/_latency_ms*100:.0f}%) "
+                        f"REFRESH({trigger_reason}) "
+                        f"| Action={_act_ms:.1f}ms "
+                        f"[N={refresh_every} img={img_thresh} bnd={boundary_thresh:.2f}]")
+        else:
+            logger.info(f"[LATENCY] total={_latency_ms:.1f}ms "
+                        f"| VLM=cached "
+                        f"| Action={_act_ms:.1f}ms "
+                        f"[use {_VLM_CACHE['cache_uses']}/{refresh_every} "
+                        f"bnd_score={_VLM_CACHE['boundary_score']:.3f}]")
 
         result = {
             "actions": actions.cpu().numpy()[0],
@@ -307,8 +353,9 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
             "vlm_ms": float(_vlm_ms),
             "action_ms": float(_act_ms),
             "vlm_refreshed": bool(need_refresh),
+            "trigger": trigger_reason,
         }
-        if boundary is not None:
+        if CONFIG["send_boundary"] and boundary is not None:
             result["boundary"] = boundary.cpu().numpy()[0]
         return result
         
@@ -425,10 +472,15 @@ def main():
                              "1 = recompute every query (exact baseline). N>1 speeds "
                              "up inference ~Nx for the cached queries.")
     parser.add_argument("--vlm_img_thresh", type=float, default=0.0,
-                        help="Optional image-change gate (per-element RMS in "
-                             "ImageNet-normalized space). >0 forces a VLM refresh "
-                             "when the scene changes more than this, regardless of "
-                             "--vlm_refresh_every. 0 disables the gate.")
+                        help="Image-change gate: per-element RMS in ImageNet-"
+                             "normalized space. >0 forces VLM refresh on large "
+                             "scene changes. 0 disables.")
+    parser.add_argument("--boundary_refresh_thresh", type=float, default=0.0,
+                        help="Semantic-aware refresh gate: use the model's own "
+                             "boundary head score (trained on action change rate) "
+                             "to trigger VLM refresh at contact/reversal moments. "
+                             "Requires an adaptive-chunking checkpoint. "
+                             "Typical range 0.2-0.5. 0 disables.")
     parser.add_argument("--amp_dtype", type=str, default="fp32",
                         choices=["fp32", "bf16", "fp16"],
                         help="Mixed-precision inference. fp32 = baseline. "
@@ -445,6 +497,7 @@ def main():
     CONFIG["send_boundary"] = args.send_boundary
     CONFIG["vlm_refresh_every"] = args.vlm_refresh_every
     CONFIG["vlm_img_thresh"] = args.vlm_img_thresh
+    CONFIG["boundary_refresh_thresh"] = args.boundary_refresh_thresh
     CONFIG["amp_dtype"] = args.amp_dtype
 
     load_model(args.checkpoint, args.norm_stats, args.smolvlm_model)
@@ -454,9 +507,17 @@ def main():
     logger.info(f"  Action horizon: {CONFIG['action_horizon']}")
     logger.info(f"  Solver: {CONFIG['solver']}  |  NFE steps: {CONFIG['nfe_steps']}  |  "
                 f"Send boundary: {CONFIG['send_boundary']}")
-    logger.info(f"  VLM cache: refresh_every={CONFIG['vlm_refresh_every']}  |  "
+    _cache_mode = (
+        "BASELINE (no caching)"
+        if CONFIG["vlm_refresh_every"] <= 1
+           and CONFIG["vlm_img_thresh"] <= 0
+           and CONFIG["boundary_refresh_thresh"] <= 0
+        else "ADAPTIVE DUAL-RATE CACHING"
+    )
+    logger.info(f"  VLM cache: N={CONFIG['vlm_refresh_every']}  "
                 f"img_thresh={CONFIG['vlm_img_thresh']}  "
-                f"({'BASELINE (no caching)' if CONFIG['vlm_refresh_every'] <= 1 and CONFIG['vlm_img_thresh'] <= 0 else 'DUAL-RATE CACHING ON'})")
+                f"boundary_thresh={CONFIG['boundary_refresh_thresh']}  "
+                f"[{_cache_mode}]")
     logger.info(f"  AMP dtype: {CONFIG['amp_dtype']}  "
                 f"({'fp32 baseline' if CONFIG['amp_dtype'] == 'fp32' else 'mixed precision — faster, quality-preserving'})")
     

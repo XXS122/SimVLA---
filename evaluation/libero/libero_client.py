@@ -100,7 +100,8 @@ class WebSocketClient:
     def __init__(self, host: str, port: int, replan_steps: int = 5, resize_size: int = 224,
                  adaptive_chunking: bool = False, boundary_threshold: float = 0.5,
                  min_replan: int = 2, max_replan: Optional[int] = None,
-                 vlm_refresh_every: int = 1, vlm_img_thresh: float = 0.0):
+                 vlm_refresh_every: int = 1, vlm_img_thresh: float = 0.0,
+                 boundary_refresh_thresh: float = 0.0):
         if not HAS_WS_CLIENT:
             raise ImportError("openpi_client not installed. Run: pip install openpi-client")
         self.client = ws_client.WebsocketClientPolicy(host, port)
@@ -110,6 +111,7 @@ class WebSocketClient:
         # server can sweep N without reloading the model.
         self.vlm_refresh_every = vlm_refresh_every
         self.vlm_img_thresh = vlm_img_thresh
+        self.boundary_refresh_thresh = boundary_refresh_thresh
         # Adaptive Action Chunking (AAC): when enabled, the number of actions
         # executed before replanning is chosen from the server's per-step
         # boundary scores instead of the fixed `replan_steps`.
@@ -173,6 +175,7 @@ class WebSocketClient:
                 "reset": self._pending_reset,
                 "vlm_refresh_every": self.vlm_refresh_every,
                 "vlm_img_thresh": self.vlm_img_thresh,
+                "boundary_refresh_thresh": self.boundary_refresh_thresh,
             }
             self._pending_reset = False
 
@@ -439,9 +442,12 @@ def main():
                              "1 = baseline (recompute every query). N>1 speeds "
                              "up inference while proprio stays fresh each step.")
     parser.add_argument("--vlm_img_thresh", type=float, default=0.0,
-                        help="Optional image-change gate (per-element RMS). >0 "
-                             "forces a VLM refresh on large scene changes. "
-                             "0 disables the gate.")
+                        help="Image-change gate (per-element RMS). >0 forces "
+                             "VLM refresh on large scene changes. 0 disables.")
+    parser.add_argument("--boundary_refresh_thresh", type=float, default=0.0,
+                        help="Semantic refresh gate: boundary head score above "
+                             "this triggers VLM refresh at contact/reversal. "
+                             "Requires adaptive-chunking checkpoint. 0 disables.")
 
     args = parser.parse_args()
 
@@ -485,6 +491,7 @@ def main():
             min_replan=args.min_replan, max_replan=args.max_replan,
             vlm_refresh_every=args.vlm_refresh_every,
             vlm_img_thresh=args.vlm_img_thresh,
+            boundary_refresh_thresh=args.boundary_refresh_thresh,
         )
     else:
         if args.adaptive_chunking:
