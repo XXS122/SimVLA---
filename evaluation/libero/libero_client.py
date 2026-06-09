@@ -91,12 +91,17 @@ class WebSocketClient:
     """
     def __init__(self, host: str, port: int, replan_steps: int = 5, resize_size: int = 224,
                  adaptive_chunking: bool = False, boundary_threshold: float = 0.5,
-                 min_replan: int = 2, max_replan: Optional[int] = None):
+                 min_replan: int = 2, max_replan: Optional[int] = None,
+                 vlm_refresh_every: int = 1, vlm_img_thresh: float = 0.0):
         if not HAS_WS_CLIENT:
             raise ImportError("openpi_client not installed. Run: pip install openpi-client")
         self.client = ws_client.WebsocketClientPolicy(host, port)
         self.replan_steps = replan_steps
         self.resize_size = resize_size
+        # Dual-rate VLM caching knobs, sent to the server per request so one
+        # server can sweep N without reloading the model.
+        self.vlm_refresh_every = vlm_refresh_every
+        self.vlm_img_thresh = vlm_img_thresh
         # Adaptive Action Chunking (AAC): when enabled, the number of actions
         # executed before replanning is chosen from the server's per-step
         # boundary scores instead of the fixed `replan_steps`.
@@ -104,11 +109,20 @@ class WebSocketClient:
         self.boundary_threshold = boundary_threshold
         self.min_replan = min_replan
         self.max_replan = max_replan
+        # Cumulative metrics across ALL episodes (NOT cleared by reset()).
+        self.latency_log: List[float] = []
+        self.refresh_count: int = 0   # queries that ran the full VLM
+        self.query_count: int = 0     # total server queries
         self.reset()
 
     def reset(self) -> None:
+        # Per-episode state only. Cumulative metrics live in __init__ so the
+        # end-of-run summary covers every trial, not just the last one.
         self.action_plan: Deque[np.ndarray] = collections.deque()
-        self.latency_log: List[float] = []
+        # Tell the server to drop its VLM cache at the start of each episode
+        # (trials of the same task share a prompt, so prompt-change detection
+        # alone can't catch episode boundaries).
+        self._pending_reset: bool = True
 
     def _num_to_execute(self, action_chunk: np.ndarray, boundary) -> int:
         """How many actions of the chunk to commit before replanning.
@@ -141,13 +155,18 @@ class WebSocketClient:
                 image_tools.resize_with_pad(obs["wrist_image"], self.resize_size, self.resize_size)
             )
 
-            # Build observation dict
+            # Build observation dict. `reset` is True only on the first query
+            # of an episode so the server drops its stale VLM cache.
             element = {
                 "observation/image": img,
                 "observation/wrist_image": wrist_img,
                 "observation/state": obs["state"],
                 "prompt": goal,
+                "reset": self._pending_reset,
+                "vlm_refresh_every": self.vlm_refresh_every,
+                "vlm_img_thresh": self.vlm_img_thresh,
             }
+            self._pending_reset = False
 
             # Query server
             result = self.client.infer(element)
@@ -160,6 +179,13 @@ class WebSocketClient:
             lat = result.get("latency_ms")
             if lat is not None:
                 self.latency_log.append(float(lat))
+
+            # Track how often the server actually ran the full VLM. A lower
+            # refresh rate == more caching == more speedup. Default True so an
+            # old/baseline server (no field) counts as "always refreshed".
+            self.query_count += 1
+            if bool(result.get("vlm_refreshed", True)):
+                self.refresh_count += 1
 
             n_exec = self._num_to_execute(action_chunk, result.get("boundary"))
             for i in range(n_exec):
@@ -356,6 +382,12 @@ def eval_libero(
     if all_latencies:
         avg_lat = sum(all_latencies) / len(all_latencies)
         print(f"Avg inference latency over {len(all_latencies)} requests: {avg_lat:.1f}ms")
+    # Dual-rate VLM caching effectiveness (only meaningful for websocket client).
+    if getattr(client, "query_count", 0):
+        rr = client.refresh_count / client.query_count
+        print(f"VLM refresh rate: {client.refresh_count}/{client.query_count} "
+              f"({rr*100:.0f}% of queries ran the full VLM; "
+              f"{(1-rr)*100:.0f}% reused cached features)")
 
     return success_rate
 
@@ -391,6 +423,17 @@ def main():
                         help="Minimum actions to execute per chunk under AAC.")
     parser.add_argument("--max_replan", type=int, default=None,
                         help="Maximum actions to execute per chunk under AAC (default: full chunk).")
+    # Dual-rate VLM feature caching (the inference-speed innovation). Sent to
+    # the server per request, so the same running server handles any value.
+    parser.add_argument("--vlm_refresh_every", type=int, default=1,
+                        help="Recompute the expensive VLM once per N server "
+                             "queries (reuse cached features in between). "
+                             "1 = baseline (recompute every query). N>1 speeds "
+                             "up inference while proprio stays fresh each step.")
+    parser.add_argument("--vlm_img_thresh", type=float, default=0.0,
+                        help="Optional image-change gate (per-element RMS). >0 "
+                             "forces a VLM refresh on large scene changes. "
+                             "0 disables the gate.")
 
     args = parser.parse_args()
 
@@ -418,6 +461,12 @@ def main():
     if args.adaptive_chunking:
         print(f"   Adaptive chunking: ON (threshold={args.boundary_threshold}, "
               f"min={args.min_replan}, max={args.max_replan or 'full'})")
+    if args.client_type == "websocket":
+        if args.vlm_refresh_every > 1 or args.vlm_img_thresh > 0:
+            print(f"   VLM caching: refresh_every={args.vlm_refresh_every}, "
+                  f"img_thresh={args.vlm_img_thresh}  (dual-rate inference)")
+        else:
+            print(f"   VLM caching: OFF (refresh_every=1 == baseline)")
 
     # Initialize client
     if args.client_type == "websocket":
@@ -426,6 +475,8 @@ def main():
             adaptive_chunking=args.adaptive_chunking,
             boundary_threshold=args.boundary_threshold,
             min_replan=args.min_replan, max_replan=args.max_replan,
+            vlm_refresh_every=args.vlm_refresh_every,
+            vlm_img_thresh=args.vlm_img_thresh,
         )
     else:
         if args.adaptive_chunking:

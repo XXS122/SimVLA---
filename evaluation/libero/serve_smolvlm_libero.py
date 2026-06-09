@@ -60,7 +60,36 @@ CONFIG = {
     "solver": "euler",        # "euler" (baseline) or "heun" (2nd-order)
     "nfe_steps": 10,          # number of ODE integration steps
     "send_boundary": False,   # also return adaptive-chunking boundary scores
+    # --- Dual-rate VLM feature caching (the actual speedup) ---------------
+    # The VLM stage (~90% of latency) depends ONLY on images+language, so its
+    # output can be reused for several consecutive control queries while the
+    # cheap action transformer still consumes FRESH proprio each step.
+    #   vlm_refresh_every = 1  -> recompute VLM every query == exact baseline
+    #   vlm_refresh_every = N  -> recompute VLM once per N queries (N-1 reuses)
+    "vlm_refresh_every": 1,
+    # Optional image-change gate: if > 0, force a VLM refresh whenever the
+    # current frame differs from the cached frame by more than this per-element
+    # RMS (ImageNet-normalized space). 0 disables the gate (fixed-N only).
+    "vlm_img_thresh": 0.0,
 }
+
+# Dual-rate VLM feature cache. Holds the last VLM encoding so it can be reused
+# across consecutive queries. Reset on episode boundaries (client sends
+# {"reset": True}) and whenever the prompt or image changes enough.
+_VLM_CACHE = {
+    "enc": None,          # dict returned by model.encode_vlm()
+    "last_image": None,   # preprocessed image tensor at last refresh (for gating)
+    "prompt": None,       # language instruction at last refresh
+    "cache_uses": 0,      # how many queries have used the current enc (incl. refresh)
+}
+
+
+def reset_vlm_cache():
+    """Invalidate the dual-rate VLM cache (call on episode boundaries)."""
+    _VLM_CACHE["enc"] = None
+    _VLM_CACHE["last_image"] = None
+    _VLM_CACHE["prompt"] = None
+    _VLM_CACHE["cache_uses"] = 0
 
 
 def load_model(checkpoint_path: str, norm_stats_path: str = None, smolvlm_model_path: str = None):
@@ -177,7 +206,37 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
         # Proprioception
         proprio_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
         
-        # Inference — time the expensive VLM stage and the cheap action stage
+        # ---- Dual-rate VLM feature caching -------------------------------
+        # Decide whether to rerun the expensive VLM (refresh) or reuse the
+        # cached features. proprio is ALWAYS fresh and only consumed by the
+        # cheap action transformer below, so caching never stales the robot
+        # state — only the (slow-changing) visual-language semantics.
+        # Per-request override (lets one server sweep N without reloading the
+        # model); falls back to the server's CLI default when absent.
+        refresh_every = max(1, int(observation.get("vlm_refresh_every",
+                                                   CONFIG["vlm_refresh_every"])))
+        img_thresh = float(observation.get("vlm_img_thresh",
+                                           CONFIG["vlm_img_thresh"]))
+
+        if bool(observation.get("reset", False)):
+            reset_vlm_cache()
+
+        prompt_changed = (_VLM_CACHE["prompt"] != prompt)
+
+        img_changed = False
+        if img_thresh > 0.0 and _VLM_CACHE["last_image"] is not None:
+            _diff = (images - _VLM_CACHE["last_image"]).float()
+            _img_rms = torch.sqrt(torch.mean(_diff * _diff)).item()
+            img_changed = _img_rms > img_thresh
+
+        need_refresh = (
+            _VLM_CACHE["enc"] is None
+            or prompt_changed
+            or img_changed
+            or _VLM_CACHE["cache_uses"] >= refresh_every
+        )
+
+        # Inference — time the (optional) VLM stage and the cheap action stage
         # separately so we can confirm where the latency actually goes.
         import time as _time
 
@@ -187,7 +246,15 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
 
         with torch.no_grad():
             _sync(); _t0 = _time.perf_counter()
-            enc = model.encode_vlm(lang['input_ids'], images, image_mask)
+            if need_refresh:
+                enc = model.encode_vlm(lang['input_ids'], images, image_mask)
+                _VLM_CACHE["enc"] = enc
+                _VLM_CACHE["last_image"] = images
+                _VLM_CACHE["prompt"] = prompt
+                _VLM_CACHE["cache_uses"] = 1
+            else:
+                enc = _VLM_CACHE["enc"]
+                _VLM_CACHE["cache_uses"] += 1
             _sync(); _t1 = _time.perf_counter()
             gen = model.generate_actions_from_enc(
                 enc,
@@ -201,10 +268,17 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
         _vlm_ms = (_t1 - _t0) * 1000
         _act_ms = (_t2 - _t1) * 1000
         _latency_ms = (_t2 - _t0) * 1000
-        logger.info(f"[LATENCY] total={_latency_ms:.1f}ms "
-                    f"| VLM={_vlm_ms:.1f}ms ({_vlm_ms/_latency_ms*100:.0f}%) "
-                    f"| Action={_act_ms:.1f}ms ({_act_ms/_latency_ms*100:.0f}%) "
-                    f"[solver={CONFIG['solver']} nfe={CONFIG['nfe_steps']}]")
+        if need_refresh:
+            logger.info(f"[LATENCY] total={_latency_ms:.1f}ms "
+                        f"| VLM={_vlm_ms:.1f}ms ({_vlm_ms/_latency_ms*100:.0f}%) REFRESH "
+                        f"| Action={_act_ms:.1f}ms ({_act_ms/_latency_ms*100:.0f}%) "
+                        f"[solver={CONFIG['solver']} nfe={CONFIG['nfe_steps']} "
+                        f"refresh_every={refresh_every}]")
+        else:
+            logger.info(f"[LATENCY] total={_latency_ms:.1f}ms "
+                        f"| VLM=cached(~0ms) "
+                        f"| Action={_act_ms:.1f}ms "
+                        f"[cache_use {_VLM_CACHE['cache_uses']}/{refresh_every}]")
 
         if isinstance(gen, tuple):
             actions, boundary = gen
@@ -216,6 +290,7 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
             "latency_ms": float(_latency_ms),
             "vlm_ms": float(_vlm_ms),
             "action_ms": float(_act_ms),
+            "vlm_refreshed": bool(need_refresh),
         }
         if boundary is not None:
             result["boundary"] = boundary.cpu().numpy()[0]
@@ -263,7 +338,11 @@ async def handle_connection(websocket, path=None):
                 if isinstance(actions, np.ndarray):
                     actions = actions.tolist()
 
-                response_data = {"actions": actions, "latency_ms": result.get("latency_ms", 0.0)}
+                response_data = {
+                    "actions": actions,
+                    "latency_ms": result.get("latency_ms", 0.0),
+                    "vlm_refreshed": result.get("vlm_refreshed", True),
+                }
                 boundary = result.get("boundary")
                 if boundary is not None:
                     response_data["boundary"] = (
@@ -324,6 +403,16 @@ def main():
     parser.add_argument("--send_boundary", action="store_true",
                         help="Also return per-step adaptive-chunking boundary "
                              "scores (requires an adaptive-chunking checkpoint).")
+    parser.add_argument("--vlm_refresh_every", type=int, default=1,
+                        help="Dual-rate VLM caching: recompute the expensive VLM "
+                             "once per N queries (reuse cached features in between). "
+                             "1 = recompute every query (exact baseline). N>1 speeds "
+                             "up inference ~Nx for the cached queries.")
+    parser.add_argument("--vlm_img_thresh", type=float, default=0.0,
+                        help="Optional image-change gate (per-element RMS in "
+                             "ImageNet-normalized space). >0 forces a VLM refresh "
+                             "when the scene changes more than this, regardless of "
+                             "--vlm_refresh_every. 0 disables the gate.")
 
     args = parser.parse_args()
 
@@ -333,6 +422,8 @@ def main():
     CONFIG["solver"] = args.solver
     CONFIG["nfe_steps"] = args.nfe_steps
     CONFIG["send_boundary"] = args.send_boundary
+    CONFIG["vlm_refresh_every"] = args.vlm_refresh_every
+    CONFIG["vlm_img_thresh"] = args.vlm_img_thresh
 
     load_model(args.checkpoint, args.norm_stats, args.smolvlm_model)
 
@@ -341,6 +432,9 @@ def main():
     logger.info(f"  Action horizon: {CONFIG['action_horizon']}")
     logger.info(f"  Solver: {CONFIG['solver']}  |  NFE steps: {CONFIG['nfe_steps']}  |  "
                 f"Send boundary: {CONFIG['send_boundary']}")
+    logger.info(f"  VLM cache: refresh_every={CONFIG['vlm_refresh_every']}  |  "
+                f"img_thresh={CONFIG['vlm_img_thresh']}  "
+                f"({'BASELINE (no caching)' if CONFIG['vlm_refresh_every'] <= 1 and CONFIG['vlm_img_thresh'] <= 0 else 'DUAL-RATE CACHING ON'})")
     
     asyncio.run(serve(args.host, args.port))
 
