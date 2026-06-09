@@ -267,11 +267,14 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
 
         prompt_changed = (_VLM_CACHE["prompt"] != prompt)
 
-        # Trigger B: image-change gate
-        img_changed = False
-        if img_thresh > 0.0 and _VLM_CACHE["last_image"] is not None:
+        # Trigger B: image-change gate. The RMS is ALWAYS computed (cheap) so it
+        # shows up in the diagnostic log even when the gate is disabled — this is
+        # how we calibrate vlm_img_thresh. img_rms = -1 means "no cached frame".
+        img_rms = -1.0
+        if _VLM_CACHE["last_image"] is not None:
             _diff = (images - _VLM_CACHE["last_image"]).float()
-            img_changed = torch.sqrt(torch.mean(_diff * _diff)).item() > img_thresh
+            img_rms = torch.sqrt(torch.mean(_diff * _diff)).item()
+        img_changed = (img_thresh > 0.0 and img_rms > img_thresh)
 
         # Trigger C: boundary-score gate (semantic, uses model's own signal)
         boundary_triggered = (
@@ -302,9 +305,10 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
             if device == "cuda":
                 torch.cuda.synchronize()
 
-        # When boundary_thresh is active we always need boundary scores to gate
-        # the NEXT step; combine with send_boundary for the client response.
-        need_boundary = CONFIG["send_boundary"] or boundary_thresh > 0.0
+        # Always request the boundary score: the head is tiny (<1ms) and we want
+        # its value in the diagnostic log on EVERY query (incl. baseline runs) so
+        # the score distribution can be inspected to calibrate boundary_refresh_thresh.
+        need_boundary = True
 
         with torch.no_grad(), _amp_ctx():
             _sync(); _t0 = _time.perf_counter()
@@ -337,24 +341,28 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
         else:
             actions, boundary = gen, None
 
-        # Update boundary score for next step's gate (C trigger).
-        if boundary is not None and boundary_thresh > 0.0:
-            # boundary: [B, T] logits from regression head — higher = more
-            # change expected. Take max over the executed chunk.
-            _VLM_CACHE["boundary_score"] = float(boundary.max().item())
+        # boundary: [B, T] regression scores — higher = more action change
+        # (contact / reversal) expected. Take max over the chunk. Update the
+        # gate's memory unconditionally (it's only USED when boundary_thresh>0,
+        # so updating it always is harmless and feeds the diagnostic log).
+        diag_bnd = float(boundary.max().item()) if boundary is not None else -1.0
+        if boundary is not None:
+            _VLM_CACHE["boundary_score"] = diag_bnd
 
+        # DIAG[...] prints the two calibration signals every query: the just-
+        # computed boundary score and the image RMS vs the cached frame.
+        _diag = f"DIAG[bnd={diag_bnd:.3f} imgrms={img_rms:.3f}]"
         if need_refresh:
             logger.info(f"[LATENCY] total={_latency_ms:.1f}ms "
                         f"| VLM={_vlm_ms:.1f}ms ({_vlm_ms/_latency_ms*100:.0f}%) "
                         f"REFRESH({trigger_reason}) "
                         f"| Action={_act_ms:.1f}ms "
-                        f"[N={refresh_every} img={img_thresh} bnd={boundary_thresh:.2f}]")
+                        f"[N={refresh_every} img={img_thresh} bnd={boundary_thresh:.2f}] {_diag}")
         else:
             logger.info(f"[LATENCY] total={_latency_ms:.1f}ms "
                         f"| VLM=cached "
                         f"| Action={_act_ms:.1f}ms "
-                        f"[use {_VLM_CACHE['cache_uses']}/{refresh_every} "
-                        f"bnd_score={_VLM_CACHE['boundary_score']:.3f}]")
+                        f"[use {_VLM_CACHE['cache_uses']}/{refresh_every}] {_diag}")
 
         result = {
             "actions": actions.cpu().numpy()[0],
