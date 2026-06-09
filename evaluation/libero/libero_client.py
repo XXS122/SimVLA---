@@ -34,6 +34,14 @@ try:
 except ImportError:
     HAS_WS_CLIENT = False
 
+# Headless rendering defaults. MuJoCo/robosuite default to GLX (needs an X
+# display); on a headless server PyOpenGL then fails to expose the EGL device
+# extensions ("module 'OpenGL.EGL' has no attribute 'EGLDeviceEXT'"). Forcing
+# the EGL backend here — BEFORE importing libero/robosuite — fixes it. Both
+# vars use setdefault so an explicit `export MUJOCO_GL=osmesa` still wins.
+os.environ.setdefault("MUJOCO_GL", "egl")
+os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 
