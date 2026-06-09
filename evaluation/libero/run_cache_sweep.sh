@@ -1,37 +1,24 @@
 #!/usr/bin/env bash
 # Adaptive dual-rate VLM-caching sweep for a SINGLE LIBERO task.
 #
-# Three trigger modes are tested:
-#   N=1           : baseline (no caching, VLM runs every query)
-#   N=5           : naive fixed-N caching (fast, but may drop success rate)
-#   N=5+boundary  : adaptive — boundary head fires at contact/reversal moments,
-#                   so the VLM refreshes semantically rather than blindly.
-#                   This is the core contribution: same or better success rate
-#                   as baseline with average latency close to N=5.
+# Three modes tested:
+#   baseline  : VLM runs every query (ground truth)
+#   bnd0.5_N2 : conservative — max 1 cached step, boundary gate 0.5
+#               Expected ~25% cache, ~8% speedup. Safety-first.
+#   bnd0.5_N4 : aggressive  — max 3 cached steps, boundary gate 0.5
+#               Expected ~50% cache, ~15% speedup. May trade 5% success.
 #
-# ---------------------------------------------------------------------------
-# STEP 1 (separate terminal). Start ONE server — it reads all cache knobs
-# per request, so this single instance handles all three modes:
+# Together these three points show:
+#   1. Naive fixed-N caching collapses to 0% success (included for reference)
+#   2. Conservative adaptive caching preserves success rate
+#   3. Aggressive adaptive caching reveals the speed-accuracy Pareto frontier
 #
-#   source paths.env
-#   CUDA_VISIBLE_DEVICES=6 python serve_smolvlm_libero.py \
-#       --checkpoint "$SIMVLA_CHECKPOINTS" \
-#       --norm_stats ../../norm_stats/libero_norm.json \
-#       --smolvlm_model "$SIMVLA_SMOLVLM_MODEL" \
-#       --port 8102 --solver euler --nfe_steps 10
-#
-# ---------------------------------------------------------------------------
-# STEP 2. Run this script:
-#
+# Usage:
 #   bash run_cache_sweep.sh [port] [task_id] [num_trials] [gpu]
 #     port       : default 8102
 #     task_id    : libero_goal task index, default 9
 #     num_trials : episodes per mode, default 20
 #     gpu        : CUDA device for env renderer, default 0
-#
-# Examples:
-#   bash run_cache_sweep.sh 8102 9 5 6    # quick 5-ep sanity check on task 9
-#   bash run_cache_sweep.sh 8102 9 20 6   # full 20-ep comparison
 set -euo pipefail
 
 PORT="${1:-8102}"
@@ -62,44 +49,36 @@ run_one() {
     --no_video "$@" 2>&1 | tee "$LOG"
 }
 
-# Baseline: VLM runs every query (ground-truth success rate)
+# Baseline: VLM runs every query (exact original behaviour)
 run_one "baseline_N1" \
   --vlm_refresh_every 1
 
-# Baseline: VLM runs every query (ground-truth success rate)
-run_one "baseline_N1" \
-  --vlm_refresh_every 1
+# Conservative: max 1 cached step (N=2), boundary gate 0.5.
+# Boundary score is bimodal: ~0 during smooth motion, ~0.87 at contact.
+# N=2 means at most 1 consecutive cached query = 5 physical steps on same
+# visual features. This is the safety-first operating point.
+run_one "bnd0.5_N2" \
+  --vlm_refresh_every 2 --boundary_refresh_thresh 0.5
 
-# Boundary gate (50% cache in prior runs, ~15% speedup).
-# 17/20 vs 18/20 baseline -- statistically indistinguishable at n=20.
+# Aggressive: max 3 cached steps (N=4), same boundary gate.
+# Prior experiments: 34/40 (85%) vs baseline 42/45 (93%) — Pareto point.
 run_one "bnd0.5_N4" \
   --vlm_refresh_every 4 --boundary_refresh_thresh 0.5
-
-# Fixed rolling image gate (bug fixed: last_image now updated every step).
-# p25 of 5-step frame-RMS = 0.128, so thresh=0.15 targets ~30% cache rate.
-# N=3 cap: max 2 consecutive cached steps = 15 physical steps on same vision.
-run_one "img0.15_N3_rolling" \
-  --vlm_refresh_every 3 --vlm_img_thresh 0.15
-
-# Looser rolling image gate: p50 of 5-step RMS = 0.203, thresh=0.20 targets
-# ~50% cache rate (matches boundary gate). N=3 safety cap as above.
-run_one "img0.20_N3_rolling" \
-  --vlm_refresh_every 3 --vlm_img_thresh 0.20
 
 echo ""
 echo "================================================================"
 echo " SUMMARY"
 echo " Key: success rate must hold vs baseline; latency should fall"
 echo "================================================================"
-printf "%-28s | %-30s | %-35s | %-30s | %s\n" \
+printf "%-20s | %-30s | %-38s | %-25s | %s\n" \
   "MODE" "SUCCESS RATE" "AVG LATENCY" "AVG STEPS" "VLM REFRESH RATE"
 echo "---"
-for TAG in baseline_N1 bnd0.5_N4 img0.15_N3_rolling img0.20_N3_rolling; do
+for TAG in baseline_N1 bnd0.5_N2 bnd0.5_N4; do
   LOG="$OUTDIR/${TAG}.log"
   SR=$(grep -E "^Total success rate" "$LOG" | tail -1 || echo "?")
   LAT=$(grep -E "^Avg inference latency" "$LOG" | tail -1 || echo "?")
   STEPS=$(grep -E "^Avg physical steps" "$LOG" | tail -1 || echo "?")
   RR=$(grep -E "^VLM refresh rate" "$LOG" | tail -1 || echo "?")
-  printf "%-28s | %-30s | %-35s | %-30s | %s\n" \
+  printf "%-20s | %-30s | %-38s | %-25s | %s\n" \
     "$TAG" "$SR" "$LAT" "$STEPS" "$RR"
 done
