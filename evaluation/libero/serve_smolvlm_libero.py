@@ -177,30 +177,46 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
         # Proprioception
         proprio_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
         
-        # Inference
+        # Inference — time the expensive VLM stage and the cheap action stage
+        # separately so we can confirm where the latency actually goes.
         import time as _time
-        _t0 = _time.perf_counter()
+
+        def _sync():
+            if device == "cuda":
+                torch.cuda.synchronize()
+
         with torch.no_grad():
-            gen = model.generate_actions(
-                input_ids=lang['input_ids'],
-                image_input=images,
-                image_mask=image_mask,
+            _sync(); _t0 = _time.perf_counter()
+            enc = model.encode_vlm(lang['input_ids'], images, image_mask)
+            _sync(); _t1 = _time.perf_counter()
+            gen = model.generate_actions_from_enc(
+                enc,
                 proprio=proprio_tensor,
                 steps=CONFIG["nfe_steps"],
                 solver=CONFIG["solver"],
                 return_boundary=CONFIG["send_boundary"],
             )
+            _sync(); _t2 = _time.perf_counter()
 
-        _latency_ms = (_time.perf_counter() - _t0) * 1000
-        logger.info(f"[LATENCY] solver={CONFIG['solver']} nfe={CONFIG['nfe_steps']} "
-                    f"=> {_latency_ms:.1f}ms")
+        _vlm_ms = (_t1 - _t0) * 1000
+        _act_ms = (_t2 - _t1) * 1000
+        _latency_ms = (_t2 - _t0) * 1000
+        logger.info(f"[LATENCY] total={_latency_ms:.1f}ms "
+                    f"| VLM={_vlm_ms:.1f}ms ({_vlm_ms/_latency_ms*100:.0f}%) "
+                    f"| Action={_act_ms:.1f}ms ({_act_ms/_latency_ms*100:.0f}%) "
+                    f"[solver={CONFIG['solver']} nfe={CONFIG['nfe_steps']}]")
 
         if isinstance(gen, tuple):
             actions, boundary = gen
         else:
             actions, boundary = gen, None
 
-        result = {"actions": actions.cpu().numpy()[0], "latency_ms": float(_latency_ms)}
+        result = {
+            "actions": actions.cpu().numpy()[0],
+            "latency_ms": float(_latency_ms),
+            "vlm_ms": float(_vlm_ms),
+            "action_ms": float(_act_ms),
+        }
         if boundary is not None:
             result["boundary"] = boundary.cpu().numpy()[0]
         return result

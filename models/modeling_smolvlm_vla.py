@@ -433,40 +433,32 @@ class SmolVLMVLA(PreTrainedModel):
 
     # ================================= inference =================================
     @torch.no_grad()
-    def generate_actions(
+    def encode_vlm(
         self,
         input_ids: torch.LongTensor,
         image_input: torch.FloatTensor,
         image_mask: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """Expensive stage: run the VLM (vision encoder + language fusion) and
+        return the cacheable features. The result depends ONLY on images and
+        language, NOT on proprioception, so it can be reused across consecutive
+        control steps (dual-rate / feature-caching inference)."""
+        self.eval()
+        return self.forward_vlm_efficient(image_input, image_mask, input_ids)
+
+    @torch.no_grad()
+    def generate_actions_from_enc(
+        self,
+        enc: Dict[str, torch.Tensor],
         proprio: torch.Tensor,
         steps: int = 10,
         solver: str = "euler",
         return_boundary: bool = False,
     ):
-        """
-        Flow Matching inference (ODE integration).
-
-        1) Initialize x_t = noise (t=1)
-        2) Loop t from 1 to 0, predicting velocity v_t and integrating
-        3) Final x_0 ≈ target action
-
-        Args
-        ----
-        steps : number of integration steps (NFE for Euler; 2*NFE for Heun).
-        solver : "euler" (1st-order, default, original behaviour) or
-                 "heun" (2nd-order predictor-corrector). Heun has O(dt^3) local
-                 error so it reaches Euler-quality actions at roughly half the
-                 steps -> lower inference latency.
-        return_boundary : if True, additionally query the trained adaptive
-                 chunking boundary head on the final actions and return
-                 (actions, boundary_scores). boundary_scores is [B, T] with high
-                 values at high-change (contact / reversal) steps. Returns
-                 (actions, None) when the checkpoint has no boundary head.
-        """
-        self.eval()
-        enc = self.forward_vlm_efficient(image_input, image_mask, input_ids)
-
-        B = input_ids.shape[0]
+        """Cheap stage: flow-matching ODE integration over the action transformer
+        using pre-computed (possibly cached) VLM features `enc` plus FRESH
+        proprioception. See `generate_actions` for arg semantics."""
+        B = enc["vlm_features"].shape[0]
         D = self.action_space.dim_action
         device = proprio.device
         dtype = proprio.dtype
@@ -528,6 +520,36 @@ class SmolVLMVLA(PreTrainedModel):
             if isinstance(out, tuple):
                 boundary = out[1]
         return actions, boundary
+
+    @torch.no_grad()
+    def generate_actions(
+        self,
+        input_ids: torch.LongTensor,
+        image_input: torch.FloatTensor,
+        image_mask: torch.Tensor,
+        proprio: torch.Tensor,
+        steps: int = 10,
+        solver: str = "euler",
+        return_boundary: bool = False,
+    ):
+        """
+        Flow Matching inference (ODE integration). Thin wrapper that runs the
+        expensive VLM stage then the cheap action stage in one shot (original
+        behaviour). For dual-rate / cached inference call `encode_vlm` and
+        `generate_actions_from_enc` separately.
+
+        Args
+        ----
+        steps : number of integration steps (NFE for Euler; 2*NFE for Heun).
+        solver : "euler" (1st-order, default, original behaviour) or
+                 "heun" (2nd-order predictor-corrector).
+        return_boundary : if True, also return the adaptive-chunking boundary
+                 scores (or None when the checkpoint has no boundary head).
+        """
+        enc = self.encode_vlm(input_ids, image_input, image_mask)
+        return self.generate_actions_from_enc(
+            enc, proprio, steps=steps, solver=solver, return_boundary=return_boundary
+        )
 
     # =============================== FastAPI service =============================
     def _build_app(self, processor):
