@@ -342,11 +342,17 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
             actions, boundary = gen, None
 
         # boundary: [B, T] regression scores — higher = more action change
-        # (contact / reversal) expected. Take max over the chunk. Update the
-        # gate's memory unconditionally (it's only USED when boundary_thresh>0,
-        # so updating it always is harmless and feeds the diagnostic log).
+        # (contact / reversal) expected. Take max over the chunk.
+        #
+        # IMPORTANT: only update the gate's memory during CACHED steps.
+        # After a refresh the score is already reset to 0. If we let the fresh
+        # prediction overwrite it, the gate immediately re-triggers on the
+        # very next query (the fresh boundary score ≈ 0.87 > threshold),
+        # producing 100% refresh with zero caching. The gate is designed to
+        # detect when STALE features are becoming dangerous — so the signal
+        # must come from cached steps, not from freshly computed ones.
         diag_bnd = float(boundary.max().item()) if boundary is not None else -1.0
-        if boundary is not None:
+        if boundary is not None and not need_refresh:
             _VLM_CACHE["boundary_score"] = diag_bnd
 
         # DIAG[...] prints the two calibration signals every query: the just-
