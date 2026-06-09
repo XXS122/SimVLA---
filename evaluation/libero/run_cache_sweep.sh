@@ -66,20 +66,25 @@ run_one() {
 run_one "baseline_N1" \
   --vlm_refresh_every 1
 
-# Image-only gate @ tight threshold (safe operating point confirmed in 10-trial pilot).
-# Training-free, checkpoint-agnostic. p25 of frame-RMS distribution = 0.128.
-run_one "img0.15_N6" \
-  --vlm_refresh_every 6 --vlm_img_thresh 0.15
+# Baseline: VLM runs every query (ground-truth success rate)
+run_one "baseline_N1" \
+  --vlm_refresh_every 1
 
-# Image-only gate @ looser threshold. p50 of frame-RMS = 0.203.
-# Expected cache rate ~30%, expected speedup ~20%. Needs 20 trials to confirm safety.
-run_one "img0.20_N6" \
-  --vlm_refresh_every 6 --vlm_img_thresh 0.20
-
-# Boundary-only gate (50% cache in pilot). 10 trials showed 8/10 vs 9/10 baseline.
-# n=10 is too small to distinguish; 20 trials determine if this is truly safe.
+# Boundary gate (50% cache in prior runs, ~15% speedup).
+# 17/20 vs 18/20 baseline -- statistically indistinguishable at n=20.
 run_one "bnd0.5_N4" \
   --vlm_refresh_every 4 --boundary_refresh_thresh 0.5
+
+# Fixed rolling image gate (bug fixed: last_image now updated every step).
+# p25 of 5-step frame-RMS = 0.128, so thresh=0.15 targets ~30% cache rate.
+# N=3 cap: max 2 consecutive cached steps = 15 physical steps on same vision.
+run_one "img0.15_N3_rolling" \
+  --vlm_refresh_every 3 --vlm_img_thresh 0.15
+
+# Looser rolling image gate: p50 of 5-step RMS = 0.203, thresh=0.20 targets
+# ~50% cache rate (matches boundary gate). N=3 safety cap as above.
+run_one "img0.20_N3_rolling" \
+  --vlm_refresh_every 3 --vlm_img_thresh 0.20
 
 echo ""
 echo "================================================================"
@@ -89,7 +94,7 @@ echo "================================================================"
 printf "%-28s | %-30s | %-35s | %-30s | %s\n" \
   "MODE" "SUCCESS RATE" "AVG LATENCY" "AVG STEPS" "VLM REFRESH RATE"
 echo "---"
-for TAG in baseline_N1 img0.15_N6 img0.20_N6 bnd0.5_N4; do
+for TAG in baseline_N1 bnd0.5_N4 img0.15_N3_rolling img0.20_N3_rolling; do
   LOG="$OUTDIR/${TAG}.log"
   SR=$(grep -E "^Total success rate" "$LOG" | tail -1 || echo "?")
   LAT=$(grep -E "^Avg inference latency" "$LOG" | tail -1 || echo "?")

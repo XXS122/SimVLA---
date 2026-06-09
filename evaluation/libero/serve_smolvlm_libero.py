@@ -315,13 +315,18 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
             if need_refresh:
                 enc = model.encode_vlm(lang['input_ids'], images, image_mask)
                 _VLM_CACHE["enc"] = enc
-                _VLM_CACHE["last_image"] = images
                 _VLM_CACHE["prompt"] = prompt
                 _VLM_CACHE["cache_uses"] = 1
                 _VLM_CACHE["boundary_score"] = 0.0  # reset on refresh
             else:
                 enc = _VLM_CACHE["enc"]
                 _VLM_CACHE["cache_uses"] += 1
+            # Rolling update: always track the PREVIOUS query's image so the
+            # img_thresh gate measures "5-step change" (fixed window) not
+            # "change since last refresh" (growing window). Without this the
+            # gate almost never fires because cumulative drift exceeds any
+            # threshold after just 2 cached steps.
+            _VLM_CACHE["last_image"] = images
             _sync(); _t1 = _time.perf_counter()
             gen = model.generate_actions_from_enc(
                 enc,
