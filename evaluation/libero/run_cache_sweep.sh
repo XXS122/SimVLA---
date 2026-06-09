@@ -36,7 +36,7 @@ set -euo pipefail
 
 PORT="${1:-8102}"
 TASK_ID="${2:-9}"
-NUM_TRIALS="${3:-20}"
+NUM_TRIALS="${3:-10}"
 GPU="${4:-0}"
 TASK_SUITE="libero_goal"
 SEED="${SEED:-7}"
@@ -62,22 +62,26 @@ run_one() {
     --no_video "$@" 2>&1 | tee "$LOG"
 }
 
-# Baseline: VLM runs every query
+# Baseline: VLM runs every query (ground-truth success rate)
 run_one "baseline_N1" \
   --vlm_refresh_every 1
 
-# Naive fixed-N: VLM cached every 5 queries (fast but may drop success rate)
-run_one "naive_N5" \
-  --vlm_refresh_every 5
+# Boundary-only gate (calibrated thresh 0.5; boundary score is bimodal:
+# ~0 during smooth motion, ~0.9 at contact). Caches ~50% but the boundary
+# head can't sense free-space drift from stale vision -> can drop success.
+run_one "bnd0.5_N4" \
+  --vlm_refresh_every 4 --boundary_refresh_thresh 0.5
 
-# Adaptive: N=5 cap + boundary-score gate (semantic refresh at critical moments)
-# Boundary thresh 0.3 = refresh whenever predicted action-change rate > 0.3
-run_one "adaptive_N5_bnd0.3" \
-  --vlm_refresh_every 5 --boundary_refresh_thresh 0.3
+# Boundary + image-change gate (the safe combination): cache only when the
+# scene is nearly static AND no contact predicted. img_thresh 0.2 ~ median
+# frame RMS, so any appreciable visual motion forces a refresh.
+run_one "bnd0.5_img0.2_N4" \
+  --vlm_refresh_every 4 --boundary_refresh_thresh 0.5 --vlm_img_thresh 0.2
 
-# Optional tighter cap + boundary gate (more refreshes, safer)
-run_one "adaptive_N3_bnd0.3" \
-  --vlm_refresh_every 3 --boundary_refresh_thresh 0.3
+# Image-only gate (training-free, checkpoint-agnostic): refresh purely on
+# visual change. Most principled "do I need to recompute vision" signal.
+run_one "img0.15_N6" \
+  --vlm_refresh_every 6 --vlm_img_thresh 0.15
 
 echo ""
 echo "================================================================"
@@ -87,7 +91,7 @@ echo "================================================================"
 printf "%-28s | %-30s | %-35s | %-30s | %s\n" \
   "MODE" "SUCCESS RATE" "AVG LATENCY" "AVG STEPS" "VLM REFRESH RATE"
 echo "---"
-for TAG in baseline_N1 naive_N5 adaptive_N5_bnd0.3 adaptive_N3_bnd0.3; do
+for TAG in baseline_N1 bnd0.5_N4 bnd0.5_img0.2_N4 img0.15_N6; do
   LOG="$OUTDIR/${TAG}.log"
   SR=$(grep -E "^Total success rate" "$LOG" | tail -1 || echo "?")
   LAT=$(grep -E "^Avg inference latency" "$LOG" | tail -1 || echo "?")
