@@ -36,7 +36,7 @@ set -euo pipefail
 
 PORT="${1:-8102}"
 TASK_ID="${2:-9}"
-NUM_TRIALS="${3:-10}"
+NUM_TRIALS="${3:-20}"
 GPU="${4:-0}"
 TASK_SUITE="libero_goal"
 SEED="${SEED:-7}"
@@ -66,22 +66,20 @@ run_one() {
 run_one "baseline_N1" \
   --vlm_refresh_every 1
 
-# Boundary-only gate (calibrated thresh 0.5; boundary score is bimodal:
-# ~0 during smooth motion, ~0.9 at contact). Caches ~50% but the boundary
-# head can't sense free-space drift from stale vision -> can drop success.
-run_one "bnd0.5_N4" \
-  --vlm_refresh_every 4 --boundary_refresh_thresh 0.5
-
-# Boundary + image-change gate (the safe combination): cache only when the
-# scene is nearly static AND no contact predicted. img_thresh 0.2 ~ median
-# frame RMS, so any appreciable visual motion forces a refresh.
-run_one "bnd0.5_img0.2_N4" \
-  --vlm_refresh_every 4 --boundary_refresh_thresh 0.5 --vlm_img_thresh 0.2
-
-# Image-only gate (training-free, checkpoint-agnostic): refresh purely on
-# visual change. Most principled "do I need to recompute vision" signal.
+# Image-only gate @ tight threshold (safe operating point confirmed in 10-trial pilot).
+# Training-free, checkpoint-agnostic. p25 of frame-RMS distribution = 0.128.
 run_one "img0.15_N6" \
   --vlm_refresh_every 6 --vlm_img_thresh 0.15
+
+# Image-only gate @ looser threshold. p50 of frame-RMS = 0.203.
+# Expected cache rate ~30%, expected speedup ~20%. Needs 20 trials to confirm safety.
+run_one "img0.20_N6" \
+  --vlm_refresh_every 6 --vlm_img_thresh 0.20
+
+# Boundary-only gate (50% cache in pilot). 10 trials showed 8/10 vs 9/10 baseline.
+# n=10 is too small to distinguish; 20 trials determine if this is truly safe.
+run_one "bnd0.5_N4" \
+  --vlm_refresh_every 4 --boundary_refresh_thresh 0.5
 
 echo ""
 echo "================================================================"
@@ -91,7 +89,7 @@ echo "================================================================"
 printf "%-28s | %-30s | %-35s | %-30s | %s\n" \
   "MODE" "SUCCESS RATE" "AVG LATENCY" "AVG STEPS" "VLM REFRESH RATE"
 echo "---"
-for TAG in baseline_N1 bnd0.5_N4 bnd0.5_img0.2_N4 img0.15_N6; do
+for TAG in baseline_N1 img0.15_N6 img0.20_N6 bnd0.5_N4; do
   LOG="$OUTDIR/${TAG}.log"
   SR=$(grep -E "^Total success rate" "$LOG" | tail -1 || echo "?")
   LAT=$(grep -E "^Avg inference latency" "$LOG" | tail -1 || echo "?")
