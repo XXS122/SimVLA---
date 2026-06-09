@@ -119,13 +119,22 @@ def reset_vlm_cache():
 def load_model(checkpoint_path: str, norm_stats_path: str = None, smolvlm_model_path: str = None):
     """Load SimVLA model and processor."""
     global model, processor
-    
+
     logger.info(f"Loading SimVLA from {checkpoint_path}...")
-    
-    model = SmolVLMVLA.from_pretrained(checkpoint_path)
+
+    if smolvlm_model_path:
+        # Override the SmolVLM backbone path baked into the checkpoint config.
+        # Needed when the checkpoint was created on a different machine with different paths.
+        from models.configuration_smolvlm_vla import SmolVLMVLAConfig
+        config = SmolVLMVLAConfig.from_pretrained(checkpoint_path)
+        config.smolvlm_model_path = smolvlm_model_path
+        logger.info(f"Overriding smolvlm_model_path -> {smolvlm_model_path}")
+        model = SmolVLMVLA.from_pretrained(checkpoint_path, config=config)
+    else:
+        model = SmolVLMVLA.from_pretrained(checkpoint_path)
     model = model.to(device)
     model.eval()
-    
+
     smolvlm_path = smolvlm_model_path or "HuggingFaceTB/SmolVLM-500M-Instruct"
     processor = SmolVLMVLAProcessor.from_pretrained(smolvlm_path)
     
