@@ -49,14 +49,15 @@ class SmolVLMDataReader(IterableDataset):
     IMAGE_STD = (0.229, 0.224, 0.225)
     
     def __init__(
-        self, 
-        metas_path: str, 
-        num_actions: int = 10, 
-        num_views: int = 3, 
+        self,
+        metas_path: str,
+        num_actions: int = 10,
+        num_views: int = 3,
         training: bool = True,
         action_mode: str = "galaxea_joint",
         lang_aug: str = None,
         image_size: int = 384,  # Default 384, can be 384 or 512
+        tds_weights_csv: str = None,
     ):
         self.num_views = num_views
         self.training = training
@@ -64,9 +65,18 @@ class SmolVLMDataReader(IterableDataset):
         self.action_mode = action_mode
         self.image_size = image_size
         self.metas: Dict[str, dict] = {}
-        
+
         print(f"[SmolVLM Dataset] Image size: {self.image_size}x{self.image_size}")
         print(f"[SmolVLM Dataset] Action mode: {action_mode}")
+
+        # Transition-Density Sampling (off when csv not given -> exact
+        # original uniform behavior)
+        self.tds_task_pk = None
+        if tds_weights_csv:
+            from .tds_sampling import load_task_weights
+            self.tds_task_pk = load_task_weights(tds_weights_csv)
+            print(f"[SmolVLM Dataset] TDS enabled: {len(self.tds_task_pk)} "
+                  f"task weights from {tds_weights_csv}")
         
         # Load metadata
         if fileio.isdir(metas_path):
@@ -135,16 +145,29 @@ class SmolVLMDataReader(IterableDataset):
         
         return transforms.Compose(transform_list)
 
+    def _finalize_sample(self, sample: dict, meta: dict) -> dict:
+        """Shared post-processing: slice abs trajectory into action chunk."""
+        idx_for_delta = meta.get("idx_for_delta", [])
+        has_proprio = "proprio" in sample
+        slice_result = action_slice(sample["abs_trajectory"], idx_for_delta)
+
+        if has_proprio:
+            sample["action"] = slice_result["action"]
+        else:
+            sample.update(slice_result)
+        del sample["abs_trajectory"]
+        return sample
+
     def _iter_one_dataset(self, dataset_name: str) -> Iterable[dict]:
         """Iterate over one dataset."""
         meta = self.metas[dataset_name]
         traj_indices = list(range(len(meta["datalist"])))
         if self.training:
             random.shuffle(traj_indices)
-            
+
         Handler = get_handler_cls(dataset_name)
         handler = Handler(meta=meta, num_views=self.num_views)
-        
+
         for traj_idx in traj_indices:
             try:
                 for sample in handler.iter_episode(
@@ -155,22 +178,91 @@ class SmolVLMDataReader(IterableDataset):
                     lang_aug_map=meta.get("lang_aug_map"),
                     action_mode=self.action_mode
                 ):
-                    idx_for_delta = meta.get("idx_for_delta", [])
-                    has_proprio = "proprio" in sample
-                    slice_result = action_slice(sample["abs_trajectory"], idx_for_delta)
-                    
-                    if has_proprio:
-                        sample["action"] = slice_result["action"]
-                    else:
-                        sample.update(slice_result)
-                    del sample["abs_trajectory"]
-                    
-                    yield sample
+                    yield self._finalize_sample(sample, meta)
             except Exception as e:
                 continue
-                
+
         if self.training:
             yield from self._iter_one_dataset(dataset_name)
+
+    def _iter_one_task(self, dataset_name: str, traj_idx: int) -> Iterable[dict]:
+        """Infinite sample stream from a single task file (TDS mode)."""
+        meta = self.metas[dataset_name]
+        Handler = get_handler_cls(dataset_name)
+        handler = Handler(meta=meta, num_views=self.num_views)
+        failures = 0
+        while True:
+            yielded = False
+            try:
+                for sample in handler.iter_episode(
+                    traj_idx,
+                    num_actions=self.num_actions,
+                    training=self.training,
+                    image_aug=self.image_aug,
+                    lang_aug_map=meta.get("lang_aug_map"),
+                    action_mode=self.action_mode
+                ):
+                    yielded = True
+                    yield self._finalize_sample(sample, meta)
+            except Exception:
+                pass
+            if yielded:
+                failures = 0
+            else:
+                failures += 1
+                if failures >= 3:
+                    print(f"[TDS] task file idx={traj_idx} of {dataset_name} "
+                          f"failed {failures} passes in a row, dropping it "
+                          f"from the sampling pool")
+                    return
+
+    def _iter_tds(self) -> Iterable[dict]:
+        """Two-level Transition-Density Sampling over all task files.
+
+        Each yield draws a task file with probability DATA_WEIGHTS-scaled
+        p_k, then takes the next sample from that task's persistent stream.
+        Note: this keeps one suspended episode generator per task file
+        (roughly the decoded arrays of one demo each), so worker RAM grows
+        by ~10-20 MB per task file.
+        """
+        from .tds_sampling import (SamplingMonitor, file_stem,
+                                   resolve_stem_weights)
+
+        entries = []  # (dataset_name, traj_idx, stem, dataset_weight)
+        for name, meta in self.metas.items():
+            dw = DATA_WEIGHTS.get(name, 1.0)
+            for i, item in enumerate(meta["datalist"]):
+                path = item["path"] if isinstance(item, dict) else item
+                entries.append((name, i, file_stem(path), dw))
+
+        pks = resolve_stem_weights([e[2] for e in entries], self.tds_task_pk)
+        ws = [dw * pk for (_, _, _, dw), pk in zip(entries, pks)]
+        s = sum(ws)
+        ws = [w / s for w in ws]
+        gens = [iter(self._iter_one_task(name, i)) for name, i, _, _ in entries]
+
+        # Verify the empirical sampling distribution once (worker 0 only)
+        worker_info = torch.utils.data.get_worker_info()
+        monitor = None
+        if worker_info is None or worker_info.id == 0:
+            monitor = SamplingMonitor(
+                {e[2]: w for e, w in zip(entries, ws)})
+
+        while gens:
+            i = random.choices(range(len(gens)), weights=ws, k=1)[0]
+            try:
+                sample = next(gens[i])
+            except StopIteration:
+                # Dead task file: remove and renormalize
+                del gens[i], ws[i], entries[i]
+                if not gens:
+                    return
+                s = sum(ws)
+                ws = [w / s for w in ws]
+                continue
+            if monitor is not None:
+                monitor.record(entries[i][2])
+            yield sample
 
     def __iter__(self):
         """Main iteration."""
@@ -178,6 +270,8 @@ class SmolVLMDataReader(IterableDataset):
         if not self.training:
             for n in names:
                 yield from self._iter_one_dataset(n)
+        elif self.tds_task_pk is not None:
+            yield from self._iter_tds()
         else:
             gens = [iter(self._iter_one_dataset(n)) for n in names]
             ws = [DATA_WEIGHTS.get(n, 1.0) for n in names]
@@ -281,14 +375,15 @@ class SmolVLMDataReaderWithPadding(SmolVLMDataReader):
 
 
 def create_smolvlm_dataloader(
-    batch_size: int, 
-    metas_path: str, 
+    batch_size: int,
+    metas_path: str,
     num_actions: int,
     training: bool,
     action_mode: str,
     num_workers: int = 4,
     image_size: int = 384,
     use_smart_padding: bool = False,
+    tds_weights_csv: str = None,
 ):
     """
     Create dataloader for SmolVLM-VLA training.
@@ -311,7 +406,10 @@ def create_smolvlm_dataloader(
         Image size (default 384, can be 384 or 512).
     use_smart_padding : bool
         Whether to use smart padding for small images.
-        
+    tds_weights_csv : str
+        Optional task_difficulty.csv from transition_density_stats.py;
+        enables Transition-Density Sampling over task files.
+
     Returns
     -------
     DataLoader
@@ -349,6 +447,7 @@ def create_smolvlm_dataloader(
         training=training,
         action_mode=action_mode,
         image_size=image_size,
+        tds_weights_csv=tds_weights_csv,
     )
     
     return DataLoader(

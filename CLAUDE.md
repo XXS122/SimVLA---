@@ -54,6 +54,14 @@ python compute_libero_norm_stats.py \
   --data_dir ./datasets/metas \
   --subsets libero_10 libero_goal libero_object libero_spatial \
   --output ./norm_stats/libero_norm.json
+
+# (Optional, TDS Experiment 0) Per-task transition-density difficulty scores
+python transition_density_stats.py \
+  --data_root $LIBERO_DATASETS \
+  --suites libero_spatial libero_object libero_goal libero_10 \
+  --out task_difficulty.csv
+# Add --sr_csv baseline_per_task_sr.csv (from libero_client.py --per_task_csv)
+# to run the Spearman hypothesis test (Exp 0a); see docs/tds_design.md
 ```
 
 ### Training
@@ -68,6 +76,9 @@ bash train_smolvlm_large.sh [batch_size] [learning_coef] [output_dir] [resume_ck
 
 # Enable Adaptive Action Chunking (change-rate-weighted loss + boundary head)
 USE_ADAPTIVE_CHUNKING=true CHUNK_LOSS_WEIGHT=0.1 bash train_smolvlm_small.sh
+
+# Enable Transition-Density Sampling (difficulty-weighted task sampling)
+TDS_WEIGHTS_CSV=./task_difficulty.csv bash train_smolvlm_small.sh
 
 # Direct training script invocation
 python train_smolvlm.py --help
@@ -181,6 +192,17 @@ tail -f eval_step200k_goal.txt
 - `IterableDataset` implementations that stream episodes from HDF5 files
 - Multi-view image support (default 3 views); configurable image size (384×384 or 512×512)
 - ImageNet normalization applied to images
+- Optional Transition-Density Sampling (`tds_weights_csv`): two-level sampling that
+  draws a task file per sample with probability `p_k` (since the dataset is an
+  infinite `IterableDataset`, `WeightedRandomSampler` does not apply)
+
+**`tds_sampling.py`** — Transition-Density Sampling (opt-in, off by default)
+- Loads per-task weights `p_k` from `task_difficulty.csv` (produced offline by
+  `transition_density_stats.py` from gripper-event density, low-speed plateau ratio,
+  and trajectory length — same plateau constants as BGE / step-level weighting)
+- `SamplingMonitor` verifies empirical vs target sampling distribution early in training
+- CLI `--tds_weights_csv`; shell env `TDS_WEIGHTS_CSV`
+- Design notes / experiment plan: `docs/tds_design.md`
 
 **`domain_handler/`** — Plugin system for different dataset formats
 - `base.py` defines the `BaseDomainHandler` interface

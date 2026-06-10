@@ -157,6 +157,11 @@ def get_args_parser():
     parser.add_argument("--chunk_loss_weight", type=float, default=0.1,
                         help="Weight for the boundary prediction auxiliary loss")
 
+    # Transition-Density Sampling (TDS)
+    parser.add_argument("--tds_weights_csv", type=str, default=None,
+                        help="task_difficulty.csv from transition_density_stats.py; "
+                             "enables difficulty-weighted task sampling (off by default)")
+
     # Model architecture
     parser.add_argument("--hidden_size", type=int, default=768,
                         help="Hidden size for action transformer")
@@ -289,6 +294,7 @@ def main(args):
         "use_adaln": args.use_adaln,
         "use_adaptive_chunking": args.use_adaptive_chunking,
         "chunk_loss_weight": args.chunk_loss_weight,
+        "tds_weights_csv": args.tds_weights_csv,
     }
     
     if use_wandb:
@@ -373,6 +379,8 @@ def main(args):
     processor = SmolVLMVLAProcessor.from_pretrained(args.smolvlm_model_path)
 
     # Create SmolVLM dataloader (384x384 images)
+    if args.tds_weights_csv:
+        logger.info(f"Transition-Density Sampling ENABLED -> {args.tds_weights_csv}")
     train_dataloader = create_smolvlm_dataloader(
         batch_size=args.batch_size,
         metas_path=args.train_metas_path,
@@ -381,6 +389,7 @@ def main(args):
         training=True,
         num_workers=args.num_workers,
         image_size=args.image_size,
+        tds_weights_csv=args.tds_weights_csv,
     )
 
     # Optimizer

@@ -64,6 +64,7 @@ NUM_HEADS=12
 USE_ADALN=false          # DiT-style conditioning
 USE_ADAPTIVE_CHUNKING=${USE_ADAPTIVE_CHUNKING:-false}  # change-rate-weighted loss + boundary head
 CHUNK_LOSS_WEIGHT=${CHUNK_LOSS_WEIGHT:-0.1}            # weight of boundary auxiliary loss
+TDS_WEIGHTS_CSV=${TDS_WEIGHTS_CSV:-""}                 # task_difficulty.csv -> enables TDS sampling
 
 # =============================================================================
 # Step 1: Create training metadata (if not exists)
@@ -120,6 +121,12 @@ fi
 if [ "${USE_ADAPTIVE_CHUNKING}" = true ]; then
     ARGS="${ARGS} --use_adaptive_chunking --chunk_loss_weight ${CHUNK_LOSS_WEIGHT}"
     echo "Adaptive action chunking ENABLED (chunk_loss_weight=${CHUNK_LOSS_WEIGHT})"
+fi
+
+# Add Transition-Density Sampling if a weights csv is given
+if [ -n "${TDS_WEIGHTS_CSV}" ]; then
+    ARGS="${ARGS} --tds_weights_csv ${TDS_WEIGHTS_CSV}"
+    echo "Transition-Density Sampling ENABLED (${TDS_WEIGHTS_CSV})"
 fi
 
 # Add resume checkpoint if specified

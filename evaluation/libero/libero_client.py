@@ -206,6 +206,7 @@ def eval_libero(
     video_out_path: str = "data/libero/videos",
     save_video: bool = True,
     task_id: int = None,
+    per_task_csv: str = None,
 ) -> float:
     """
     Run LIBERO evaluation across all tasks in a suite.
@@ -224,7 +225,8 @@ def eval_libero(
     print(f"   Max steps: {max_steps}")
     
     total_episodes, total_successes = 0, 0
-    
+    per_task_rows = []
+
     task_ids = [task_id] if task_id is not None else range(num_tasks - 1, -1, -1)
     for task_id in tqdm(task_ids, desc="Tasks"):
         task = task_suite.get_task(task_id)
@@ -304,10 +306,24 @@ def eval_libero(
 
         env.close()
         print(f"   Task {task_id}: {task_successes}/{num_trials} ({task_successes/num_trials*100:.1f}%)")
-    
+        # "<task.name>_demo" matches the task_name keys of
+        # transition_density_stats.py (hdf5 file stems), so the csv can be
+        # passed straight to its --sr_csv for the TDS hypothesis test
+        per_task_rows.append((f"{task.name}_demo", task_successes / num_trials * 100.0))
+
     success_rate = total_successes / max(total_episodes, 1)
     print(f"\nTotal success rate: {total_successes}/{total_episodes} ({success_rate*100:.1f}%)")
-    
+
+    if per_task_csv:
+        import csv
+        write_header = not os.path.exists(per_task_csv)
+        with open(per_task_csv, "a", newline="") as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow(["task_name", "sr"])
+            writer.writerows(per_task_rows)
+        print(f"Per-task SR appended to {per_task_csv}")
+
     return success_rate
 
 
@@ -332,6 +348,11 @@ def main():
     parser.add_argument("--no_video", action="store_true", help="Disable video recording for faster evaluation")
     parser.add_argument("--task_id", type=int, default=None,
                         help="If set, only evaluate this task index (0-based). Omit to run all tasks.")
+    parser.add_argument("--per_task_csv", type=str, default=None,
+                        help="Append per-task SR rows (task_name, sr) to this csv; "
+                             "format matches transition_density_stats.py --sr_csv. "
+                             "Use one csv per suite when running suites in parallel, "
+                             "then concatenate.")
 
     args = parser.parse_args()
 
@@ -372,6 +393,7 @@ def main():
         video_out_path=str(video_path),
         save_video=not args.no_video,
         task_id=args.task_id,
+        per_task_csv=args.per_task_csv,
     )
 
 

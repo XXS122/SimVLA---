@@ -5,3 +5,9 @@ flash-attn>=2.5.0
 # Experiment tracking & logging
 wandb
 tensorboard
+
+# Data analysis (transition_density_stats.py / TDS experiment 0)
+h5py
+pandas
+scipy
+matplotlib
