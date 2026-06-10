@@ -101,12 +101,16 @@ def analyze_task_hdf5(path: str) -> dict:
         demos = list(f["data"].keys())
         for demo in demos:
             actions = f["data"][demo]["actions"][:]    # (T, d)
+            if len(actions) < 2:   # degenerate demo: no diff defined
+                continue
             c = per_dim_normalized_change_rate(actions)
             events.append(count_gripper_events(actions))
             plateaus.append(plateau_ratio(c))
             lengths.append(len(actions))
+    if not events:
+        raise ValueError(f"{path}: no usable demos (all shorter than 2 steps)")
     return {
-        "n_demos": len(demos),
+        "n_demos": len(events),
         "E_events": float(np.mean(events)),      # component 1: gripper events
         "P_plateau": float(np.mean(plateaus)),   # component 2: plateau ratio
         "L_length": float(np.mean(lengths)),     # component 3: mean length

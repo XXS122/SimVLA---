@@ -41,6 +41,10 @@ OUTPUT_DIR="./eval_simvla_${PORT}"
 rm -rf "$OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"
 
+# Per-task SR csvs (one per suite to avoid concurrent writes; libero_client.py
+# appends, so clear leftovers from previous runs with the same prefix)
+rm -f "${OUTPUT_PREFIX}"_per_task_*.csv "${OUTPUT_PREFIX}_sr_all.csv"
+
 echo "Starting LIBERO evaluation..."
 echo "   Server Port: $PORT"
 echo "   Num Trials: $NUM_TRIALS"
@@ -59,6 +63,7 @@ CUDA_VISIBLE_DEVICES=$GPU_SPATIAL python -u libero_client.py \
     --client_type websocket \
     --task_suite libero_spatial \
     --num_trials $NUM_TRIALS \
+    --per_task_csv "${OUTPUT_PREFIX}_per_task_spatial.csv" \
     --video_out "$OUTPUT_DIR" > "${OUTPUT_PREFIX}_spatial.txt" 2>&1 &
 PID_SPATIAL=$!
 echo "   [PID $PID_SPATIAL] libero_spatial (GPU $GPU_SPATIAL) -> ${OUTPUT_PREFIX}_spatial.txt"
@@ -69,6 +74,7 @@ CUDA_VISIBLE_DEVICES=$GPU_OBJECT python -u libero_client.py \
     --client_type websocket \
     --task_suite libero_object \
     --num_trials $NUM_TRIALS \
+    --per_task_csv "${OUTPUT_PREFIX}_per_task_object.csv" \
     --video_out "$OUTPUT_DIR" > "${OUTPUT_PREFIX}_object.txt" 2>&1 &
 PID_OBJECT=$!
 echo "   [PID $PID_OBJECT] libero_object (GPU $GPU_OBJECT) -> ${OUTPUT_PREFIX}_object.txt"
@@ -79,6 +85,7 @@ CUDA_VISIBLE_DEVICES=$GPU_GOAL python -u libero_client.py \
     --client_type websocket \
     --task_suite libero_goal \
     --num_trials $NUM_TRIALS \
+    --per_task_csv "${OUTPUT_PREFIX}_per_task_goal.csv" \
     --video_out "$OUTPUT_DIR" > "${OUTPUT_PREFIX}_goal.txt" 2>&1 &
 PID_GOAL=$!
 echo "   [PID $PID_GOAL] libero_goal (GPU $GPU_GOAL) -> ${OUTPUT_PREFIX}_goal.txt"
@@ -89,6 +96,7 @@ CUDA_VISIBLE_DEVICES=$GPU_10 python -u libero_client.py \
     --client_type websocket \
     --task_suite libero_10 \
     --num_trials $NUM_TRIALS \
+    --per_task_csv "${OUTPUT_PREFIX}_per_task_10.csv" \
     --video_out "$OUTPUT_DIR" > "${OUTPUT_PREFIX}_10.txt" 2>&1 &
 PID_10=$!
 echo "   [PID $PID_10] libero_10 (GPU $GPU_10) -> ${OUTPUT_PREFIX}_10.txt"
@@ -114,3 +122,12 @@ for suite in spatial object goal 10; do
     fi
 done
 echo "=========================================="
+
+# Merge per-suite SR csvs into one file for the TDS hypothesis test
+# (transition_density_stats.py --sr_csv); keep only the first header.
+# Name must NOT match the _per_task_*.csv glob, or a rerun would merge it
+# into itself.
+MERGED="${OUTPUT_PREFIX}_sr_all.csv"
+awk 'FNR==1 && NR!=1 {next} {print}' "${OUTPUT_PREFIX}"_per_task_*.csv > "$MERGED" 2>/dev/null \
+    && echo "Per-task SR merged into: $MERGED" \
+    || echo "(no per-task csvs found to merge)"
