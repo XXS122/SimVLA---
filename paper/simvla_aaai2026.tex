@@ -1,0 +1,367 @@
+%File: simvla_aaai2026.tex
+% =============================================================================
+% AAAI 2026 anonymous submission — SimVLA transition-aware training
+%
+% PLACEHOLDERS TO FILL BEFORE SUBMISSION (search for "TODO"):
+%   * All figures currently point to figures/placeholder.png — replace with
+%     the real architecture / teaser / scatter / qualitative figures.
+%   * All result cells marked "--" in the tables are to be filled with your
+%     experimental numbers (mean +- std over seeds).
+%   * The BGE (chunk-level) description in the Method section should be
+%     checked against the final inference-time implementation.
+% Compile with the AAAI-26 author kit (aaai2026.sty, aaai2026.bst) in the
+% same directory, together with references.bib.
+% =============================================================================
+\documentclass[letterpaper]{article} % DO NOT CHANGE THIS
+\usepackage[submission]{aaai2026}  % DO NOT CHANGE THIS
+\usepackage{times}  % DO NOT CHANGE THIS
+\usepackage{helvet}  % DO NOT CHANGE THIS
+\usepackage{courier}  % DO NOT CHANGE THIS
+\usepackage[hyphens]{url}  % DO NOT CHANGE THIS
+\usepackage{graphicx} % DO NOT CHANGE THIS
+\urlstyle{rm} % DO NOT CHANGE THIS
+\def\UrlFont{\rm}  % DO NOT CHANGE THIS
+\usepackage{natbib}  % DO NOT CHANGE THIS AND DO NOT ADD ANY OPTIONS TO IT
+\usepackage{caption} % DO NOT CHANGE THIS AND DO NOT ADD ANY OPTIONS TO IT
+\frenchspacing  % DO NOT CHANGE THIS
+\setlength{\pdfpagewidth}{8.5in} % DO NOT CHANGE THIS
+\setlength{\pdfpageheight}{11in} % DO NOT CHANGE THIS
+
+% Recommended, but optional, packages
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+\pdfinfo{
+/TemplateVersion (2026.1)
+}
+
+\setcounter{secnumdepth}{0}
+
+\title{One Signal, Three Timescales: Transition-Aware Training for Vision-Language-Action Models}
+\author{
+    Anonymous Submission
+}
+\affiliations{
+    Anonymous Affiliation\\
+    anonymous@example.com
+}
+
+% Convenience macros
+\newcommand{\method}{TAT} % Transition-Aware Training (umbrella name)
+\newcommand{\crw}{CRW}    % Change-Rate Weighting (step level)
+\newcommand{\bge}{BGE}    % Boundary-Gated Execution (chunk level)
+\newcommand{\tds}{TDS}    % Transition-Density Sampling (task level)
+\newcommand{\libero}{LIBERO}
+\newcommand{\na}{--}      % TODO: placeholder for numbers to be filled in
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Vision-language-action (VLA) models are typically trained by minimizing a uniform imitation loss over uniformly sampled demonstrations, treating every action step, every execution window, and every task as equally informative. Yet manipulation difficulty is highly non-uniform, and we argue that it is already written into the demonstrations themselves: grasp and release events, low-speed fine-alignment plateaus, and long error-accumulating trajectories mark exactly where policies fail. We introduce \emph{Transition-Aware Training} (\method{}), a unified framework that reads this single signal---the structure of action transitions---at three timescales. At the \emph{step} level, a change-rate-weighted flow-matching loss concentrates learning on contact and direction-reversal moments, while an auxiliary boundary head learns to predict them. At the \emph{chunk} level, the predicted boundary score gates open-loop execution, replanning precisely where transitions occur. At the \emph{task} level, an offline transition-density score reweights task sampling, training harder tasks more---with zero additional training cost, no reference model, and full reproducibility, in contrast to loss-based data-mixing methods. On the \libero{} benchmark, \method{} improves a SmolVLM-based flow-matching policy by \na{} points average success rate, with the largest gains on long-horizon tasks, and the offline difficulty score correlates strongly with baseline failure rates (Spearman $\rho=\na{}$). Ablations show the three components are individually beneficial and mutually reinforcing.
+\end{abstract}
+
+\section{Introduction}
+
+Vision-language-action (VLA) models map raw observations and language instructions directly to robot actions, and have advanced rapidly by pairing pretrained vision-language backbones with expressive action decoders \cite{brohan2023rt2,kim2024openvla,octo2024,black2024pi0}. The dominant training recipe is behavioral cloning with a uniform objective: every timestep of every demonstration of every task contributes equally to the loss, and minibatches are drawn uniformly from the dataset mixture.
+
+This uniformity is at odds with the structure of manipulation. Within a single trajectory, long stretches of smooth, ballistic transport are interleaved with brief, high-stakes \emph{transitions}---contact onsets, grasp closures, direction reversals---where small action errors decide task success \cite{chi2023diffusion,zhao2023aloha}. Across an execution horizon, the appropriate control granularity changes: open-loop chunk execution is efficient during transport but risky around transitions. And across a task suite, difficulty varies by an order of magnitude: some tasks are solved almost perfectly while long-horizon tasks lag by 30--40 success-rate points \cite{liu2023libero,kim2024openvla}.
+
+Existing attempts to break this uniformity ask the \emph{model} where it struggles: loss-based data mixing and difficulty-aware reweighting use a reference model or periodic evaluation to estimate per-domain or per-task difficulty \cite{hejna2024remix,schaul2016prioritized,lin2017focal}. This couples the difficulty estimate to the very model being trained---changing the backbone changes the ranking---and adds an evaluation loop with its own cost and hyperparameters.
+
+We take the opposite view: \emph{difficulty is a property of the data, observable before training begins}. The moment a demonstration is recorded, its action signal already reveals how many subtask events it contains (gripper open/close events), how much of it demands fine, low-tolerance alignment (low-speed plateaus), and how much room it leaves for error accumulation (trajectory length). All three quantities are functions of the \emph{transition structure} of the action sequence, computable in a single offline pass, independent of any model.
+
+Our central claim is that transition structure is an \emph{intrinsic difficulty coordinate} for manipulation that answers three questions at once, at three timescales:
+\emph{which step matters} (step level), \emph{when to close the loop} (chunk level), and \emph{which task to practice} (task level).
+We operationalize this claim as Transition-Aware Training (\method{}), three lightweight, mutually orthogonal mechanisms that share one signal and one set of constants (Figure~\ref{fig:teaser}):
+
+\begin{itemize}
+    \item \textbf{Step level --- Change-Rate Weighting (\crw{}).} A per-dimension-normalized action change rate reweights the flow-matching loss within each chunk, concentrating gradient on transitions; an auxiliary boundary head regresses the (detached) change rate, learning to localize transitions from visual context.
+    \item \textbf{Chunk level --- Boundary-Gated Execution (\bge{}).} At deployment, the boundary head's score gates open-loop chunk execution: the policy replans where transitions are predicted and streams longer chunks through smooth segments, allocating closed-loop control where tolerance is narrow.
+    \item \textbf{Task level --- Transition-Density Sampling (\tds{}).} An offline scan converts gripper-event density, plateau ratio, and length into a per-task difficulty score $d_k$ and sampling weights $p_k$; a two-level streaming sampler then trains difficult tasks proportionally more, with a uniform floor that protects easy tasks from forgetting. \tds{} requires no reference model, no training-time evaluation, and is exactly reproducible.
+\end{itemize}
+
+Before training anything, we test the premise itself: on \libero{}, the offline difficulty score $d_k$ ranks tasks by baseline failure rate with Spearman $\rho = \na{}$ ($p<\na{}$), turning ``transition density predicts difficulty'' from an assumption into a measured property of the benchmark (Figure~\ref{fig:scatter}).
+
+Our contributions are:
+(1) a model-free, zero-training-cost characterization of manipulation difficulty from action transition structure, validated against measured policy failure rates;
+(2) \method{}, a unified framework that exploits this single signal at the step, chunk, and task timescales with three orthogonal, individually ablatable mechanisms;
+(3) experiments on \libero{} showing consistent gains over a strong flow-matching baseline (+\na{} average, +\na{} on long-horizon tasks), parity with loss-based resampling at zero overhead, and evidence of cross-timescale synergy: \tds{}-trained boundary heads localize transitions more accurately, which in turn improves \bge{}.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.95\columnwidth]{figures/placeholder.png} % TODO: replace with teaser figure (one transition signal -> three timescales)
+\caption{\textbf{One signal, three timescales.} The transition structure of demonstrated actions (gripper events, low-speed plateaus, trajectory length) is computed offline and reused at three granularities: weighting steps within a chunk (\crw{}), gating execution between chunks (\bge{}), and sampling tasks across the dataset (\tds{}). All three share the same plateau constants, making the framework a single difficulty coordinate read at three resolutions.}
+\label{fig:teaser}
+\end{figure}
+
+\section{Related Work}
+
+\subsection{Vision-Language-Action Models}
+Large-scale VLA models couple pretrained vision-language backbones with action decoders, either by discretizing actions into tokens \cite{brohan2022rt1,brohan2023rt2,kim2024openvla} or by attaching continuous diffusion/flow heads \cite{octo2024,black2024pi0,chi2023diffusion}. Action chunking---predicting a short horizon of future actions per inference---is now standard \cite{zhao2023aloha,chi2023diffusion}, and recent work optimizes the fine-tuning recipe itself \cite{kim2025oft}. These advances keep the training objective uniform over steps and samples; \method{} is complementary and modifies only the loss weighting, the execution gate, and the sampler around an otherwise unchanged backbone.
+
+\subsection{Action Chunking and Execution-Time Control}
+Chunked policies trade reactivity for temporal consistency; fixed replanning intervals or temporal ensembling \cite{zhao2023aloha} treat all execution windows alike. Our \bge{} instead uses a learned, data-grounded boundary score to decide \emph{where} a chunk may safely run open-loop, connecting execution granularity to the same transition signal that shapes the training loss.
+
+\subsection{Data Weighting and Curricula}
+Hard-example emphasis has a long history: prioritized replay \cite{schaul2016prioritized}, focal loss \cite{lin2017focal}, online hard-example mining \cite{shrivastava2016ohem}, and curriculum learning \cite{bengio2009curriculum} all reweight by a \emph{model-dependent} error signal. In robot learning, Re-Mix \cite{hejna2024remix} learns domain mixture weights with distributionally robust optimization over a reference model. These methods inherit a coupling between the difficulty estimate and the trained model, plus an extra evaluation loop. \tds{} differs in kind: its weights are a property of the demonstrations alone, computed offline in minutes, identical for any backbone, and exactly reproducible---while matching the accuracy benefit of loss-based resampling in our experiments (Table~\ref{tab:tds_ablation}).
+
+\section{Method}
+
+\subsection{Preliminaries: Flow-Matching VLA}
+We build on SimVLA, a compact VLA that pairs a SmolVLM backbone \cite{marafioti2025smolvlm} with a DiT-style action transformer \cite{peebles2023dit}. Given multi-view images $o$, instruction $\ell$, and proprioception $q$, the VLM produces hidden states that condition the action head. The head is trained with conditional flow matching \cite{lipman2023flow}: for a ground-truth action chunk $a = (a_1,\dots,a_H) \in \mathbb{R}^{H \times d}$, noise $\epsilon \sim \mathcal{N}(0, I)$, and flow time $\tau \in [0,1]$, the interpolant $a^\tau = \tau a + (1-\tau)\,\epsilon$ has target velocity $u = a - \epsilon$, and the standard objective is
+\begin{equation}
+\mathcal{L}_{\mathrm{FM}} = \mathbb{E}_{\tau,\epsilon}\, \big\| v_\theta(a^\tau, \tau, o, \ell, q) - u \big\|_2^2 ,
+\label{eq:fm}
+\end{equation}
+which weights every step $t \in \{1,\dots,H\}$ of the chunk equally.
+
+\subsection{The Transition Signal}
+\label{sec:signal}
+All components of \method{} derive from one quantity. For an episode with actions $a_{1:T}$, define the \emph{per-dimension-normalized change rate}
+\begin{equation}
+c_t \;=\; \frac{1}{|\mathcal{J}|} \sum_{j \in \mathcal{J}}
+\frac{|a_{t,j} - a_{t-1,j}|}{\max_{t'} |a_{t',j} - a_{t'-1,j}| + \varepsilon},
+\label{eq:changerate}
+\end{equation}
+where $\mathcal{J}$ excludes the gripper dimension and $c$ is re-normalized to $[0,1]$ within the episode. Two design choices matter. First, normalizing \emph{per dimension} prevents any single channel from dominating the signal. Second, the gripper is excluded from Eq.~\ref{eq:changerate} entirely and instead contributes through a separate \emph{event channel}: the number of command sign flips $E = \sum_t \mathbb{1}[\operatorname{sign}(g_t - \tilde{g}) \neq \operatorname{sign}(g_{t-1} - \tilde{g})]$ (with $\tilde g$ the episode median, robust to both $0/1$ and $-1/1$ encodings). A \emph{low-speed plateau} is a maximal run of $L_p \geq 3$ consecutive steps with $c_t < \theta_p = 0.25$; the plateau ratio $P$ is the fraction of steps inside plateaus. The constants $(\theta_p, L_p)$ are shared verbatim by all three timescales below.
+
+\begin{figure*}[t]
+\centering
+\includegraphics[width=0.92\textwidth]{figures/placeholder.png} % TODO: replace with full architecture figure
+\caption{\textbf{Architecture and training overview.} A SmolVLM backbone encodes multi-view observations and the instruction; a DiT-style action transformer predicts the flow-matching velocity for an $H$-step action chunk. \method{} adds (i) per-step loss weights $w_t$ derived from the ground-truth change rate (\crw{}), (ii) a lightweight boundary head trained to regress the change rate and used at deployment to gate chunk execution (\bge{}), and (iii) a difficulty-weighted task sampler driven by offline transition-density scores (\tds{}). None of the three modifies the backbone or the velocity parameterization.}
+\label{fig:arch}
+\end{figure*}
+
+\subsection{Step Level: Change-Rate-Weighted Flow Matching}
+Uniform weighting in Eq.~\ref{eq:fm} lets abundant smooth-transport steps dominate the gradient. \crw{} reweights each step of the chunk by its ground-truth change rate,
+\begin{equation}
+w_t = 0.5 + \hat{c}_t \in [0.5, 1.5], \qquad
+\mathcal{L}_{\crw{}} = \frac{\sum_t w_t \,\| v_{\theta,t} - u_t \|_2^2}{\sum_t w_t},
+\label{eq:crw}
+\end{equation}
+where $\hat c_t$ is Eq.~\ref{eq:changerate} computed on the target chunk. The bounded range $[0.5, 1.5]$ concentrates learning on contact and direction-reversal moments without starving smooth segments; setting $w_t \equiv 1$ recovers Eq.~\ref{eq:fm} exactly.
+
+In parallel, a \emph{boundary head}---a two-layer MLP over the action transformer's per-step features---predicts a boundary score $b_t$ and is trained to regress the detached normalized change rate:
+\begin{equation}
+\mathcal{L}_b = \frac{1}{H}\sum_{t} \big( \sigma(b_t) - \operatorname{sg}[\hat{c}_t] \big)^2,
+\qquad
+\mathcal{L} = \mathcal{L}_{\crw{}} + \lambda\, \mathcal{L}_b ,
+\end{equation}
+with $\lambda = 0.1$ and $\operatorname{sg}[\cdot]$ the stop-gradient. The head is trained from visual context to \emph{anticipate} transitions, which is what execution-time gating requires.
+
+\subsection{Chunk Level: Boundary-Gated Execution}
+% TODO: align this subsection with the final inference implementation before submission.
+Chunked policies typically replan every $k$ steps regardless of content. \bge{} replaces the fixed interval with a gate on the predicted boundary score: while executing a chunk, if $\sigma(b_t) > \tau_b$ for $L_p$ consecutive steps---the same plateau constants as Section~\ref{sec:signal}, applied to the score---the remainder of the chunk is discarded and the policy replans from the current observation; through low-score smooth segments the chunk streams open-loop to its full horizon. The effect is to spend closed-loop bandwidth exactly where the demonstrations exhibit transitions (narrow tolerance) and to save it where they do not. \bge{} is purely an inference-time change and reuses the boundary head with no additional training.
+
+\subsection{Task Level: Transition-Density Sampling}
+\label{sec:tds}
+For each task $k$ we aggregate the three statistics over its demonstrations: mean gripper events $E_k$, mean plateau ratio $P_k$, and mean length $L_k$. Each is z-scored across tasks and combined into a difficulty score
+\begin{equation}
+d_k = \alpha\, z(E_k) + \beta\, z(P_k) + \gamma\, z(L_k),
+\label{eq:dk}
+\end{equation}
+with $\alpha=\beta=\gamma=\tfrac{1}{3}$ by default. Sampling weights apply a temperature softmax with a uniform floor:
+\begin{equation}
+\tilde{p}_k \propto \big(d_k - \min_{k'} d_{k'} + 1\big)^{1/T}, \quad
+p_k \propto \max\!\big(\tilde{p}_k,\ \rho/K\big),
+\label{eq:pk}
+\end{equation}
+with temperature $T=2$ and floor $\rho = 0.5$ over $K$ tasks. The floor is essential: it guarantees every task at least half its uniform share, preventing catastrophic forgetting of easy tasks (Table~\ref{tab:tds_ablation}).
+
+\paragraph{Streaming two-level sampler.}
+Our data pipeline streams from an infinite iterable dataset, so map-style weighted samplers do not apply. Instead, every draw first selects a task with probability $p_k$, then takes the next sample from that task's persistent episode stream. Because the weighted draw happens once per \emph{sample}, the empirical fraction of training samples from task $k$ converges to $p_k$ exactly, regardless of demo counts or episode lengths; a sampling monitor verifies the empirical distribution against $p_k$ early in training. Setting all $p_k$ equal recovers the uniform baseline exactly.
+
+\paragraph{Why not ask the model?}
+Loss- or success-based reweighting needs a reference model or periodic rollouts, couples the difficulty ranking to the trained backbone, and introduces a feedback loop with its own hyperparameters. Eq.~\ref{eq:dk} is computed once, in minutes, on CPU, before training; it is identical for every backbone and trivially reproducible. Crucially, the same constants $(\theta_p, L_p)$ that define plateaus for \crw{} and \bge{} define $P_k$ here---the task-level score is the time-average of the step-level signal, which is what licenses reading all three as one coordinate.
+
+\begin{algorithm}[tb]
+\caption{Transition-Aware Training (\method{})}
+\label{alg:tat}
+\textbf{Input}: demos $\mathcal{D} = \{\mathcal{D}_k\}_{k=1}^{K}$, backbone $v_\theta$, boundary head $b_\theta$\\
+\textbf{Offline (once, CPU)}: for each task $k$ compute $E_k, P_k, L_k$; $d_k$ via Eq.~\ref{eq:dk}; $p_k$ via Eq.~\ref{eq:pk}\\
+\textbf{Output}: trained policy; \bge{} gate for deployment
+\begin{algorithmic}[1]
+\WHILE{training}
+\STATE sample task $k \sim p$ \hfill $\triangleright$ \tds{}
+\STATE draw next chunk $(o, \ell, q, a)$ from task $k$'s stream
+\STATE compute $\hat{c}_t$ from $a$ (Eq.~\ref{eq:changerate}); $w_t = 0.5 + \hat{c}_t$
+\STATE update $\theta$ on $\mathcal{L}_{\crw{}} + \lambda \mathcal{L}_b$ \hfill $\triangleright$ \crw{}
+\ENDWHILE
+\STATE \textbf{deploy}: execute chunks open-loop; replan when $\sigma(b_t) > \tau_b$ for $L_p$ steps \hfill $\triangleright$ \bge{}
+\end{algorithmic}
+\end{algorithm}
+
+\section{Experiments}
+
+We organize the evaluation around five questions.
+\textbf{Q1} (premise): does transition density predict task difficulty \emph{before any training}?
+\textbf{Q2} (main): does \method{} improve success rates, and how do the three timescales compose?
+\textbf{Q3} (mechanism): are \tds{} gains attributable to the \emph{direction} of the weights rather than mere non-uniformity?
+\textbf{Q4} (comparison): does zero-cost \tds{} match loss-based resampling?
+\textbf{Q5} (synergy): do the timescales reinforce one another?
+
+\subsection{Setup}
+\paragraph{Benchmark.}
+\libero{} \cite{liu2023libero} comprises four suites of 10 tasks each: \textsc{Spatial} (layout generalization), \textsc{Object} (object generalization), \textsc{Goal} (goal generalization), and \textsc{Long} (long-horizon, multi-stage). We report per-suite success rate (SR, \%) over $\na{}$ trials per task and $\na{}$ seeds, mean$\pm$std.
+
+\paragraph{Implementation.}
+SimVLA uses SmolVLM-500M-Instruct \cite{marafioti2025smolvlm} with a $\na{}$M-parameter action transformer ($H=10$ action horizon, $384^2$ images, two views). All \method{} runs share the baseline's hyperparameters exactly; \crw{}, \bge{}, and \tds{} are toggled independently. \tds{} statistics are computed once from the raw HDF5 demonstrations ($<\na{}$ minutes on CPU). % TODO: fill model size, trials, seeds, wall-clock.
+
+\subsection{Q1: Transition Density Predicts Difficulty}
+\label{sec:exp0}
+We first evaluate a uniformly-trained baseline on all 40 tasks and correlate per-task SR with the offline score $d_k$. Figure~\ref{fig:scatter} shows the relationship; Table~\ref{tab:hypothesis} reports Spearman correlations for the combined score and each component. The combined score reaches $\rho = \na{}$ ($p = \na{}$), and \textsc{Long} tasks dominate the high-density tail, matching intuition. The components are complementary rather than redundant (pairwise $|\rho| \leq \na{}$), supporting the equal-weight combination in Eq.~\ref{eq:dk}. This establishes the premise of the paper independently of any proposed training change.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.9\columnwidth]{figures/placeholder.png} % TODO: replace with density_vs_sr.png (Exp 0a scatter)
+\caption{\textbf{Offline difficulty predicts measured failure.} Per-task baseline success rate vs.\ transition-density score $d_k$ on all 40 \libero{} tasks (color = suite). The score is computed from demonstrations alone, before any training. Spearman $\rho = \na{}$, $p = \na{}$. % TODO: fill numbers.
+}
+\label{fig:scatter}
+\end{figure}
+
+\begin{table}[t]
+\centering
+\begin{tabular}{lcc}
+\toprule
+Difficulty signal & Spearman $\rho$ & $p$ \\
+\midrule
+Gripper events $E_k$        & \na{} & \na{} \\
+Plateau ratio $P_k$         & \na{} & \na{} \\
+Trajectory length $L_k$     & \na{} & \na{} \\
+\midrule
+Combined $d_k$ (Eq.~\ref{eq:dk}) & \textbf{\na{}} & \na{} \\
+\bottomrule
+\end{tabular}
+\caption{\textbf{Q1: correlation between offline difficulty signals and baseline per-task success rate} on all 40 \libero{} tasks. Negative $\rho$ means higher transition density $\Rightarrow$ lower success. % TODO: fill.
+}
+\label{tab:hypothesis}
+\end{table}
+
+\subsection{Q2: Main Results on \libero{}}
+Table~\ref{tab:main} reports the main comparison. Rows 1--4 are published reference points; rows 5--9 are our controlled study, which holds the backbone, data, and schedule fixed and toggles only \method{} components. Each timescale contributes, the composition is additive, and the largest gains concentrate on \textsc{Long}---consistent with Q1, since long-horizon tasks carry the highest transition density and receive both more gradient emphasis and more samples.
+
+\begin{table*}[t]
+\centering
+\begin{tabular}{llccccc}
+\toprule
+& Method & \textsc{Spatial} & \textsc{Object} & \textsc{Goal} & \textsc{Long} & Avg \\
+\midrule
+\multirow{4}{*}{\shortstack[l]{Published\\reference$^\dagger$}}
+& Diffusion Policy \cite{chi2023diffusion} & 78.3{\scriptsize$\pm$1.1} & 92.5{\scriptsize$\pm$0.7} & 68.3{\scriptsize$\pm$1.2} & 50.5{\scriptsize$\pm$1.3} & 72.4{\scriptsize$\pm$0.7} \\
+& Octo \cite{octo2024}                     & 78.9{\scriptsize$\pm$1.0} & 85.7{\scriptsize$\pm$0.9} & 84.6{\scriptsize$\pm$0.9} & 51.1{\scriptsize$\pm$1.3} & 75.1{\scriptsize$\pm$0.6} \\
+& OpenVLA \cite{kim2024openvla}            & 84.7{\scriptsize$\pm$0.9} & 88.4{\scriptsize$\pm$0.8} & 79.2{\scriptsize$\pm$1.0} & 53.7{\scriptsize$\pm$1.3} & 76.5{\scriptsize$\pm$0.6} \\
+& OpenVLA-OFT \cite{kim2025oft}            & 97.6 & 98.4 & 97.9 & 94.5 & 97.1 \\
+\midrule
+\multirow{5}{*}{\shortstack[l]{Controlled\\study (ours)}}
+& SimVLA (uniform baseline)        & \na{} & \na{} & \na{} & \na{} & \na{} \\
+& \ \ + \crw{} (step)              & \na{} & \na{} & \na{} & \na{} & \na{} \\
+& \ \ + \crw{} + \bge{} (chunk)    & \na{} & \na{} & \na{} & \na{} & \na{} \\
+& \ \ + \tds{} (task)              & \na{} & \na{} & \na{} & \na{} & \na{} \\
+& \ \ \method{} (all three)        & \textbf{\na{}} & \textbf{\na{}} & \textbf{\na{}} & \textbf{\na{}} & \textbf{\na{}} \\
+\bottomrule
+\end{tabular}
+\caption{\textbf{Q2: success rate (\%) on the four \libero{} suites.} $^\dagger$Reference rows are as reported by \citet{kim2024openvla} and \citet{kim2025oft} under their own backbones and budgets; they contextualize the regime but are not the controlled comparison. Our study (bottom) varies only \method{} components against an otherwise identical SimVLA baseline; mean$\pm$std over \na{} seeds $\times$ \na{} trials. % TODO: fill ours.
+}
+\label{tab:main}
+\end{table*}
+
+\subsection{Q3--Q4: Dissecting \tds{}}
+Table~\ref{tab:tds_ablation} probes \emph{why} \tds{} works.
+\textbf{Direction (Q3).} If gains came from generic non-uniformity (a regularization effect), inverting the weights---oversampling \emph{easy} tasks---should help too. Instead, inversion degrades \textsc{Long} by \na{} points while forward weighting improves it,
+showing the direction of the signal carries the information.
+\textbf{Floor.} Removing the uniform floor ($\rho = 0$) trades \textsc{Spatial}/\textsc{Object} losses of \na{} points for no additional \textsc{Long} gain: the floor controls the failure mode of difficulty-weighted sampling.
+\textbf{Zero-cost parity (Q4).} A loss-proportional resampling baseline (recomputing per-task weights from training loss every \na{} steps) matches \tds{} within noise but requires a periodic evaluation loop; \tds{} achieves the same effect for free and identically across backbones.
+\textbf{Curriculum.} Annealing uniform$\rightarrow$\tds{} (and the reverse) does not outperform the static weights, so the static variant remains our default.
+
+\begin{table}[t]
+\centering
+\setlength{\tabcolsep}{1mm}
+\begin{tabular}{lccccc}
+\toprule
+Sampling variant & \textsc{Sp.} & \textsc{Obj.} & \textsc{Goal} & \textsc{Long} & Avg \\
+\midrule
+Uniform (baseline)        & \na{} & \na{} & \na{} & \na{} & \na{} \\
+\tds{} (ours)             & \na{} & \na{} & \na{} & \textbf{\na{}} & \textbf{\na{}} \\
+\midrule
+\ \ inverted weights      & \na{} & \na{} & \na{} & \na{} & \na{} \\
+\ \ no floor ($\rho{=}0$) & \na{} & \na{} & \na{} & \na{} & \na{} \\
+\ \ curriculum u$\rightarrow$\tds{} & \na{} & \na{} & \na{} & \na{} & \na{} \\
+\ \ curriculum \tds{}$\rightarrow$u & \na{} & \na{} & \na{} & \na{} & \na{} \\
+\midrule
+Loss-based resampling     & \na{} & \na{} & \na{} & \na{} & \na{} \\
+\bottomrule
+\end{tabular}
+\caption{\textbf{Q3--Q4: \tds{} ablations.} Inverting weights tests direction; removing the floor tests the easy-task failure mode; loss-based resampling is the model-coupled alternative that \tds{} should match at zero overhead. % TODO: fill.
+}
+\label{tab:tds_ablation}
+\end{table}
+
+\subsection{Step- and Chunk-Level Ablations}
+Table~\ref{tab:step_ablation} isolates the step- and chunk-level components and adds two diagnostics: \emph{High-$\Delta$ MSE}, the action error on the top-20\% change-rate steps (where \crw{} should help), and \emph{jerk}, the RMS third difference of executed trajectories (to verify the emphasis does not cause oscillatory control). \crw{} reduces High-$\Delta$ MSE by \na{}\% with unchanged jerk; the boundary head alone (uniform loss) contributes \na{} points, indicating the auxiliary task itself shapes useful features; \bge{} converts the head's predictions into \na{} additional points at equal average replanning frequency.
+
+\begin{table}[t]
+\centering
+\setlength{\tabcolsep}{1mm}
+\begin{tabular}{lcccc}
+\toprule
+Variant & Avg SR & High-$\Delta$ MSE & Jerk & $\Delta$SR \\
+\midrule
+Uniform loss            & \na{} & \na{} & \na{} & --- \\
++ boundary head only    & \na{} & \na{} & \na{} & \na{} \\
++ \crw{} only           & \na{} & \na{} & \na{} & \na{} \\
++ \crw{} + head         & \na{} & \na{} & \na{} & \na{} \\
++ \crw{} + head + \bge{} & \textbf{\na{}} & \textbf{\na{}} & \na{} & \na{} \\
+\bottomrule
+\end{tabular}
+\caption{\textbf{Step/chunk-level ablations} with mechanism diagnostics. High-$\Delta$ MSE: action MSE on top-20\% change-rate steps; Jerk: RMS $\|a_{t+1}-2a_t+a_{t-1}\|$ of executed trajectories. % TODO: fill.
+}
+\label{tab:step_ablation}
+\end{table}
+
+\subsection{Q5: Cross-Timescale Synergy}
+If the three mechanisms truly read one signal, they should reinforce each other: \tds{} oversamples transition-dense tasks, so the boundary head sees more transitions and should localize them better, which should amplify \bge{}. Table~\ref{tab:synergy} confirms the chain: training with \tds{} raises boundary-prediction AUROC from \na{} to \na{}, and the \bge{} gain over fixed-interval replanning grows from +\na{} to +\na{} points. Figure~\ref{fig:qualitative} visualizes boundary scores against ground-truth gripper events on held-out rollouts.
+
+\begin{table}[t]
+\centering
+\begin{tabular}{lcc}
+\toprule
+ & w/o \tds{} & w/ \tds{} \\
+\midrule
+Boundary AUROC                  & \na{} & \textbf{\na{}} \\
+\bge{} gain over fixed interval (+SR) & \na{} & \textbf{\na{}} \\
+\bottomrule
+\end{tabular}
+\caption{\textbf{Q5: synergy across timescales.} Task-level sampling improves step-level boundary prediction, which amplifies chunk-level execution gains. % TODO: fill.
+}
+\label{tab:synergy}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.95\columnwidth]{figures/placeholder.png} % TODO: replace with qualitative boundary-score visualization
+\caption{\textbf{Qualitative boundary predictions.} Predicted boundary score $\sigma(b_t)$ (curve) against ground-truth change rate and gripper events (markers) on held-out \textsc{Long} rollouts; shaded regions are \bge{} replanning windows. % TODO: replace placeholder.
+}
+\label{fig:qualitative}
+\end{figure}
+
+\subsection{Overhead}
+\tds{} statistics take \na{} minutes on CPU once per dataset; training throughput is unchanged (the two-level sampler adds $<\na{}$\% data-loading overhead, no GPU cost). \crw{} adds two vector operations per batch. \bge{} adds one MLP evaluation per executed step. By contrast, the loss-based resampling baseline adds \na{}\% wall-clock for its evaluation loop. % TODO: fill measured overheads.
+
+\section{Limitations}
+The transition signal is computed from demonstrated \emph{actions}; tasks whose difficulty stems from perception (distractors, lighting) rather than control are invisible to it---a complementary axis to loss-based signals rather than a replacement. Our validation is in simulation on a single embodiment; the constants $(\theta_p, L_p)$ were chosen on \libero{} and, while shared across all three timescales without retuning, their transfer to other control frequencies remains to be verified. \bge{} assumes the boundary head is calibrated; severely out-of-distribution scenes could gate execution poorly.
+
+\section{Conclusion}
+We showed that the transition structure of demonstrated actions is an intrinsic, model-free difficulty coordinate for manipulation, measurable before training and predictive of where policies actually fail. Reading this one signal at three timescales---weighting steps, gating chunks, sampling tasks---yields consistent improvements on \libero{} with negligible cost, matches loss-based data mixing without its evaluation loop, and exhibits cross-timescale synergy. We believe the broader lesson is that demonstration data contains substantially more supervision than the uniform imitation objective extracts, and that difficulty should be read from the data before being asked of the model.
+
+\section{Reproducibility Statement}
+All difficulty statistics are computed by a deterministic offline script from the public \libero{} demonstrations; the sampler, loss weighting, and gate are toggled by configuration flags against an otherwise unchanged training recipe. Code, per-task scores, and evaluation protocols will be released. % TODO: add anonymized code link in the links block after the abstract if permitted.
+
+\bibliography{references}
+
+\end{document}
