@@ -128,6 +128,16 @@ CUDA_VISIBLE_DEVICES=0 python libero_client.py \
   --video_out ./eval_videos
 ```
 
+**单卡串行评估（只有 1 块 GPU 时跑全部 4 个任务集）：**
+```bash
+cd evaluation/libero
+bash run_eval_seq.sh <端口> <每任务回合数> <结果前缀> <gpu> [--no_video]
+
+# 示例（产物含 baseline_exp0_sr_all.csv，可直接喂
+# transition_density_stats.py --sr_csv 做 TDS 实验 0a）：
+bash run_eval_seq.sh 8102 20 baseline_exp0 0 --no_video
+```
+
 #### 第三步 — 查看结果
 
 ```bash
