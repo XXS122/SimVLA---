@@ -54,7 +54,7 @@ WARMUP_STEPS=0
 FREEZE_STEPS=1000
 SAVE_INTERVAL=${SAVE_INTERVAL:-10000}
 LOG_INTERVAL=20
-NUM_WORKERS=4
+NUM_WORKERS=${NUM_WORKERS:-4}   # set NUM_WORKERS=0 if /dev/shm is small (Docker Bus error)
 MAX_GRAD_NORM=1.0
 
 # Model architecture (Large configuration)
