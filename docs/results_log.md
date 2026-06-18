@@ -109,24 +109,34 @@ a significant ρ=−0.32; gripper-event count is uninformative on this benchmark
 
 ## 6. TDS — training & evaluation status
 
-- exp_tds training started 2026-06-15 05:27; ~1.6 s/it (num_workers=0).
-- Checkpoints saved so far: **ckpt-20000, ckpt-40000** (continuing to 100k).
-- **TDS evaluation: not yet run.** First comparison target = tds/ckpt-40000
-  vs uniform/ckpt-40000.
+- exp_tds trained on **yyk** (`/workspace`) from 2026-06-15 05:27; ~1.6 s/it.
+- Checkpoints: ckpt-20000, ckpt-40000 (training continued / may have stopped ~40k).
+- **tds/ckpt-40000 evaluated on yyk:** 97.0 / 99.5 / 87.0 / 64.0 → **avg 86.9**.
+- Cross-machine note: checkpoint config embeds the backbone path; when copying
+  yyk→sapi, `sed` the `smolvlm_model_path` from `/workspace/...` to
+  `/datasets/models/smolvlm/SmolVLM-500M-Instruct`.
+
+Machines: **sapi** = `/datasets` (trained exp_uniform); **yyk** = `/workspace`
+(trained exp_tds). norm_stats md5 + transformers (4.21.1) verified identical.
 
 ---
 
-## 7. Main comparison table (TO FILL — the headline result)
-
-Budget point = 40k (most headroom). Fill TDS row after evaluating tds/ckpt-40000.
+## 7. Main comparison table — 40k budget point
 
 | Run @ 40k | Spatial | Object | Goal | Long | **Avg** |
 |---|---|---|---|---|---|
-| uniform | 73.0 | 95.5 | 38.5 | 40.5 | **61.9** |
-| **TDS** | _pending_ | _pending_ | _pending_ | _pending_ | _pending_ |
-| Δ (TDS − uniform) | | | | | |
+| uniform (sapi) | 73.0 | 95.5 | 38.5 | 40.5 | **61.9** |
+| **TDS (yyk)** | 97.0 | 99.5 | 87.0 | 64.0 | **86.9** |
+| **Δ (TDS − uniform)** | +24.0 | +4.0 | **+48.5** | **+23.5** | **+25.0** |
 
-Expectation: largest gains on Goal/Long (the oversampled high-density suites).
+TDS@40k (86.9) ≈ uniform@100k (91.6) ⇒ **~2.3× sample efficiency**. Per-suite
+gains track uniform's remaining headroom (object near ceiling → +4; goal/long
+lowest → largest gains), consistent with TDS accelerating learning.
+
+**⚠️ Pending decisive validation:** uniform was evaluated on sapi, TDS on yyk.
+Re-evaluating tds/ckpt-40000 on **sapi** (same env as uniform) — run prefix
+`tds40k_onA` — confirms the gap is not a cross-machine artifact. Expected
+~97/99.5/87/64 if real. Do not report as final until this matches.
 
 ---
 
