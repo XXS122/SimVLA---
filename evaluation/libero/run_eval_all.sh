@@ -12,6 +12,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export LIBERO_ROOT="${SCRIPT_DIR}/LIBERO"
 export PYTHONPATH="${LIBERO_ROOT}:${PYTHONPATH}"
 
+# Headless MuJoCo rendering (CPU/software). Without these a fresh shell defaults
+# to EGL and crashes with "OpenGL.EGL has no attribute 'EGLDeviceEXT'".
+export MUJOCO_GL=${MUJOCO_GL:-osmesa}
+export PYOPENGL_PLATFORM=${PYOPENGL_PLATFORM:-osmesa}
+
 echo "LIBERO Environment:"
 echo "   LIBERO_ROOT: $LIBERO_ROOT"
 echo "   PYTHONPATH: $PYTHONPATH"
