@@ -118,7 +118,7 @@ for suite in spatial object goal 10; do
     file="${OUTPUT_PREFIX}_${suite}.txt"
     if [ -f "$file" ]; then
         echo "--- $suite ---"
-        grep -E "Success Rate|Average" "$file" 2>/dev/null || echo "  (see $file)"
+        grep -iE "Total success rate" "$file" 2>/dev/null || echo "  (see $file)"
     fi
 done
 echo "=========================================="
