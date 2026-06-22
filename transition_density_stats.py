@@ -123,14 +123,20 @@ def analyze_task_hdf5(path: str) -> dict:
 
 def compute_difficulty_and_weights(df: pd.DataFrame,
                                    alpha=1/3, beta=1/3, gamma=1/3,
-                                   temperature=2.0, clip_rho=0.5) -> pd.DataFrame:
+                                   temperature=2.0, clip_rho=0.5,
+                                   invert=False) -> pd.DataFrame:
     z = lambda s: (s - s.mean()) / max(s.std(), 1e-8)
     df["zE"], df["zP"], df["zL"] = z(df.E_events), z(df.P_plateau), z(df.L_length)
     df["d_k"] = alpha * df.zE + beta * df.zP + gamma * df.zL
 
+    # Direction control (ablation): invert the difficulty so EASY tasks are
+    # oversampled. If the gains came from generic non-uniformity, this would
+    # also help; it should instead hurt, proving the direction carries signal.
+    score = -df.d_k if invert else df.d_k
+
     # Temperature softmax; shift to positive range first (a negative base
     # raised to 1/T would produce NaN)
-    shifted = df.d_k - df.d_k.min() + 1.0
+    shifted = score - score.min() + 1.0
     w = shifted ** (1.0 / temperature)
     p = w / w.sum()
 
@@ -205,6 +211,8 @@ def main():
                     help="weight of the length component")
     ap.add_argument("--temperature", type=float, default=2.0)
     ap.add_argument("--clip_rho", type=float, default=0.5)
+    ap.add_argument("--invert", action="store_true",
+                    help="oversample EASY tasks (direction-control ablation)")
     ap.add_argument("--sr_csv", default=None,
                     help="baseline per-task SR csv (task_name, sr); "
                          "if given, run Experiment 0a. Produce it with "
@@ -236,7 +244,8 @@ def main():
     df = pd.DataFrame(rows)
     df = compute_difficulty_and_weights(
         df, alpha=args.alpha, beta=args.beta, gamma=args.gamma,
-        temperature=args.temperature, clip_rho=args.clip_rho)
+        temperature=args.temperature, clip_rho=args.clip_rho,
+        invert=args.invert)
     df.sort_values("d_k", ascending=False).to_csv(args.out, index=False)
     print(f"\nWrote {args.out}; difficulty Top-5:")
     print(df.nlargest(5, "d_k")[["suite", "task_name", "d_k",

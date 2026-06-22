@@ -115,13 +115,12 @@ Oversample the EASY tasks instead. If gains were from generic non-uniformity,
 this would also help; it should instead hurt (esp. Goal/Long).
 
 ```bash
-# inverted difficulty weights from the SAME transition stats
+# inverted difficulty weights from the SAME transition stats (--invert flips
+# the direction so EASY tasks are oversampled)
 python transition_density_stats.py --data_root $LIBERO_DATASETS \
     --suites libero_spatial libero_object libero_goal libero_10 \
-    --alpha 0 --beta 0.5 --gamma 0.5 --temperature -2.0 \
+    --alpha 0 --beta 0.5 --gamma 0.5 --invert \
     --out task_difficulty_inverted.csv
-# (if negative temperature isn't supported, use make_empirical_weights.py
-#  --invert on the transition d_k, or negate d_k before the softmax)
 
 TDS_WEIGHTS_CSV=./task_difficulty_inverted.csv \
 NUM_WORKERS=0 ITERS=40000 SAVE_INTERVAL=20000 WANDB_MODE=offline \
