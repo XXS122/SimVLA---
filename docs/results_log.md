@@ -164,6 +164,21 @@ convergence but **stays positive** — TDS is not merely caught up. So TDS is
 / Spatial +5). The +4.0 is smaller than the 40k gap (LIBERO near-saturated by
 100k) but Goal/Spatial gains are ~2–3× the per-suite standard error.
 
+### 7c. Efficiency curve (avg SR vs step) — being filled
+
+| Step | uniform | TDS | Δ |
+|---|---|---|---|
+| 20k | _eval running_ | _pending_ | |
+| 40k | 61.9 | 89.75 | +27.9 |
+| 60k | **85.4** | _pending_ | |
+| 80k | _pending_ | _pending_ | |
+| 100k | 91.6 | 95.6 | +4.0 |
+
+uniform per-suite @60k: 88.0 / 99.0 / 65.0 / 89.5. TDS@40k (89.75) already
+exceeds uniform@60k (85.4) — TDS reaches at 40k what uniform needs ~70–80k for.
+Minor per-suite non-monotonicity (long/object slightly higher at 60k than 100k)
+is within 20-trial eval noise.
+
 ---
 
 ## 8. Pending / next
