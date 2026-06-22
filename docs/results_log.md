@@ -166,18 +166,22 @@ convergence but **stays positive** — TDS is not merely caught up. So TDS is
 
 ### 7c. Efficiency curve (avg SR vs step) — being filled
 
-| Step | uniform | TDS | Δ |
+| Step | uniform (sapi) | TDS | gap |
 |---|---|---|---|
-| 20k | _eval running_ | _pending_ | |
-| 40k | 61.9 | 89.75 | +27.9 |
-| 60k | **85.4** | _pending_ | |
-| 80k | _pending_ | _pending_ | |
-| 100k | 91.6 | 95.6 | +4.0 |
+| 20k | _eval running_ | yyk: 82.5/93.5/78.5/_long pending_ | |
+| 40k | 61.9 | 89.75 (sapi) / 86.9 (yyk) | +27.9 |
+| 60k | **85.4** | **95.0** (yyk: 100/97.5/97.0/85.5) | +9.6 |
+| 80k | _pending_ | **93.9** (yyk: 100/98.5/90.0/87.0) | — |
+| 100k | 91.6 | 95.6 (sapi) | +4.0 |
 
-uniform per-suite @60k: 88.0 / 99.0 / 65.0 / 89.5. TDS@40k (89.75) already
-exceeds uniform@60k (85.4) — TDS reaches at 40k what uniform needs ~70–80k for.
-Minor per-suite non-monotonicity (long/object slightly higher at 60k than 100k)
-is within 20-trial eval noise.
+Gap shrinks +27.9 → +9.6 → +4.0 but **stays positive** — textbook
+sample-efficiency curve. uniform per-suite @60k: 88.0/99.0/65.0/89.5.
+
+**⚠️ Machine consistency:** TDS 60k/80k/(20k) are yyk-native; TDS 40k/100k are
+sapi same-machine. yyk evals run ~3 pts BELOW sapi (TDS 40k: 86.9 yyk vs 89.75
+sapi), so the yyk points are conservative (understate TDS). For the final
+figure, evaluate the whole TDS curve on sapi (copy ckpts + sed path) so both
+lines are same-machine. tds20k libero_10 result missing — re-check/rerun.
 
 ---
 
