@@ -142,6 +142,28 @@ tasks; TDS reallocates gradient to hard tasks, which then learn much faster.
 
 Provisional cross-machine read (TDS on yyk): 97.0/99.5/87.0/64.0 = 86.9.
 
+### 7b. Convergence comparison — 100k budget point (SAME-MACHINE, sapi)
+
+| Run @ 100k (sapi) | Spatial | Object | Goal | Long | **Avg** |
+|---|---|---|---|---|---|
+| uniform | 92.5 | 96.0 | 90.5 | 87.5 | **91.6** |
+| **TDS** | 97.5 | 98.5 | 96.0 | 90.5 | **95.6** |
+| **Δ (TDS − uniform)** | +5.0 | +2.5 | **+5.5** | +3.0 | **+4.0** |
+
+**Two-point efficiency picture (same machine):**
+
+| Budget | uniform | TDS | Δ |
+|---|---|---|---|
+| 40k | 61.9 | 89.75 | **+27.9** |
+| 100k | 91.6 | 95.6 | **+4.0** |
+
+Textbook sample-efficiency curve: a huge early gap that narrows toward
+convergence but **stays positive** — TDS is not merely caught up. So TDS is
+(i) far more sample-efficient (TDS@40k ≈ uniform@100k, ~2.2× speedup) AND
+(ii) converges higher (+4.0 at 100k, concentrated on the hard suites Goal +5.5
+/ Spatial +5). The +4.0 is smaller than the 40k gap (LIBERO near-saturated by
+100k) but Goal/Spatial gains are ~2–3× the per-suite standard error.
+
 ---
 
 ## 8. Pending / next
