@@ -164,27 +164,30 @@ convergence but **stays positive** — TDS is not merely caught up. So TDS is
 / Spatial +5). The +4.0 is smaller than the 40k gap (LIBERO near-saturated by
 100k) but Goal/Spatial gains are ~2–3× the per-suite standard error.
 
-### 7c. Efficiency curve (avg SR vs step)
+### 7c. Efficiency curve (avg SR vs step) — COMPLETE
 
 | Step | uniform (sapi) | TDS (yyk) | gap |
 |---|---|---|---|
-| 20k | _eval running_ | **75.6** (82.5/93.5/78.5/48.0) | |
-| 40k | 61.9 | **86.9** (97.0/99.5/87.0/64.0) · sapi 89.75 | +25.0 |
-| 60k | **85.4** | **95.0** (100/97.5/97.0/85.5) | +9.6 |
-| 80k | _pending_ | **93.9** (100/98.5/90.0/87.0) | |
-| 100k | 91.6 | 95.6 (sapi) | +4.0 |
+| 20k | **35.1** (21.0/76.0/23.5/20.0) | **75.6** (82.5/93.5/78.5/48.0) | **+40.5** |
+| 40k | **61.9** (73.0/95.5/38.5/40.5) | **86.9** (97.0/99.5/87.0/64.0) · sapi 89.75 | +25.0 |
+| 60k | **85.4** (88.0/99.0/65.0/89.5) | **95.0** (100/97.5/97.0/85.5) | +9.6 |
+| 80k | **81.5** (86.0/99.0/64.5/76.5) | **93.9** (100/98.5/90.0/87.0) | +12.4 |
+| 100k | **91.6** (92.5/96.0/90.5/87.5) | 95.6 (sapi) | +4.0 |
 
 Standout efficiency facts:
-- TDS@20k (75.6) > uniform@40k (61.9) — TDS at 20k beats uniform at 40k.
-- TDS@60k (95.0) > uniform@100k (91.6) — TDS reaches at 60k a level uniform
-  never reaches even at 100k. ⇒ ~1.7× steps to surpass uniform's best.
-- TDS plateaus ~94–95 by 60k while uniform is still climbing; gap shrinks
-  +25.0 → +9.6 → +4.0 but stays positive (TDS also converges higher).
+- gap is +40.5 at 20k (TDS 75.6 vs uniform 35.1), shrinking to +4.0 at 100k but
+  always positive — TDS dominates at every budget.
+- TDS matches uniform's 100k success (91.6) at ~50k steps ⇒ **~2× fewer steps**;
+  TDS@60k (95.0) already exceeds uniform@100k (91.6); TDS converges higher (+4.0).
+- TDS plateaus ~94–95 by 60k while uniform is still climbing.
 
-**⚠️ Machine consistency:** TDS 20/40/60/80k are yyk-native; TDS 40k/100k also
-have sapi same-machine values (40k: 86.9 yyk vs 89.75 sapi → yyk ~3 pts low,
-conservative). For the final figure evaluate the whole TDS curve on sapi.
-Still pending: uniform 20k (running), uniform 80k.
+Notes: uniform@80k (81.5) dips below uniform@60k (85.4) — a wiggle driven by the
+high-variance Long suite (89.5→76.5→87.5 over 60/80/100k); within 20-trial eval
+noise. Optionally re-eval 60/80k at 50 trials for a smoother figure.
+
+**⚠️ Machine consistency:** uniform all sapi; TDS 20/40/60/80k yyk-native, 40k/
+100k also sapi (40k: 86.9 yyk vs 89.75 sapi → yyk ~3 pts low, conservative).
+Final figure: evaluate the whole TDS curve on sapi for same-machine cleanliness.
 
 ---
 
