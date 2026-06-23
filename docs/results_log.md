@@ -164,24 +164,27 @@ convergence but **stays positive** — TDS is not merely caught up. So TDS is
 / Spatial +5). The +4.0 is smaller than the 40k gap (LIBERO near-saturated by
 100k) but Goal/Spatial gains are ~2–3× the per-suite standard error.
 
-### 7c. Efficiency curve (avg SR vs step) — being filled
+### 7c. Efficiency curve (avg SR vs step)
 
-| Step | uniform (sapi) | TDS | gap |
+| Step | uniform (sapi) | TDS (yyk) | gap |
 |---|---|---|---|
-| 20k | _eval running_ | yyk: 82.5/93.5/78.5/_long pending_ | |
-| 40k | 61.9 | 89.75 (sapi) / 86.9 (yyk) | +27.9 |
-| 60k | **85.4** | **95.0** (yyk: 100/97.5/97.0/85.5) | +9.6 |
-| 80k | _pending_ | **93.9** (yyk: 100/98.5/90.0/87.0) | — |
+| 20k | _eval running_ | **75.6** (82.5/93.5/78.5/48.0) | |
+| 40k | 61.9 | **86.9** (97.0/99.5/87.0/64.0) · sapi 89.75 | +25.0 |
+| 60k | **85.4** | **95.0** (100/97.5/97.0/85.5) | +9.6 |
+| 80k | _pending_ | **93.9** (100/98.5/90.0/87.0) | |
 | 100k | 91.6 | 95.6 (sapi) | +4.0 |
 
-Gap shrinks +27.9 → +9.6 → +4.0 but **stays positive** — textbook
-sample-efficiency curve. uniform per-suite @60k: 88.0/99.0/65.0/89.5.
+Standout efficiency facts:
+- TDS@20k (75.6) > uniform@40k (61.9) — TDS at 20k beats uniform at 40k.
+- TDS@60k (95.0) > uniform@100k (91.6) — TDS reaches at 60k a level uniform
+  never reaches even at 100k. ⇒ ~1.7× steps to surpass uniform's best.
+- TDS plateaus ~94–95 by 60k while uniform is still climbing; gap shrinks
+  +25.0 → +9.6 → +4.0 but stays positive (TDS also converges higher).
 
-**⚠️ Machine consistency:** TDS 60k/80k/(20k) are yyk-native; TDS 40k/100k are
-sapi same-machine. yyk evals run ~3 pts BELOW sapi (TDS 40k: 86.9 yyk vs 89.75
-sapi), so the yyk points are conservative (understate TDS). For the final
-figure, evaluate the whole TDS curve on sapi (copy ckpts + sed path) so both
-lines are same-machine. tds20k libero_10 result missing — re-check/rerun.
+**⚠️ Machine consistency:** TDS 20/40/60/80k are yyk-native; TDS 40k/100k also
+have sapi same-machine values (40k: 86.9 yyk vs 89.75 sapi → yyk ~3 pts low,
+conservative). For the final figure evaluate the whole TDS curve on sapi.
+Still pending: uniform 20k (running), uniform 80k.
 
 ---
 
