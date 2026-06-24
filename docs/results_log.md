@@ -18,8 +18,8 @@ We therefore retrain from scratch at low budget where success rate is
 non-saturated and differences are measurable.
 
 **Two machines, parallel.**
-- Machine A (`ff86…`, `/datasets/code/SimVLA---`): trained `exp_uniform`; now the eval machine.
-- Machine B (`NF5468…`, `/workspace/hyj/code/SimVLA---`): training `exp_tds`.
+- **sapi** (`/datasets/code/SimVLA---`): trained `exp_uniform`; primary eval machine.
+- **yyk** (`/workspace/hyj/code/SimVLA---`): trained `exp_tds`, `exp_uniform_interleaved`, `exp_empirical`.
 
 ---
 
@@ -189,13 +189,80 @@ noise. Optionally re-eval 60/80k at 50 trials for a smoother figure.
 100k also sapi (40k: 86.9 yyk vs 89.75 sapi → yyk ~3 pts low, conservative).
 Final figure: evaluate the whole TDS curve on sapi for same-machine cleanliness.
 
+### 7d. Uniform-interleaved control — decomposing the +27.9 (IMPORTANT)
+
+`exp_uniform_interleaved` (alias **flat40k**) = the **TDS two-level sampler with
+flat weights** `p_k = 1/N`. It isolates the sampling *mechanism* from the
+difficulty *weights*. Result (40k, **yyk-native**, 20 trials/task):
+
+| Run @ 40k | Spatial | Object | Goal | Long | **Avg** | machine |
+|---|---|---|---|---|---|---|
+| uniform (naive per-suite stream) | 73.0 | 95.5 | 38.5 | 40.5 | **61.9** | sapi |
+| **uniform-interleaved (flat)** | 95.0 | 93.5 | 83.5 | 67.5 | **84.9** | **yyk** |
+| TDS | 97.0 | 99.5 | 87.0 | 64.0 | **86.9** | yyk |
+| TDS | 97.5 | 98.5 | 92.0 | 71.0 | **89.75** | sapi |
+
+**Mechanism vs weights — the headline +27.9 is mostly the mechanism, not the
+density weighting:**
+
+- **Mechanism (uniform → interleaved): ≈ +23 avg.** The naive uniform path
+  (`__iter__` else-branch) samples at the **suite** level (4-way) and streams one
+  full episode's timesteps before moving on, so a batch of 64 holds only ~4
+  distinct episodes (heavily correlated → poor SGD). The two-level sampler draws
+  a fresh **episode stream** per sample over ~2000 streams, so a batch holds ~64
+  distinct episodes (decorrelated → good SGD). Task distribution is identical in
+  expectation (`DATA_WEIGHTS` all 1.0, ~equal episodes/suite), so the +23 is
+  **pure batch-mixing / decorrelation**, concentrated on the hard suites that the
+  coarse sampler was starving (Goal +45, Long +27, Spatial +22).
+- **Transition-density weighting (interleaved → TDS): ≈ +2.0 avg**, measured
+  **same-machine (yyk)**: flat 84.9 → TDS 86.9. Per suite (yyk): Sp +2.0, Obj
+  +6.0, Goal +3.5, **Long −3.5** (within 20-trial noise). The weighting helps the
+  suite it up-weights most (Goal) but the *average* effect is small because the
+  easy suites are already near ceiling once mixing is fixed.
+
+**Sapi-scale estimate** (flat is yyk-native, ~3 pts low; offset-correct → flat
+≈ 87.8 on sapi): mechanism ≈ **+25.9**, weighting ≈ **+1.9**. Same story either
+way: the sampler mechanism carries the gain; the density weighting adds a small,
+Goal-concentrated increment that sits near the ±3 cross-machine / 20-trial noise.
+
+**⚠️ Cross-machine caveat — clean decomposition still pending.** flat is
+yyk-native; uniform/TDS main table is sapi. The only *clean same-machine* number
+is yyk (flat 84.9 vs TDS 86.9 = +2.0). To decompose against the sapi main table,
+**evaluate the flat checkpoint on sapi** (copy + `sed` the backbone path, exactly
+as done for TDS). Recommend ≥2–3 seeds for the weighting effect since +2 is near
+noise.
+
+**Implication for the paper.** The predicted ablation reading ("uniform-interleaved
+≈ uniform; the gain is from the weights") is **falsified** — it is the opposite.
+Honest framings to choose between (user's call):
+(A) Present TDS as a two-part data pipeline (fine-grained interleaving + density
+   reweighting) and report the decomposition transparently; or
+(B) Make uniform-interleaved the PRIMARY baseline and headline the clean
+   weighting effect (+2 avg / +3.5 Goal), relegating naive uniform to context.
+Do not finalize framing until the same-machine flat eval (and exp_empirical) land.
+
+### 7e. Measured-difficulty baseline (exp_empirical) — TRAINED, eval pending
+
+`exp_empirical` (difficulty = −SR from the uniform baseline's measured per-task
+success → sampling weights) finished training at **ckpt-40000**
+(`runs/exp_empirical/ckpt-40000`, loss_total 0.174). **Not yet evaluated.** This
+is the "ask-the-model" oracle control: if free transition-density difficulty
+≈ measured difficulty, the row should land near TDS. Evaluate next (same machine
+as the flat/TDS comparison for a clean read).
+
 ---
 
 ## 8. Pending / next
 
-- [ ] Evaluate **tds/ckpt-40000** → first real TDS-vs-uniform signal (§7).
-- [ ] uniform ckpt-20000 eval (last attempt failed — server was down).
-- [ ] Fill efficiency curve: both runs at 20k/40k/60k/80k/100k.
+- [x] Evaluate **tds/ckpt-40000** → +27.9 same-machine (§7).
+- [x] Fill efficiency curve: both runs at 20k/40k/60k/80k/100k (§7c).
+- [x] Uniform-interleaved control (flat40k) evaluated → decomposition (§7d).
+- [ ] **🔴 Evaluate flat (uniform-interleaved) on sapi** → clean mechanism-vs-weights
+      decomposition against the sapi main table (copy ckpt + `sed` backbone path).
+- [ ] **🔴 Evaluate exp_empirical/ckpt-40000** (measured-difficulty oracle, §7e).
+- [ ] inverted-weights + no-floor (ρ=0) controls at 40k (just different csv).
+- [ ] ≥2–3 seeds for the +2 density-weighting effect (it sits near eval noise).
+- [ ] Decide paper framing (§7d A vs B) once same-machine flat + empirical land.
 - [ ] Optional: re-check Exp 0 at 20k (more spread, may strengthen ρ).
 - [ ] 340k (adaptive-chunking) = 98% saved as the "large-budget upper bound,
       method does not hurt" row.
