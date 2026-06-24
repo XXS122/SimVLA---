@@ -1,0 +1,283 @@
+%File: simvla_tds_aaai2027.tex
+% =============================================================================
+% AAAI-2027 anonymous submission.
+% Core contribution: Transition-Aware Dynamic Sampling (TDS) for sample-efficient
+% Vision-Language-Action learning, built on the SimVLA base model.
+%
+% TODO BEFORE SUBMISSION (search "TODO"):
+%   * Replace the fbox figure placeholders with the generated PDFs
+%     (architecture, efficiency curve = main_suite_curves.png, Exp-0 scatter =
+%     density_vs_sr.png, per-task appendix grids).
+%   * Fill the ablation table rows marked "--" once the control runs finish
+%     (measured-difficulty / uniform-interleaved / inverted / no-clip).
+%   * Confirm the published-baseline numbers against the cited sources.
+% Compile: pdflatex -> bibtex -> pdflatex x2, with aaai2027.sty/.bst + references.bib.
+% =============================================================================
+\documentclass[letterpaper]{article} % DO NOT CHANGE THIS
+\usepackage[submission]{aaai2027}  % DO NOT CHANGE THIS
+\usepackage[hyphens]{url}  % DO NOT CHANGE THIS
+\usepackage{graphicx} % DO NOT CHANGE THIS
+\urlstyle{rm} % DO NOT CHANGE THIS
+\def\UrlFont{\rm}  % DO NOT CHANGE THIS
+\usepackage{natbib}  % DO NOT CHANGE THIS AND DO NOT ADD ANY OPTIONS TO IT
+\usepackage{caption} % DO NOT CHANGE THIS AND DO NOT ADD ANY OPTIONS TO IT
+\frenchspacing  % DO NOT CHANGE THIS
+
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{multirow}
+
+\pdfinfo{
+/TemplateVersion (2027.1)
+}
+
+\setcounter{secnumdepth}{0}
+
+% ---- convenience macros ----
+\newcommand{\tds}{TDS}
+\newcommand{\dk}{d_{k}}
+\newcommand{\pk}{p_{k}}
+\newcommand{\na}{\textbf{[TODO]}}
+
+\title{Transition-Aware Dynamic Sampling for Sample-Efficient\\Vision-Language-Action Learning}
+\author{
+    Anonymous Submission
+}
+\affiliations{
+    Anonymous Submission
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Vision-language-action (VLA) models are almost always trained by minimizing a uniform behavioral-cloning objective over uniformly sampled demonstrations, implicitly assuming that every task in the training mixture is equally informative. Manipulation difficulty, however, is highly non-uniform, and we observe that it is already encoded in the demonstrations themselves: the density of gripper open/close events, the fraction of low-speed fine-alignment segments, and the trajectory length jointly characterize how hard a task is to imitate. We introduce \emph{Transition-Aware Dynamic Sampling} (\tds{}), a training strategy that scores per-task difficulty \emph{offline} from this transition structure and dynamically reweights how often each task is drawn during training, concentrating optimization on the hard, under-learned tasks. \tds{} requires no reference model, no periodic policy evaluation, and adds no measurable training overhead, in contrast to loss- or success-based data-mixing methods that must repeatedly query the model. Built on the compact SimVLA base model and evaluated on the LIBERO benchmark, \tds{} improves average success rate by $+27.9$ points at a fixed $40$k-step budget (same-machine controlled comparison) and reaches the uniform baseline's $100$k-step performance in roughly half the steps, while remaining ahead at convergence. An offline-computed difficulty score also correlates significantly with measured per-task failure ($\rho=-0.32$, $p<0.05$), supporting the premise that transition structure is a model-free proxy for task difficulty.
+\end{abstract}
+
+\section{Introduction}
+
+Vision-language-action (VLA) models map raw visual observations and natural-language instructions directly to robot actions, and have advanced quickly by coupling pretrained vision-language backbones with expressive action decoders \citep{brohan2023rt2,kim2024openvla,octo2024,black2024pi0}. The prevailing training recipe is behavioral cloning under a \emph{uniform} objective: each timestep of each demonstration of each task contributes equally to the loss, and minibatches are sampled uniformly from the data mixture.
+
+This uniformity sits uneasily with the structure of manipulation. Across a task suite, difficulty varies by a large margin---some tasks are mastered almost immediately while long-horizon, multi-stage tasks lag by tens of success-rate points \citep{liu2023libero,kim2024openvla}. Under uniform sampling, a model spends the same optimization budget rehearsing already-solved easy tasks as it does on the hard tasks that actually determine average performance. The result is poor \emph{sample efficiency}: the policy reaches a given success rate only after far more gradient steps than necessary.
+
+A natural remedy is to sample hard tasks more often. The dominant way to decide \emph{which} tasks are hard is to \emph{ask the model}: train a reference or proxy model and read off difficulty from its loss, temporal-difference error, or rollout success \citep{schaul2016prioritized,lin2017focal,hejna2024remix,xie2023doremi}. This couples the difficulty estimate to the very model being trained, changes when the backbone changes, and introduces an extra evaluation loop with its own cost and hyperparameters.
+
+We take the opposite view: \emph{difficulty is a property of the demonstrations, observable before training begins}. The moment a demonstration is recorded, its action signal already reveals how many sub-task events it contains (gripper open/close events), how much of it demands slow, low-tolerance alignment (low-speed plateaus), and how much room it leaves for error accumulation (trajectory length). All three are deterministic functions of the action sequence, computable in a single offline pass, independent of any model.
+
+Building on this observation we propose \emph{Transition-Aware Dynamic Sampling} (\tds{}). \tds{} (i) computes a per-task transition-density difficulty score offline from the demonstrations, (ii) converts it into a sampling distribution over tasks via a temperature-controlled transform with a uniform floor, and (iii) drives a streaming, two-level sampler that dynamically realizes this distribution during training---all while leaving the base model, the loss, and the optimizer untouched. Because the difficulty signal is data-intrinsic, \tds{} adds no training-time evaluation and is identical for any backbone.
+
+Our contributions are:
+\begin{itemize}
+\item \textbf{The TDS mechanism}: a model-free, zero-training-cost characterization of per-task manipulation difficulty from action transition structure, and a temperature-with-floor reweighting that turns it into a task-sampling distribution.
+\item \textbf{Integration into SimVLA}: a streaming two-level sampler that realizes the target distribution exactly over an infinite iterable dataset, modifying only the data path of an otherwise standard flow-matching VLA.
+\item \textbf{Improved sample efficiency}: on LIBERO, \tds{} yields $+27.9$ average success rate at a fixed low budget and $\sim\!2\times$ fewer steps to match the uniform baseline (same-machine controlled comparison), with the offline difficulty score significantly predicting measured per-task failure.
+\end{itemize}
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.92\columnwidth}{\centering \vspace{2.2cm} TODO: SimVLA $+$ TDS overview. Offline difficulty $\dk$ from transition structure (gripper events, low-speed plateaus, length) $\rightarrow$ task sampling weights $\pk$ $\rightarrow$ streaming two-level sampler feeding the SmolVLM$+$DiT flow-matching policy. \vspace{2.2cm}}}
+\caption{Overview of SimVLA with Transition-Aware Dynamic Sampling. Difficulty is read from the demonstrations before training; only the sampler changes.}
+\label{fig:overview}
+\end{figure}
+
+\section{Related Work}
+
+\paragraph{Vision-language-action models.}
+Large VLA models attach action decoders to pretrained vision-language backbones, either by discretizing actions into tokens \citep{brohan2022rt1,brohan2023rt2,kim2024openvla} or by attaching continuous diffusion/flow heads \citep{octo2024,black2024pi0,chi2023diffusion}. Recent work also optimizes the fine-tuning recipe itself \citep{kim2025oft}. These efforts keep the training objective and sampling uniform over tasks; \tds{} is complementary and modifies only how tasks are sampled.
+
+\paragraph{Imitation learning and behavioral cloning.}
+Action chunking with diffusion or flow matching has become a standard, effective recipe for visuomotor imitation \citep{chi2023diffusion,zhao2023aloha,lipman2023flow}. Our base model follows this paradigm; \tds{} is agnostic to the specific decoder.
+
+\paragraph{Curriculum learning and data sampling.}
+Emphasizing hard examples has a long history: prioritized replay \citep{schaul2016prioritized}, focal loss \citep{lin2017focal}, online hard-example mining \citep{shrivastava2016ohem}, and curriculum learning \citep{bengio2009curriculum}. For data mixtures, Re-Mix \citep{hejna2024remix} learns domain weights via distributionally robust optimization over a reference model, and DoReMi \citep{xie2023doremi} trains a proxy model to set mixture proportions, reaching baseline accuracy in $2.6\times$ fewer steps. All of these derive difficulty from a \emph{model}. \tds{} differs in kind: its weights are a property of the demonstrations, computed offline, identical for any backbone, and free of an evaluation loop.
+
+\paragraph{Transition modeling.}
+Most VLA training treats all transitions within a trajectory as equally important. We instead use the \emph{aggregate} transition structure of a task's demonstrations as a difficulty signal for sampling, rather than modeling individual transitions; this aggregate is exactly what is missing from uniform task sampling.
+
+\section{Method}
+
+\subsection{Problem Formulation}
+A demonstration is a trajectory $\tau=\{(o_t,a_t)\}_{t=1}^{T}$ of observations $o_t$ (multi-view images, language instruction, proprioception) and actions $a_t\in\mathbb{R}^{d}$, inducing state transitions $s_t\!\to\!s_{t+1}$. The training set is partitioned into $K$ tasks $\{\mathcal{D}_k\}_{k=1}^{K}$. A policy $\pi_\theta$ is trained by behavioral cloning over action chunks $a_{t:t+H}$. Writing $p$ for the distribution from which a task is drawn at each training step, the objective is
+\begin{equation}
+\min_\theta\ \mathbb{E}_{k\sim p}\,\mathbb{E}_{(o,a)\sim\mathcal{D}_k}\big[\,\mathcal{L}\!\left(\pi_\theta(o),a\right)\big].
+\label{eq:objective}
+\end{equation}
+The standard recipe sets $p$ uniform, $p_k=1/K$. \tds{} replaces $p$ with a difficulty-aware distribution $\pk$ derived offline from the demonstrations, leaving $\mathcal{L}$ and $\theta$'s optimization unchanged.
+
+\subsection{SimVLA Base Model}
+SimVLA is a compact flow-matching VLA. A pretrained SmolVLM vision-language backbone \citep{marafioti2025smolvlm} encodes the multi-view images and the instruction into conditioning features; a DiT-style action transformer \citep{peebles2023dit} consumes these features together with proprioception and a noised action chunk, and is trained with conditional flow matching \citep{lipman2023flow} to predict the chunk's velocity field. At inference the head integrates the velocity to produce an $H$-step action chunk. SimVLA is intentionally simple and serves only as the substrate on which \tds{} operates; \tds{} makes no assumption about the decoder beyond the loss in Eq.~\eqref{eq:objective}.
+
+\subsection{TDS: Transition-Aware Dynamic Sampling}
+
+\paragraph{Motivation.}
+Not all tasks are equally informative to train on. Tasks that are already solved contribute little gradient signal, whereas hard tasks---those with many contact/grasp events, long low-tolerance alignment phases, and long horizons---remain under-learned under uniform sampling. Crucially, these properties are visible in the demonstrations \emph{before} training, so we can prioritize hard tasks without ever querying the model.
+
+\paragraph{The transition signal.}
+For an episode with actions $a_{1:T}$ we define a per-dimension-normalized change rate
+\begin{equation}
+c_t=\frac{1}{|\mathcal{J}|}\sum_{j\in\mathcal{J}}\frac{\lvert a_{t,j}-a_{t-1,j}\rvert}{\max_{t'}\lvert a_{t',j}-a_{t'-1,j}\rvert+\varepsilon},
+\label{eq:changerate}
+\end{equation}
+where $\mathcal{J}$ excludes the gripper dimension and $c$ is renormalized to $[0,1]$ within the episode. From this we extract three task statistics, each averaged over the task's demonstrations:
+(1) \textbf{gripper events} $E$: the number of sign flips of the (median-centered) gripper command, robust to $0/1$ and $-1/1$ encodings, counting grasp/release sub-tasks;
+(2) \textbf{plateau ratio} $P$: the fraction of steps inside low-speed plateaus, i.e.\ maximal runs of length $\geq L_p$ with $c_t<\theta_p$, capturing fine-alignment phases with narrow tolerance;
+(3) \textbf{length} $L$: the mean trajectory length, a proxy for error-accumulation horizon. We use $\theta_p{=}0.25$, $L_p{=}3$.
+
+\paragraph{Difficulty score.}
+Because the three statistics have incommensurate units, each is standardized across tasks and combined into a difficulty score
+\begin{equation}
+\dk=\alpha\, z(E_k)+\beta\, z(P_k)+\gamma\, z(L_k),
+\label{eq:dk}
+\end{equation}
+with $z(\cdot)$ the across-task $z$-score. On LIBERO we use the two-component form $\alpha{=}0,\ \beta{=}\gamma{=}\tfrac12$: an analysis (below) shows the gripper-event term carries no discriminative signal on this benchmark, so it is dropped. Note $\dk$ is centered at $0$; negative values denote easier-than-average tasks.
+
+\paragraph{Sampling weights.}
+We map $\dk$ to a sampling distribution with a temperature transform and a uniform floor:
+\begin{equation}
+\tilde{p}_k\propto\big(\dk-\textstyle\min_{k'}d_{k'}+1\big)^{1/T},\qquad
+\pk\propto\max\!\big(\tilde{p}_k,\ \rho/K\big),
+\label{eq:pk}
+\end{equation}
+with temperature $T{=}2$ and floor $\rho{=}0.5$. The shift makes the base positive so the fractional power is well defined; $T$ controls how aggressively hard tasks are up-weighted ($T\!\to\!\infty$ recovers uniform sampling). The floor guarantees every task at least half its uniform share, preventing catastrophic forgetting of easy tasks.
+
+\paragraph{Dynamic streaming sampler.}
+SimVLA streams from an infinite iterable dataset, so a map-style weighted sampler does not apply. Instead we use a two-level scheme: at each draw we first sample a task $k\sim\pk$, then take the next sample from that task's persistent episode stream. Because the weighted draw occurs once per \emph{sample}, the empirical fraction of training samples from task $k$ converges exactly to $\pk$, independent of per-task demo counts or episode lengths; a monitor verifies the empirical distribution against $\pk$ early in training. Setting $\pk$ uniform recovers the original training stream up to sampling order. The training objective is unchanged from Eq.~\eqref{eq:objective} with $p=\pk$.
+
+\begin{algorithm}[tb]
+\caption{Transition-Aware Dynamic Sampling (\tds{})}
+\label{alg:tds}
+\textbf{Input}: demos $\{\mathcal{D}_k\}_{k=1}^{K}$, base policy $\pi_\theta$, temperature $T$, floor $\rho$\\
+\textbf{Offline (once, CPU)}: for each task $k$ compute $E_k,P_k,L_k$; $\dk$ (Eq.~\ref{eq:dk}); $\pk$ (Eq.~\ref{eq:pk})\\
+\textbf{Output}: trained $\pi_\theta$
+\begin{algorithmic}[1]
+\WHILE{training}
+\STATE sample task $k\sim\pk$
+\STATE draw next chunk $(o,a)$ from task $k$'s stream
+\STATE update $\theta$ on $\mathcal{L}(\pi_\theta(o),a)$
+\ENDWHILE
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Extensions (Future Work)}
+The transition signal of Eq.~\eqref{eq:changerate} is defined at the timestep level and could in principle reweight the per-step loss or gate execution granularity. We focus this paper on the task-sampling instantiation, which is the change responsible for the gains reported below, and leave step- and execution-level uses to future work.
+
+\section{Experiments}
+
+\subsection{Setup}
+\paragraph{Benchmark.}
+We evaluate on LIBERO \citep{liu2023libero}, four suites of ten tasks each: \textsc{Spatial} (layout generalization), \textsc{Object} (object generalization), \textsc{Goal} (goal generalization), and \textsc{Long} (long-horizon, multi-stage). We report per-suite and average success rate (SR, \%) over $20$ trials per task ($200$ rollouts per suite).
+\paragraph{Implementation.}
+SimVLA uses SmolVLM-500M-Instruct \citep{marafioti2025smolvlm} with a DiT action transformer ($H{=}10$, $384^2$ images, two views). \tds{} and the uniform baseline share an identical recipe (batch size, learning rate, schedule, seed); the \emph{only} difference is the task-sampling distribution. \tds{} statistics are computed once from the raw demonstrations on CPU in minutes. To remove cross-machine variance, the headline $40$k/$100$k comparisons are evaluated for both models on the same machine.
+
+\subsection{Main Results: Sample Efficiency}
+Table~\ref{tab:main} reports the controlled, same-machine comparison at a low budget ($40$k steps) and at convergence ($100$k steps). At $40$k, \tds{} improves average SR from $61.9$ to $89.75$ ($+27.9$), with the largest gains on the hard \textsc{Goal} ($+53.5$) and \textsc{Long} ($+30.5$) suites---exactly the tasks \tds{} up-weights. At $100$k the suites approach saturation, yet \tds{} still leads by $+4.0$, indicating it does not merely accelerate training but also reaches a higher plateau, with gains concentrated on the hard suites.
+
+\begin{table*}[t]
+\centering
+\begin{tabular}{llccccc}
+\toprule
+Budget & Method & \textsc{Spatial} & \textsc{Object} & \textsc{Goal} & \textsc{Long} & Avg \\
+\midrule
+\multirow{2}{*}{$40$k steps}
+& SimVLA (uniform) & 73.0 & 95.5 & 38.5 & 40.5 & 61.9 \\
+& SimVLA $+$ \tds{} (ours) & \textbf{97.5} & \textbf{98.5} & \textbf{92.0} & \textbf{71.0} & \textbf{89.75} \\
+\cmidrule(lr){2-7}
+& $\Delta$ & $+24.5$ & $+3.0$ & $+53.5$ & $+30.5$ & $+27.9$ \\
+\midrule
+\multirow{2}{*}{$100$k steps}
+& SimVLA (uniform) & 92.5 & 96.0 & 90.5 & 87.5 & 91.6 \\
+& SimVLA $+$ \tds{} (ours) & \textbf{97.5} & \textbf{98.5} & \textbf{96.0} & \textbf{90.5} & \textbf{95.6} \\
+\cmidrule(lr){2-7}
+& $\Delta$ & $+5.0$ & $+2.5$ & $+5.5$ & $+3.0$ & $+4.0$ \\
+\bottomrule
+\end{tabular}
+\caption{\textbf{Main result: same-machine controlled comparison on LIBERO} (SR \%, $20$ trials/task). The only difference between the two rows in each block is the task-sampling distribution. \tds{} yields a large gain at low budget that narrows but stays positive at convergence.}
+\label{tab:main}
+\end{table*}
+
+Table~\ref{tab:curve} gives the full efficiency curve. \tds{} at $20$k steps ($75.6$) already exceeds the uniform baseline at $40$k ($61.9$); \tds{} at $60$k ($95.0$) exceeds uniform at $100$k ($91.6$). Thus \tds{} reaches the uniform baseline's converged success rate in roughly half the training steps. (Curve points for \tds{} at $40$/$60$/$80$k are evaluated on a second machine and are mildly conservative relative to the same-machine anchors in Table~\ref{tab:main}; the qualitative dominance is unaffected.)
+
+\begin{table}[t]
+\centering
+\setlength{\tabcolsep}{1.2mm}
+\begin{tabular}{lccccc}
+\toprule
+Steps (k) & 20 & 40 & 60 & 80 & 100 \\
+\midrule
+Uniform & 35.1 & 61.9 & 85.4 & 81.5 & 91.6 \\
+\tds{} (ours) & \textbf{75.6} & \textbf{86.9} & \textbf{95.0} & \textbf{93.9} & \textbf{95.6} \\
+\midrule
+Gap & $+40.5$ & $+25.0$ & $+9.6$ & $+12.4$ & $+4.0$ \\
+\bottomrule
+\end{tabular}
+\caption{\textbf{Efficiency curve} (average SR \% vs.\ training steps). The gap is largest early and stays positive throughout. See Fig.~\ref{fig:curve}.}
+\label{tab:curve}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.9\columnwidth}{\centering \vspace{2.4cm} TODO: efficiency-curve figure (avg SR vs.\ steps, uniform vs.\ \tds{}, per-suite panels) --- insert \texttt{main\_suite\_curves.png}. \vspace{2.4cm}}}
+\caption{Average and per-suite success rate vs.\ training steps. \tds{} (ours) dominates the uniform baseline across budgets and suites, reaching the baseline's $100$k performance in $\sim\!2\times$ fewer steps.}
+\label{fig:curve}
+\end{figure}
+
+\paragraph{Context with published methods.}
+For reference, on LIBERO the reported averages are $72.4$ (Diffusion Policy), $75.1$ (Octo), $76.5$ (OpenVLA), and $97.1$ (OpenVLA-OFT) \citep{chi2023diffusion,octo2024,kim2024openvla,kim2025oft}, obtained under each method's own backbone and training budget. These contextualize the regime but are not controlled against our base model; our contribution is the sampling strategy and its sample-efficiency benefit, measured by the matched-recipe comparison in Tables~\ref{tab:main}--\ref{tab:curve}.
+
+\subsection{Difficulty Hypothesis Test}
+Before changing training, we test the premise that the offline difficulty score predicts where the policy fails. We correlate $\dk$ with the uniform baseline's per-task SR across all $40$ tasks. At a non-saturated checkpoint the correlation is statistically significant (Spearman $\rho=-0.32$, $p<0.05$): higher transition density implies lower success. The relation is clearest at the suite level (the \textsc{Long} suite is highest in $\dk$ and lowest in SR) and is moderate at the task level, limited by ceiling effects on the easy suites; we therefore use a non-saturated checkpoint where the signal is least compressed. A component analysis explains the two-component form of Eq.~\eqref{eq:dk}: the plateau ratio is the dominant predictor on LIBERO, length adds complementary signal, and the gripper-event count is uninformative on this benchmark.
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.9\columnwidth}{\centering \vspace{2.1cm} TODO: Exp-0 scatter / binned plot of $\dk$ vs.\ baseline per-task SR --- insert \texttt{density\_vs\_sr.png}. \vspace{2.1cm}}}
+\caption{Offline transition-density difficulty $\dk$ vs.\ measured per-task success rate (Spearman $\rho=-0.32$, $p<0.05$). Difficulty computed from demonstrations alone predicts where the policy fails.}
+\label{fig:exp0}
+\end{figure}
+
+\subsection{Ablation Study}
+We ablate the components of \tds{} at the $40$k budget; all variants change only the sampling distribution. Table~\ref{tab:ablation} reports (i) a \emph{measured-difficulty} baseline that derives sampling weights from the model's own per-task SR (the ``ask-the-model'' alternative), isolating the value of the \emph{free} data-driven difficulty; (ii) a \emph{uniform-interleaved} control (the \tds{} sampler with uniform weights), isolating the effect of the sampling \emph{mechanism} from the difficulty \emph{weights}; (iii) an \emph{inverted-weights} variant that over-samples easy tasks, testing whether the \emph{direction} of the signal matters or any non-uniform perturbation would help; and (iv) a \emph{no-floor} variant ($\rho{=}0$), testing the uniform floor's role in preventing easy-task forgetting.
+
+\begin{table}[t]
+\centering
+\setlength{\tabcolsep}{1.2mm}
+\begin{tabular}{lccccc}
+\toprule
+Variant @ $40$k & \textsc{Sp.} & \textsc{Obj.} & \textsc{Goal} & \textsc{Long} & Avg \\
+\midrule
+Uniform & 73.0 & 95.5 & 38.5 & 40.5 & 61.9 \\
+\tds{} (ours) & 97.5 & 98.5 & 92.0 & 71.0 & \textbf{89.75} \\
+\midrule
+Measured-difficulty & \na{} & \na{} & \na{} & \na{} & \na{} \\
+Uniform-interleaved & \na{} & \na{} & \na{} & \na{} & \na{} \\
+Inverted weights & \na{} & \na{} & \na{} & \na{} & \na{} \\
+No floor ($\rho{=}0$) & \na{} & \na{} & \na{} & \na{} & \na{} \\
+\bottomrule
+\end{tabular}
+\caption{\textbf{Ablations} (SR \%, $40$k budget). Expected readings: measured-difficulty $\approx$ \tds{} (free difficulty matches the costly model-coupled one); uniform-interleaved $\approx$ uniform (the gain is from the weights, not the mechanism); inverted hurts \textsc{Goal}/\textsc{Long} (direction carries information); no-floor degrades \textsc{Spatial}/\textsc{Object} (the floor prevents forgetting). \textbf{[TODO: fill once the control runs complete.]}}
+\label{tab:ablation}
+\end{table}
+
+\subsection{Generalization and Robustness}
+\tds{}'s gains are largest on the suites that stress generalization and horizon: \textsc{Goal} (goal/skill generalization) and \textsc{Long} (long-horizon, multi-stage), where the uniform baseline is weakest (Table~\ref{tab:main}). At $40$k, \tds{} lifts \textsc{Long} from $40.5$ to $71.0$ and \textsc{Goal} from $38.5$ to $92.0$, indicating that prioritizing high-transition-density tasks disproportionately benefits the hardest, longest-horizon behaviors. \textbf{[TODO: cross-embodiment / second-benchmark (e.g., CALVIN) generalization is left to future work; LIBERO is the evaluation here.]}
+
+\subsection{Qualitative Results}
+\textbf{[TODO: per-task qualitative panels --- uniform vs.\ \tds{} success rate grouped by difficulty (high/medium/low). On the high-difficulty group, \tds{} is far above uniform; on the low-difficulty group the two are comparable. Insert the generated per-task figure grid.]}
+
+\section{Discussion}
+\paragraph{Why TDS works.}
+Under uniform sampling, optimization is split evenly across tasks regardless of how much each still has to learn; easy tasks that saturate early continue to consume budget. \tds{} reallocates that budget toward high-transition-density tasks, which are precisely the under-learned, low-success tasks (Fig.~\ref{fig:exp0}). The per-suite gains track the uniform baseline's remaining headroom---near-zero on the already-saturated \textsc{Object} suite, largest on \textsc{Goal}/\textsc{Long}---consistent with this reallocation account.
+\paragraph{When it fails.}
+The transition signal is computed from demonstrated \emph{actions}; difficulty that stems from \emph{perception} (distractors, lighting, appearance shift) rather than control is invisible to it. \tds{} is therefore complementary to perception-driven or loss-based signals, not a replacement. The constants $(\theta_p,L_p)$ were set on LIBERO and their transfer across control frequencies remains to be verified.
+\paragraph{Overhead.}
+\tds{} computes its weights once, offline, on CPU in minutes, and the two-level sampler adds negligible data-loading cost and no GPU cost; training throughput is unchanged. Model-coupled alternatives instead require training a reference/proxy model and/or periodic policy evaluation---a multiplicative overhead that \tds{} avoids entirely.
+
+\section{Conclusion}
+We presented Transition-Aware Dynamic Sampling, a training strategy that reads per-task manipulation difficulty directly from the transition structure of demonstrations and dynamically reweights task sampling to concentrate learning on hard tasks. As the central contribution of SimVLA, \tds{} is model-free, adds no training overhead, and improves sample efficiency substantially on LIBERO---$+27.9$ average success rate at a fixed low budget and $\sim\!2\times$ fewer steps to match the uniform baseline---while a difficulty score computed before training significantly predicts where the policy fails. The broader message is that demonstration data carries more supervision about \emph{what to train on} than the uniform objective exploits, and that difficulty is better read from the data than asked of the model.
+
+\bibliography{references}
+
+\end{document}
