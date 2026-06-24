@@ -203,8 +203,10 @@ difficulty *weights*. Evaluated on **both** machines (20 trials/task):
 | TDS | 97.0 | 99.5 | 87.0 | 64.0 | **86.9** | yyk |
 | TDS | 97.5 | 98.5 | 92.0 | 71.0 | **89.75** | sapi |
 
-> ⚠️ sapi flat counts to confirm: percentages 97.0/96.0/85.5/70.5 imply
-> 194/192/171/141 of 200 (user paste had stale yyk fraction lines 190/187/167/135).
+> ✓ Confirmed: sapi eval served `runs/exp_uniform_interleaved/ckpt-40000`, a run
+> trained with `task_difficulty_flat.csv` (flat p_k) — definitely the flat control,
+> not empirical. Percentages are authoritative (97.0/96.0/85.5/70.5 = 194/192/171/141
+> of 200; the paste's fraction lines were stale yyk leftovers).
 
 **CLEAN same-machine (sapi) decomposition — the headline +27.9 is mostly the
 mechanism, not the density weighting:**
