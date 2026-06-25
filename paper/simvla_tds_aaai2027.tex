@@ -239,29 +239,33 @@ Before changing training, we test the premise that the offline difficulty score 
 \end{figure}
 
 \subsection{Ablation Study}
-We ablate the components of \tds{} at the $40$k budget; all variants change only the sampling distribution. Table~\ref{tab:ablation} reports (i) a \emph{measured-difficulty} baseline that derives sampling weights from the model's own per-task SR (the ``ask-the-model'' alternative), isolating the value of the \emph{free} data-driven difficulty; (ii) a \emph{uniform-interleaved} control (the \tds{} sampler with uniform weights), isolating the effect of the sampling \emph{mechanism} from the difficulty \emph{weights}; (iii) an \emph{inverted-weights} variant that over-samples easy tasks, testing whether the \emph{direction} of the signal matters or any non-uniform perturbation would help; and (iv) a \emph{no-floor} variant ($\rho{=}0$), testing the uniform floor's role in preventing easy-task forgetting.
+We ablate the components of \tds{} at the $40$k budget; all variants change only the sampling distribution. Table~\ref{tab:ablation} reports (i) a \emph{measured-difficulty} baseline that derives sampling weights from the model's own per-task SR (the ``ask-the-model'' alternative), isolating the value of the \emph{free} data-driven difficulty; (ii) a \emph{uniform-interleaved} control (the \tds{} sampler with uniform weights), isolating the effect of the sampling \emph{mechanism} from the difficulty \emph{weights}; (iii) an \emph{inverted-weights} variant that over-samples easy tasks, testing whether the \emph{direction} of the signal matters or any non-uniform perturbation would help; and (iv) a \emph{no-floor} variant ($\rho{=}0$), testing the uniform floor's role in preventing easy-task forgetting. We report (i) and (ii) here; (iii) and (iv) are included in the final version.
 
 \begin{table}[t]
 \centering
 \setlength{\tabcolsep}{1.2mm}
-\begin{tabular}{lccccc}
+\begin{tabular}{llccccc}
 \toprule
-Variant @ $40$k & \textsc{Sp.} & \textsc{Obj.} & \textsc{Goal} & \textsc{Long} & Avg \\
+Variant @ $40$k & M. & \textsc{Sp.} & \textsc{Obj.} & \textsc{Goal} & \textsc{Long} & Avg \\
 \midrule
-Uniform & 73.0 & 95.5 & 38.5 & 40.5 & 61.9 \\
-\tds{} (ours) & 97.5 & 98.5 & 92.0 & 71.0 & \textbf{89.75} \\
+\multicolumn{7}{l}{\emph{(a) Mechanism vs.\ weights --- machine A}}\\
+Uniform & A & 73.0 & 95.5 & 38.5 & 40.5 & 61.9 \\
+Uniform-interleaved & A & 97.0 & 96.0 & 85.5 & 70.5 & 87.25 \\
+\tds{} (ours) & A & 97.5 & 98.5 & 92.0 & 71.0 & \textbf{89.75} \\
 \midrule
-Measured-difficulty & \na{} & \na{} & \na{} & \na{} & \na{} \\
-Uniform-interleaved & 97.0 & 96.0 & 85.5 & 70.5 & 87.25 \\
-Inverted weights & \na{} & \na{} & \na{} & \na{} & \na{} \\
-No floor ($\rho{=}0$) & \na{} & \na{} & \na{} & \na{} & \na{} \\
+\multicolumn{7}{l}{\emph{(b) Free vs.\ oracle difficulty --- machine B}}\\
+Uniform-interleaved & B & 95.0 & 93.5 & 83.5 & 67.5 & 84.9 \\
+\tds{} (ours) & B & 97.0 & 99.5 & 87.0 & 64.0 & 86.9 \\
+Measured-difficulty & B & 94.0 & 98.0 & 90.0 & 69.5 & 87.9 \\
 \bottomrule
 \end{tabular}
-\caption{\textbf{Ablations} (SR \%, $40$k budget, all same-machine). The \emph{uniform-interleaved} control (our two-level sampler with flat weights) decomposes the headline gain: it already reaches $87.25$, so the bulk of the improvement over naive uniform ($61.9$) comes from the sampler's fine-grained batch decorrelation rather than from the difficulty weights. The transition-density weighting itself adds a further $+2.5$ on average (uniform-interleaved $87.25$ vs.\ \tds{} $89.75$), concentrated on the up-weighted \textsc{Goal} suite ($+6.5$). \textbf{[TODO: measured-difficulty / inverted / no-floor rows; $\ge 2$ seeds to tighten the $+2.5$, which is near the $20$-trial noise floor.]}}
+\caption{\textbf{Ablations} (SR \%, $40$k budget; ``M.''\ is the evaluation machine, comparisons are within-block / same-machine). \emph{Block (a):} the \emph{uniform-interleaved} control (our two-level sampler with flat weights) decomposes the headline gain --- it already reaches $87.25$, so the bulk of the improvement over naive uniform ($61.9$) comes from the sampler's fine-grained batch decorrelation, while the transition-density weighting adds a further $+2.5$ on average (concentrated on the up-weighted \textsc{Goal} suite, $+6.5$). \emph{Block (b):} replacing the free transition-density difficulty with an \emph{oracle} measured difficulty (sampling weights from the model's own per-task SR) gains only $+1.0$ over \tds{} ($87.9$ vs.\ $86.9$), i.e.\ the free, model-free signal recovers nearly all of the costly one; both improve over flat by only $+2$--$3$, so the difficulty-weighting ceiling on LIBERO is modest. The $\sim\!3$\,pt A--B offset (flat $87.25$ vs.\ $84.9$; \tds{} $89.75$ vs.\ $86.9$) is consistent across rows. \textbf{[TODO: inverted-weights and no-floor rows; eval measured-difficulty on machine A to unify; $\ge 2$ seeds to tighten the $+2.5$, near the $20$-trial noise floor.]}}
 \label{tab:ablation}
 \end{table}
 
 \paragraph{Decomposing the gain.} The uniform-interleaved control is the most informative ablation: it shows that the headline improvement over the naive uniform baseline has two distinct sources. First, a \emph{mechanism} effect---replacing per-suite episode streaming with fine-grained per-episode interleaving decorrelates the training batch (from $\sim\!4$ to $\sim\!64$ distinct episodes per batch of $64$) and accounts for the majority of the gain ($61.9\!\rightarrow\!87.25$, $+25.4$ same-machine), with the largest lift on the hard suites that the coarse sampler under-mixed (\textsc{Goal} $+47$, \textsc{Long} $+30$). Second, the \emph{transition-density weighting} adds a smaller, targeted increment on top of the well-mixed sampler ($87.25\!\rightarrow\!89.75$, $+2.5$ on average, $+6.5$ on the up-weighted \textsc{Goal} suite). We report this decomposition transparently: the practical recommendation is the full pipeline (interleaving $+$ density weighting), but the novel, model-free component---transition-density reweighting---should be credited with the incremental gain over a properly-mixed uniform baseline, not the full margin over the naive one. \textbf{[TODO: $\ge 2$ seeds to confirm the $+2.5$ weighting effect, which is currently near the $20$-trial noise floor.]}
+
+\paragraph{Free difficulty vs.\ the oracle.} The central claim of \tds{} is that difficulty can be read off the demonstrations \emph{without} a model. Block (b) of Table~\ref{tab:ablation} tests this directly by swapping our free transition-density weights for an \emph{oracle}: sampling weights derived from the trained model's own measured per-task success rate (the ``ask-the-model'' upper bound, which costs a full train-then-evaluate cycle). On the same machine, the oracle reaches $87.9$ versus \tds{}'s $86.9$---a gap of only $+1.0$, within the $20$-trial standard error. The free, offline transition-density signal thus recovers essentially all of the benefit of the expensive measured difficulty, validating the core premise that the cost of difficulty estimation can be eliminated. Notably both lie only $+2$--$3$ above the well-mixed flat sampler, so on LIBERO the headroom for \emph{any} difficulty weighting is small once batch mixing is fixed; \tds{} captures that headroom at zero additional cost.
 
 \subsection{Generalization and Robustness}
 \tds{}'s gains are largest on the suites that stress generalization and horizon: \textsc{Goal} (goal/skill generalization) and \textsc{Long} (long-horizon, multi-stage), where the uniform baseline is weakest (Table~\ref{tab:main}). At $40$k, \tds{} lifts \textsc{Long} from $40.5$ to $71.0$ and \textsc{Goal} from $38.5$ to $92.0$, indicating that prioritizing high-transition-density tasks disproportionately benefits the hardest, longest-horizon behaviors. \textbf{[TODO: cross-embodiment / second-benchmark (e.g., CALVIN) generalization is left to future work; LIBERO is the evaluation here.]}

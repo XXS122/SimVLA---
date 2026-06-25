@@ -242,25 +242,51 @@ Do not finalize framing until exp_empirical lands and ≥2 seeds confirm the +2.
 ### 7e. Measured-difficulty baseline (exp_empirical) — TRAINED, eval pending
 
 `exp_empirical` (difficulty = −SR from the uniform baseline's measured per-task
-success → sampling weights) finished training at **ckpt-40000**
-(`runs/exp_empirical/ckpt-40000`, loss_total 0.174). **Not yet evaluated.** This
-is the "ask-the-model" oracle control: if free transition-density difficulty
-≈ measured difficulty, the row should land near TDS. Evaluate next (same machine
-as the flat/TDS comparison for a clean read).
+success → sampling weights) trained at **ckpt-40000** (`runs/exp_empirical/
+ckpt-40000`, loss_total 0.174, weights `task_difficulty_empirical.csv`). This is
+the "ask-the-model" oracle control: if free transition-density difficulty
+≈ measured difficulty, the row lands near TDS.
+
+**Evaluated on yyk** (20 trials/task) — clean same-machine triple (all yyk):
+
+| @40k (yyk) | Spatial | Object | Goal | Long | **Avg** |
+|---|---|---|---|---|---|
+| flat (interleaved) | 95.0 | 93.5 | 83.5 | 67.5 | **84.9** |
+| TDS (free difficulty) | 97.0 | 99.5 | 87.0 | 64.0 | **86.9** |
+| **empirical (oracle difficulty)** | 94.0 | 98.0 | 90.0 | 69.5 | **87.9** |
+
+**Reading — free ≈ oracle (the best outcome):**
+- Difficulty weighting over flat: TDS **+2.0**, empirical **+3.0**.
+- **empirical beats TDS by only +1.0** (87.9 vs 86.9, within 20-trial noise) → the
+  *free* transition-density difficulty recovers nearly all of the *costly* measured
+  (oracle) difficulty's benefit. No model training/eval needed — the headline TDS
+  selling point.
+- Both beat flat by only +2–3 → the difficulty-weighting *ceiling* on LIBERO is
+  ~+3 once mixing is fixed; TDS captures +2 of that for free.
+- Per suite, empirical is stronger on the hard suites (Goal +3.0, Long +5.5 vs TDS)
+  and slightly weaker on the easy ones (Sp −3.0, Obj −1.5) — measured difficulty
+  weights the lowest-SR suites (Goal/Long) hardest.
+
+**⚠️ Machine:** empirical is yyk-native; the main ablation table is sapi. The
+free-vs-oracle conclusion is clean *within yyk*. For a unified sapi table, eval
+empirical on sapi too (offset-correcting yyk 87.9 + ~3 → ~90.8, i.e. just above
+sapi TDS 89.75 — consistent).
 
 ---
 
 ## 8. Pending / next
 
 - [x] Evaluate **tds/ckpt-40000** → +27.9 same-machine (§7).
+- [x] Evaluate **exp_empirical** → free ≈ oracle (empirical +1.0 over TDS, yyk) (§7e).
 - [x] Fill efficiency curve: both runs at 20k/40k/60k/80k/100k (§7c).
 - [x] Uniform-interleaved control (flat40k) evaluated → decomposition (§7d).
 - [x] **Evaluate flat (uniform-interleaved) on sapi** → clean same-machine
       decomposition: mechanism +25.4, density weighting +2.5 (Goal +6.5) (§7d).
-- [ ] **🔴 Evaluate exp_empirical/ckpt-40000** (measured-difficulty oracle, §7e).
+- [ ] (optional) eval exp_empirical on **sapi** to unify the ablation table
+      (conclusion already clean within yyk: free ≈ oracle, §7e).
 - [ ] inverted-weights + no-floor (ρ=0) controls at 40k (just different csv).
 - [ ] ≥2–3 seeds for the +2 density-weighting effect (it sits near eval noise).
-- [ ] Decide paper framing (§7d A vs B) once same-machine flat + empirical land.
+- [ ] Decide paper framing (§7d A vs B) — all controls now in; free ≈ oracle.
 - [ ] Optional: re-check Exp 0 at 20k (more spread, may strengthen ρ).
 - [ ] 340k (adaptive-chunking) = 98% saved as the "large-budget upper bound,
       method does not hurt" row.
