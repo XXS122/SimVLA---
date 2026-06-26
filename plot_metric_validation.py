@@ -88,7 +88,7 @@ def main():
     ap.add_argument("--sort_by", choices=["uniform_sr", "d_k"], default="uniform_sr",
                     help="how to bucket difficulty (default: independent measured SR)")
     ap.add_argument("--metrics", nargs="+",
-                    default=["E_events", "P_plateau", "L_length"])
+                    default=["P_plateau", "L_length"])
     ap.add_argument("--outdir", default="figures_metrics")
     args = ap.parse_args()
 

@@ -184,10 +184,9 @@ def main():
                Line2D([0], [0], color="grey", ls=":", label="plateau threshold")]
     ax_e.legend(handles=handles, fontsize=7, frameon=False, loc="lower left")
 
-    axes2 = [fig.add_subplot(gs[1, 0:2]), fig.add_subplot(gs[1, 2:4]),
-             fig.add_subplot(gs[1, 4:6])]
+    axes2 = [fig.add_subplot(gs[1, 0:3]), fig.add_subplot(gs[1, 3:6])]
     x = np.arange(len(LEVELS))
-    for ax, col in zip(axes2, ["E_events", "P_plateau", "L_length"]):
+    for ax, col in zip(axes2, ["P_plateau", "L_length"]):
         color, name, unit = METRIC_STYLE[col]
         mean, sem = bars[col]
         ax.bar(x, mean, yerr=sem, capsize=4, color=color, edgecolor="black",
