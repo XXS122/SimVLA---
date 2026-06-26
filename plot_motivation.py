@@ -140,10 +140,12 @@ def bar_data_from_csv(difficulty, uniform_sr):
 
 
 def synth_bars():
+    # mirrors the user's real run (gripper flat/non-monotonic, plateau weak,
+    # length clearest) -- a faithful preview, not an idealised one.
     return {
-        "E_events":  (np.array([7.8, 7.6, 7.5]), np.array([0.5, 0.5, 0.4])),
-        "P_plateau": (np.array([0.30, 0.21, 0.13]), np.array([0.02, 0.02, 0.015])),
-        "L_length":  (np.array([201, 177, 152]), np.array([6, 6, 4])),
+        "E_events":  (np.array([2.2, 2.6, 2.3]), np.array([0.38, 0.30, 0.18])),
+        "P_plateau": (np.array([0.50, 0.46, 0.43]), np.array([0.03, 0.025, 0.015])),
+        "L_length":  (np.array([200, 165, 145]), np.array([26, 20, 12])),
     }
 
 
@@ -175,9 +177,8 @@ def main():
          f"{len(detect_plateaus(ce))} plateau(s), len={len(ce)}"
     nh = f"{len(gripper_events(gh))} gripper events\n" \
          f"{len(detect_plateaus(ch))} plateaus, len={len(ch)}"
-    xmax = max(len(ce), len(ch))
-    plot_trace(ax_e, ce, ge, "Easy task (high success rate)", EASY_C, ne, xmax)
-    plot_trace(ax_h, ch, gh, "Hard task (low success rate)", HARD_C, nh, xmax)
+    plot_trace(ax_e, ce, ge, "Easy task (high success rate)", EASY_C, ne)
+    plot_trace(ax_h, ch, gh, "Hard task (low success rate)", HARD_C, nh)
     handles = [Patch(fc=PLAT_C, ec="0.7", label="low-speed plateau"),
                Line2D([0], [0], color=EVT_C, ls="--", label="gripper event"),
                Line2D([0], [0], color="grey", ls=":", label="plateau threshold")]
