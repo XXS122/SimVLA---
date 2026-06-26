@@ -81,8 +81,6 @@ def plot_trace(ax, c, g, title, color, note, xmax=None):
         ax.axvspan(a, b, color=PLAT_C, alpha=0.35, zorder=0)
     ax.plot(t, c, color=color, lw=1.4, zorder=3)
     ax.axhline(PLATEAU_THRESH, ls=":", color="grey", lw=0.8, zorder=1)
-    for e in gripper_events(g):
-        ax.axvline(e, color=EVT_C, lw=1.0, ls="--", alpha=0.7, zorder=2)
     # shared time axis: a short demo visibly stops early, making the length
     # contrast (the signal that actually separates easy/hard on LIBERO) the
     # dominant read.
@@ -173,14 +171,11 @@ def main():
 
     ax_e = fig.add_subplot(gs[0, 0:3])
     ax_h = fig.add_subplot(gs[0, 3:6])
-    ne = f"{len(gripper_events(ge))} gripper events\n" \
-         f"{len(detect_plateaus(ce))} plateau(s), len={len(ce)}"
-    nh = f"{len(gripper_events(gh))} gripper events\n" \
-         f"{len(detect_plateaus(ch))} plateaus, len={len(ch)}"
+    ne = f"{len(detect_plateaus(ce))} plateau(s), len={len(ce)}"
+    nh = f"{len(detect_plateaus(ch))} plateaus, len={len(ch)}"
     plot_trace(ax_e, ce, ge, "Easy task (high success rate)", EASY_C, ne)
     plot_trace(ax_h, ch, gh, "Hard task (low success rate)", HARD_C, nh)
     handles = [Patch(fc=PLAT_C, ec="0.7", label="low-speed plateau"),
-               Line2D([0], [0], color=EVT_C, ls="--", label="gripper event"),
                Line2D([0], [0], color="grey", ls=":", label="plateau threshold")]
     ax_e.legend(handles=handles, fontsize=7, frameon=False, loc="lower left")
 
