@@ -143,6 +143,7 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
         image1 = observation.get("observation/wrist_image")
         state = observation.get("observation/state", np.zeros(8))
         prompt = observation.get("prompt", "")
+        num_uncertainty_samples = int(observation.get("num_uncertainty_samples", 0) or 0)
         
         # Decode msgpack_numpy format if needed
         image0 = decode_numpy(image0)
@@ -174,6 +175,27 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
         proprio_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
         
         # Inference
+        if num_uncertainty_samples > 1:
+            with torch.no_grad():
+                result = model.generate_actions_with_uncertainty(
+                    input_ids=lang['input_ids'],
+                    image_input=images,
+                    image_mask=image_mask,
+                    proprio=proprio_tensor,
+                    steps=CONFIG["action_horizon"],
+                    num_samples=num_uncertainty_samples,
+                )
+
+            actions = result["actions"].cpu().numpy()[0]
+            uncertainty = result["continuous_uncertainty"].cpu().numpy()[0]
+            gripper_disagreement = result["gripper_disagreement"].cpu().numpy()[0]
+
+            return {
+                "actions": actions,
+                "uncertainty": uncertainty,
+                "gripper_disagreement": gripper_disagreement,
+            }
+
         with torch.no_grad():
             actions = model.generate_actions(
                 input_ids=lang['input_ids'],
@@ -182,9 +204,9 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
                 proprio=proprio_tensor,
                 steps=CONFIG["action_horizon"],
             )
-        
+
         actions = actions.cpu().numpy()[0]
-        
+
         return {"actions": actions}
         
     except Exception as e:
@@ -228,8 +250,15 @@ async def handle_connection(websocket, path=None):
                 actions = result["actions"]
                 if isinstance(actions, np.ndarray):
                     actions = actions.tolist()
-                
+
                 response_data = {"actions": actions}
+
+                for key in ("uncertainty", "gripper_disagreement"):
+                    if key in result:
+                        value = result[key]
+                        if isinstance(value, np.ndarray):
+                            value = value.tolist()
+                        response_data[key] = value
                 
                 if HAS_MSGPACK:
                     import msgpack

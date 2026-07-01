@@ -485,8 +485,112 @@ class SmolVLMVLA(PreTrainedModel):
         
             x_t = x_t + dt * v_t
             t = t + dt
-        
+
         return self.action_space.postprocess(x_t)
+
+    @torch.no_grad()
+    def generate_actions_with_uncertainty(
+        self,
+        input_ids: torch.LongTensor,
+        image_input: torch.FloatTensor,
+        image_mask: torch.Tensor,
+        proprio: torch.Tensor,
+        steps: int = 10,
+        num_samples: int = 8,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Flow-matching inference with a sampling-variance uncertainty signal.
+
+        Draws `num_samples` independent noise seeds through the same Euler
+        integration as `generate_actions`, reusing a single VLM encoding
+        pass -- extra samples only multiply the cost of the (cheap) action
+        transformer, not the vision-language backbone. The spread across
+        samples is a per-step uncertainty proxy: high variance means the
+        model isn't converging to a consistent action for this observation,
+        which is a candidate failure-warning signal (unrelated to the
+        change-rate target the ChunkBoundaryHead regresses at train time).
+
+        Returns
+        -------
+        dict with:
+          actions               : [B, T, D] postprocessed actions (sample 0)
+          continuous_uncertainty: [B, T] per-step std across samples,
+                                   L2-normed over the non-gripper action
+                                   dims (same convention as
+                                   transition_density_stats.py's
+                                   per_dim_normalized_change_rate, which
+                                   also excludes the gripper dim)
+          gripper_disagreement  : [B, T] fraction of samples whose gripper
+                                   sign disagrees with the per-step majority
+        """
+        self.eval()
+        enc = self.forward_vlm_efficient(image_input, image_mask, input_ids)
+
+        B = input_ids.shape[0]
+        D = self.action_space.dim_action
+        K = max(1, int(num_samples))
+        device = proprio.device
+        dtype = proprio.dtype
+
+        # Normalize proprio
+        if hasattr(self.action_space, 'normalize_state'):
+            proprio_norm = self.action_space.normalize_state(proprio)
+        elif hasattr(self.action_space, 'normalize'):
+            proprio_norm = self.action_space.normalize(proprio)
+        else:
+            proprio_norm = proprio
+
+        # Expand batch B -> B*K, repeating the already-computed VLM features
+        # / proprio so only the action transformer pays the K-times cost.
+        vlm_features_k = enc["vlm_features"].repeat_interleave(K, dim=0)
+        proprio_norm_k = proprio_norm.repeat_interleave(K, dim=0)
+
+        # Euler integration (identical schedule to generate_actions)
+        steps = max(1, int(steps))
+        dt = -1.0 / steps
+
+        x_t = torch.randn(B * K, self.num_actions, D, device=device, dtype=dtype)
+        t = 1.0
+
+        while t > -dt / 2:
+            t_tensor = torch.full((B * K,), t, device=device, dtype=dtype)
+
+            v_t = self.transformer(
+                vlm_features=vlm_features_k,
+                action_with_noise=x_t,
+                proprio=proprio_norm_k,
+                t=t_tensor,
+            )
+
+            x_t = x_t + dt * v_t
+            t = t + dt
+
+        x_t = x_t.view(B, K, self.num_actions, D)
+
+        gripper_idx = list(getattr(self.action_space, "gripper_idx", ()))
+        non_gripper_idx = [d for d in range(D) if d not in gripper_idx]
+
+        if non_gripper_idx:
+            continuous = x_t[..., non_gripper_idx]                     # [B, K, T, D']
+            continuous_uncertainty = continuous.std(dim=1).norm(dim=-1)  # [B, T]
+        else:
+            continuous_uncertainty = torch.zeros(B, self.num_actions, device=device, dtype=dtype)
+
+        if gripper_idx:
+            gripper = x_t[..., gripper_idx].mean(dim=-1)               # [B, K, T]
+            gripper_sign = torch.sign(gripper)
+            majority = torch.sign(gripper_sign.sum(dim=1, keepdim=True))  # [B, 1, T]
+            gripper_disagreement = (gripper_sign != majority).float().mean(dim=1)  # [B, T]
+        else:
+            gripper_disagreement = torch.zeros(B, self.num_actions, device=device, dtype=dtype)
+
+        actions = self.action_space.postprocess(x_t[:, 0])             # [B, T, D]
+
+        return {
+            "actions": actions,
+            "continuous_uncertainty": continuous_uncertainty,
+            "gripper_disagreement": gripper_disagreement,
+        }
 
     # =============================== FastAPI service =============================
     def _build_app(self, processor):
