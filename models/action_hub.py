@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Iterable, Tuple, Dict, Type, Optional
 from pathlib import Path
 import json
+import os
 import torch
 import torch.nn as nn
 import numpy as np
@@ -272,6 +273,117 @@ class LiberoJointActionSpace(BaseActionSpace):
 
 
 # =============================================================================
+# Latent-action spaces (latent_action pipeline)
+# =============================================================================
+def _default_z_dim() -> int:
+    return int(os.environ.get("SIMVLA_Z_DIM", "16") or "16")
+
+
+@register_action("latent_z")
+class LatentZActionSpace(LiberoJointActionSpace):
+    """
+    Flow-matching pretraining space: the "action" chunk is a latent-action
+    chunk z produced by the LAM (latent_action/label_z.py).
+
+    z is whitened by the LAM's variance/covariance regularizer, so action
+    normalization is the identity. Proprio is still normalized with the
+    LIBERO state stats so it matches the downstream fine-tuning stage.
+    """
+
+    def __init__(
+        self,
+        norm_stats_path: Optional[str] = None,
+        use_quantile_norm: bool = False,
+        z_dim: Optional[int] = None,
+    ):
+        super().__init__(norm_stats_path=norm_stats_path,
+                         use_quantile_norm=use_quantile_norm)
+        self.dim_action = int(z_dim or _default_z_dim())
+        self.dim_proprio = 8
+        self.gripper_idx = ()
+
+    def normalize_action(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+    def unnormalize_action(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+    def postprocess(self, action: torch.Tensor) -> torch.Tensor:
+        return action
+
+
+@register_action("libero_z_adapter")
+class LiberoZAdapterActionSpace(LiberoJointActionSpace):
+    """
+    Downstream fine-tuning space: the flow expert keeps operating in the
+    pretrained z-space; real 7-dim actions are mapped in/out through a
+    frozen affine adapter initialized from the probe fit
+    (latent_action/probe.py), i.e. the "identifiable up to affine" claim
+    made executable:
+
+        encode  : z = A @ a_norm + b          (training targets)
+        decode  : a_norm = pinv(A) @ (z - b)  (inference postprocess)
+
+    A, b are nn.Parameters (saved/restored with the checkpoint) but frozen
+    by default; --train_adapter unfreezes them for the ablation.
+    """
+
+    def __init__(
+        self,
+        norm_stats_path: Optional[str] = None,
+        use_quantile_norm: bool = False,
+        z_dim: Optional[int] = None,
+        probe_path: Optional[str] = None,
+        trainable: bool = False,
+    ):
+        super().__init__(norm_stats_path=norm_stats_path,
+                         use_quantile_norm=use_quantile_norm)
+        zd = int(z_dim or _default_z_dim())
+        self.z_dim = zd
+        self.dim_action = zd          # the flow head generates in z-space
+        self.dim_proprio = 8
+        self.raw_action_dim = 7
+
+        A = torch.empty(zd, self.raw_action_dim)
+        nn.init.orthogonal_(A)
+        self.A = nn.Parameter(A, requires_grad=trainable)
+        self.b = nn.Parameter(torch.zeros(zd), requires_grad=trainable)
+
+        if probe_path:
+            self.load_probe(probe_path)
+
+    def load_probe(self, path: str):
+        probe = np.load(path)
+        A = torch.as_tensor(probe["A"], dtype=torch.float32)   # [z_dim, 7]
+        b = torch.as_tensor(probe["b"], dtype=torch.float32)   # [z_dim]
+        if A.shape != self.A.shape:
+            raise ValueError(
+                f"probe A shape {tuple(A.shape)} != adapter {tuple(self.A.shape)}; "
+                f"check SIMVLA_Z_DIM consistency across stages"
+            )
+        with torch.no_grad():
+            self.A.copy_(A)
+            self.b.copy_(b)
+        print(f"[LiberoZAdapter] loaded affine adapter from {path} "
+              f"(probe mean R^2 z->a: {float(np.mean(probe['r2_za'])):.4f})")
+
+    # a raw [.., 7] -> z [.., z_dim]
+    def normalize_action(self, x: torch.Tensor) -> torch.Tensor:
+        a_norm = super().normalize_action(x)
+        A = self.A.to(device=a_norm.device, dtype=a_norm.dtype)
+        b = self.b.to(device=a_norm.device, dtype=a_norm.dtype)
+        return a_norm @ A.t() + b
+
+    # z [.., z_dim] -> a raw [.., 7]
+    def postprocess(self, action: torch.Tensor) -> torch.Tensor:
+        A = self.A.to(device=action.device, dtype=torch.float32)
+        b = self.b.to(device=action.device, dtype=torch.float32)
+        z = action.to(torch.float32) - b
+        a_norm = z @ torch.linalg.pinv(A).t()
+        return super().unnormalize_action(a_norm).to(action.dtype)
+
+
+# =============================================================================
 # Exports
 # =============================================================================
 __all__ = [
@@ -279,6 +391,8 @@ __all__ = [
     "build_action_space",
     "register_action",
     "LiberoJointActionSpace",
+    "LatentZActionSpace",
+    "LiberoZAdapterActionSpace",
     "ACTION_REGISTRY",
     "NormStats",
     "load_norm_stats",

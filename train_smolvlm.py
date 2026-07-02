@@ -84,9 +84,10 @@ def get_args_parser():
     parser.add_argument("--output_dir", type=str, default="runnings_smolvlm", 
                         help="Directory to save checkpoints")
 
-    # SmolVLM backbone
-    parser.add_argument("--smolvlm_model_path", type=str, 
-                        default="HuggingFaceTB/SmolVLM-500M-Instruct",
+    # SmolVLM backbone (default from $SIMVLA_SMOLVLM_MODEL)
+    parser.add_argument("--smolvlm_model_path", type=str,
+                        default=os.environ.get("SIMVLA_SMOLVLM_MODEL",
+                                               "HuggingFaceTB/SmolVLM-500M-Instruct"),
                         help="Path or HF repo for SmolVLM backbone")
     
     # Data
@@ -137,6 +138,22 @@ def get_args_parser():
     # WandB
     parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--wandb_api_key", type=str, default=None)
+    parser.add_argument("--run_name", type=str, default=None,
+                        help="wandb run name")
+
+    # Latent-action pipeline (action_mode latent_z / libero_z_adapter)
+    parser.add_argument("--z_dim", type=int,
+                        default=int(os.environ.get("SIMVLA_Z_DIM", "16") or "16"),
+                        help="latent action dimension (latent_z / libero_z_adapter)")
+    parser.add_argument("--probe_path", type=str, default=None,
+                        help="probe .npz for affine adapter init (libero_z_adapter)")
+    parser.add_argument("--train_adapter", action="store_true", default=False,
+                        help="unfreeze the affine adapter (ablation only)")
+    parser.add_argument("--pretrained_flow_ckpt", type=str, default=None,
+                        help="load transformer (+VLM) weights from a pretraining "
+                             "checkpoint dir while rebuilding the action space")
+    parser.add_argument("--freeze_vlm", action="store_true", default=False,
+                        help="keep the VLM backbone frozen for the whole run")
     
     # Resume control
     parser.add_argument("--resume", action="store_true", default=False,
@@ -279,10 +296,11 @@ def main(args):
     }
     
     if use_wandb:
+        run_name = args.run_name or f"smolvlm-{time.strftime('%Y%m%d-%H%M%S')}"
         accelerator.init_trackers(
             project_name=wandb_project,
             config=tracker_config,
-            init_kwargs={"wandb": {"name": f"smolvlm-{time.strftime('%Y%m%d-%H%M%S')}"}}
+            init_kwargs={"wandb": {"name": run_name}}
         )
     else:
         accelerator.init_trackers("SmolVLM-VLA-Training", config=tracker_config)
@@ -303,7 +321,23 @@ def main(args):
     if args.norm_stats_path:
         action_space_kwargs["norm_stats_path"] = args.norm_stats_path
         logger.info(f"Using normalization stats from: {args.norm_stats_path}")
-    
+
+    # Latent-action pipeline: keep SIMVLA_Z_DIM consistent for action space
+    # construction (including inside SmolVLMVLA.__init__/from_pretrained).
+    if args.action_mode in ("latent_z", "libero_z_adapter"):
+        os.environ["SIMVLA_Z_DIM"] = str(args.z_dim)
+        action_space_kwargs["z_dim"] = args.z_dim
+    if args.action_mode == "libero_z_adapter":
+        if args.probe_path:
+            action_space_kwargs["probe_path"] = args.probe_path
+            logger.info(f"Adapter init from probe: {args.probe_path}")
+        if args.train_adapter:
+            action_space_kwargs["trainable"] = True
+
+    if args.freeze_vlm:
+        logger.info("VLM backbone frozen for the whole run (--freeze_vlm)")
+        args.learning_coef = 0.0
+
     load_path = args.models
     
     if load_path and os.path.isdir(load_path) and os.path.exists(os.path.join(load_path, "model.safetensors")):
@@ -343,10 +377,25 @@ def main(args):
             image_size=args.image_size,
         )
         model = SmolVLMVLA(config)
-        
+
         if action_space_kwargs:
             model.action_space = build_action_space(args.action_mode, **action_space_kwargs)
-    
+
+    # Warm-start from a flow pretraining checkpoint (latent_action pipeline):
+    # loads VLM + action transformer weights, keeps the freshly built action
+    # space (adapter comes from the probe, not the checkpoint).
+    if args.pretrained_flow_ckpt:
+        from safetensors.torch import load_file
+        st_path = os.path.join(args.pretrained_flow_ckpt, "model.safetensors")
+        state = load_file(st_path)
+        state = {k: v for k, v in state.items() if not k.startswith("action_space.")}
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        missing = [k for k in missing if not k.startswith("action_space.")]
+        logger.info(f"Loaded pretrained flow weights from {st_path} "
+                    f"(missing={len(missing)}, unexpected={len(unexpected)})")
+        if missing:
+            logger.warning(f"Missing (non-adapter) keys: {missing[:8]}...")
+
     # Build processor
     processor = SmolVLMVLAProcessor.from_pretrained(args.smolvlm_model_path)
 

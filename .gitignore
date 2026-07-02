@@ -1,0 +1,19 @@
+# local environment / secrets
+paths.env
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# training artifacts
+runs/
+wandb/
+*.pt
+*.safetensors
+*.log
+
+# data artifacts
+datasets/metas/*.json
+norm_stats/*.json
+z_labels*.h5

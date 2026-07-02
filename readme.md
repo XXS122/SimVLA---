@@ -69,6 +69,25 @@ cd evaluation/libero
 
 <img width="506" height="1220" alt="image" src="https://github.com/user-attachments/assets/6ee1cd5e-42c5-4cf7-9cce-6dc04c1a215f" />
 
+## Latent-Action Research Pipeline
+
+This repo also contains a research pipeline for **identifiable continuous
+latent-action flow pretraining** (pretraining the flow-matching action expert
+on latent actions extracted from action-free video, then transferring through
+a probe-initialized frozen affine adapter). All stages are driven by one CLI
+and configured via environment variables:
+
+```bash
+cp paths.env.example paths.env   # edit your paths
+source paths.env
+./run_pipeline.sh meta && ./run_pipeline.sh norm-stats && ./run_pipeline.sh splits
+./run_pipeline.sh train-lam && ./run_pipeline.sh label && ./run_pipeline.sh probe
+./run_pipeline.sh pretrain && ./run_pipeline.sh finetune --split p1
+```
+
+See [latent_action/README.md](latent_action/README.md) for the full recipe,
+the go/no-go probe gate, and the paper artifact map.
+
 ## Model Architecture
 
 - **Vision-Language Backbone**: SmolVLM-500M-Instruct (576 hidden dim)

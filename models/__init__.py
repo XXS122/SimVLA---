@@ -15,6 +15,8 @@ from .action_hub import (
     build_action_space,
     register_action,
     LiberoJointActionSpace,
+    LatentZActionSpace,
+    LiberoZAdapterActionSpace,
     ACTION_REGISTRY,
 )
 
@@ -39,6 +41,8 @@ __all__ = [
     "build_action_space",
     "register_action",
     "LiberoJointActionSpace",
+    "LatentZActionSpace",
+    "LiberoZAdapterActionSpace",
     "ACTION_REGISTRY",
     # Transformer
     "SmolVLMActionTransformer",

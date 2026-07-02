@@ -95,16 +95,21 @@ class LiberoHDF5Handler(DomainHandler):
         self.data_dir = meta.get("data_dir", "")
         self.h5_files: List[str] = []
         self.task_names: List[str] = []
-        
+        self.demo_filters: List[Optional[set]] = []
+
         # Get HDF5 file list from datalist
         if "datalist" in meta:
             for item in meta["datalist"]:
                 if isinstance(item, dict):
                     self.h5_files.append(item["path"])
                     self.task_names.append(item.get("task", ""))
+                    # Optional low-data split: whitelist of demo keys
+                    demos = item.get("demos")
+                    self.demo_filters.append(set(demos) if demos is not None else None)
                 else:
                     self.h5_files.append(item)
                     self.task_names.append(self._parse_task_from_filename(item))
+                    self.demo_filters.append(None)
         
     def _parse_task_from_filename(self, filepath: str) -> str:
         """Parse task description from filename."""
@@ -153,6 +158,12 @@ class LiberoHDF5Handler(DomainHandler):
             
             # Get all demo keys and shuffle during training
             demo_keys = list(data_grp.keys())
+
+            # Apply low-data split filter if present (see latent_action/make_splits.py)
+            demo_filter = self.demo_filters[traj_idx] if traj_idx < len(self.demo_filters) else None
+            if demo_filter is not None:
+                demo_keys = [k for k in demo_keys if k in demo_filter]
+
             if training:
                 random.shuffle(demo_keys)
             
@@ -216,7 +227,10 @@ class LiberoHDF5Handler(DomainHandler):
         
         # Actions: [T, 7]
         actions = actions[:T].astype(np.float32)
-        
+
+        # Target sequence for chunking; subclasses may substitute latent actions
+        targets = self._load_targets(demo, actions)
+
         # Candidate indices
         indices = list(range(max(0, T - num_actions)))
         if training:
@@ -228,7 +242,7 @@ class LiberoHDF5Handler(DomainHandler):
         
         for idx in indices:
             # Get action chunk
-            action_chunk = self._get_action_chunk(actions, idx, num_actions)
+            action_chunk = self._get_action_chunk(targets, idx, num_actions)
             
             # Language augmentation
             instruction = task_instruction
@@ -266,6 +280,14 @@ class LiberoHDF5Handler(DomainHandler):
                 "abs_trajectory": torch.tensor(action_chunk, dtype=torch.float32),
             }
     
+    def _load_targets(self, demo: h5py.Group, actions: np.ndarray) -> np.ndarray:
+        """Return the target sequence used for action chunks.
+
+        Base class: the raw actions. Subclasses (e.g. LiberoZHandler) may
+        return per-step latent actions instead.
+        """
+        return actions
+
     def _get_action_chunk(
         self,
         actions: np.ndarray,

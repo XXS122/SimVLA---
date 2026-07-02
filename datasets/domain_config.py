@@ -8,6 +8,7 @@ DATA_WEIGHTS = {
     "libero_goal": 1.0,
     "libero_object": 1.0,
     "libero_spatial": 1.0,
+    "libero_z": 1.0,
 }
 
 DATA_DOMAIN_ID = {
@@ -19,4 +20,5 @@ DATA_DOMAIN_ID = {
     "libero_goal": 0,
     "libero_object": 0,
     "libero_spatial": 0,
+    "libero_z": 0,
 }
