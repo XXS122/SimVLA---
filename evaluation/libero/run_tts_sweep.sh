@@ -53,7 +53,8 @@ for S in $S_LIST; do
       continue
     fi
     echo ">> Running $TAG ..."
-    python -u libero_client.py \
+    LOG="$OUTDIR/log_${SUITE}_${TAG}.txt"
+    if python -u libero_client.py \
         --host 127.0.0.1 \
         --port "$PORT" \
         --client_type websocket \
@@ -64,8 +65,13 @@ for S in $S_LIST; do
         --ode_steps "$S" \
         --selector "$SELECTOR" \
         --log_results "$RESULTS" \
-        > "$OUTDIR/log_${SUITE}_${TAG}.txt" 2>&1
-    tail -1 "$OUTDIR/log_${SUITE}_${TAG}.txt"
+        > "$LOG" 2>&1; then
+        tail -1 "$LOG"
+    else
+        echo "!! FAILED: $TAG — last 30 lines of $LOG:"
+        tail -30 "$LOG"
+        exit 1
+    fi
   done
 done
 
