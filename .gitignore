@@ -11,3 +11,5 @@ eval_*.txt
 
 # WandB local cache
 wandb/
+*.mp4
+evaluation/libero/

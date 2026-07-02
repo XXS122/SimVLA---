@@ -101,7 +101,7 @@ export WANDB_MODE=offline      # or set WANDB_API_KEY in paths.env to log live
 
 # --- Phase 1 ---
 # Machine A — B0 control
-NUM_WORKERS=0 ITERS=100000 SAVE_INTERVAL=20000 \
+NUM_WORKERS=2 ITERS=100000 SAVE_INTERVAL=20000 \
   bash train_smolvlm_small.sh 64 0.1 ./runs/exp_uniform
 
 # Machine B — TDS only

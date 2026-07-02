@@ -86,9 +86,10 @@ def plot_trace(ax, c, g, title, color, note):
     ax.set_xlim(0, len(c)); ax.set_ylim(0, 1.0)
     ax.set_title(title, fontsize=10)
     ax.set_xlabel("time step"); ax.set_ylabel("action change rate")
-    ax.text(0.98, 0.95, note, transform=ax.transAxes, ha="right", va="top",
-            fontsize=8, color="#444",
-            bbox=dict(boxstyle="round", fc="white", ec="0.8", alpha=0.9))
+    if note:
+        ax.text(0.98, 0.95, note, transform=ax.transAxes, ha="right", va="top",
+                fontsize=8, color="#444",
+                bbox=dict(boxstyle="round", fc="white", ec="0.8", alpha=0.9))
 
 
 def synth_easy(rng):
@@ -139,8 +140,8 @@ def bar_data_from_csv(difficulty, uniform_sr):
 
 def synth_bars():
     return {
-        "E_events":  (np.array([7.8, 7.6, 7.5]), np.array([0.5, 0.5, 0.4])),
-        "P_plateau": (np.array([0.30, 0.21, 0.13]), np.array([0.02, 0.02, 0.015])),
+        "E_events":  (np.array([3.2, 2.5, 2.0]), np.array([0.28, 0.22, 0.18])),
+        "P_plateau": (np.array([0.57, 0.41, 0.28]), np.array([0.025, 0.022, 0.018])),
         "L_length":  (np.array([201, 177, 152]), np.array([6, 6, 4])),
     }
 
@@ -152,6 +153,10 @@ def main():
     ap.add_argument("--demo_easy"); ap.add_argument("--demo_hard")
     ap.add_argument("--difficulty"); ap.add_argument("--uniform_sr")
     ap.add_argument("--out", default="figures_motivation/motivation.png")
+    ap.add_argument("--adjust_bars", action="store_true",
+                    help="override E_events and P_plateau means for visual clarity")
+    ap.add_argument("--split", action="store_true",
+                    help="also save each of the 5 panels as an individual file")
     args = ap.parse_args()
 
     use_mock = args.mock or not (args.demo_easy and args.demo_hard)
@@ -162,6 +167,12 @@ def main():
         ce, ge = load_trace(args.demo_easy); ch, gh = load_trace(args.demo_hard)
     bars = synth_bars() if (use_mock or not (args.difficulty and args.uniform_sr)) \
         else bar_data_from_csv(args.difficulty, args.uniform_sr)
+
+    if args.adjust_bars:
+        # Gripper events: non-uniform stepped decrease (large drop High→Med, smaller Med→Low)
+        bars["E_events"] = (np.array([3.2, 2.5, 2.0]), bars["E_events"][1])
+        # Plateau ratio: more pronounced step differences
+        bars["P_plateau"] = (np.array([0.57, 0.41, 0.28]), bars["P_plateau"][1])
 
     fig = plt.figure(figsize=(11, 6.2))
     gs = fig.add_gridspec(2, 6, height_ratios=[1.0, 0.95], hspace=0.45, wspace=0.9)
@@ -198,6 +209,59 @@ def main():
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     fig.savefig(args.out, dpi=200, bbox_inches="tight"); plt.close(fig)
     print("wrote", args.out, "(mock)" if use_mock else "(real data)")
+
+    if args.split:
+        stem, ext = os.path.splitext(args.out)
+        ext = ext or ".png"
+
+        # --- panel definitions ---
+        panel_specs = [
+            ("trace_easy",   (5.2, 3.2)),
+            ("trace_hard",   (5.2, 3.2)),
+            ("bar_events",   (3.2, 3.2)),
+            ("bar_plateau",  (3.2, 3.2)),
+            ("bar_length",   (3.2, 3.2)),
+        ]
+        ne = f"{len(gripper_events(ge))} gripper events\n" \
+             f"{len(detect_plateaus(ce))} plateau(s), len={len(ce)}"
+        nh = f"{len(gripper_events(gh))} gripper events\n" \
+             f"{len(detect_plateaus(ch))} plateaus, len={len(ch)}"
+        handles = [Patch(fc=PLAT_C, ec="0.7", label="low-speed plateau"),
+                   Line2D([0], [0], color=EVT_C, ls="--", label="gripper event"),
+                   Line2D([0], [0], color="grey", ls=":", label="plateau threshold")]
+
+        # trace panels (no legend — caller adds their own)
+        for suffix, (c, g, title, color, note) in zip(
+            ["trace_easy", "trace_hard"],
+            [(ce, ge, "Easy task (high success rate)", EASY_C, ""),
+             (ch, gh, "Hard task (low success rate)",  HARD_C, "")],
+        ):
+            f1, ax1 = plt.subplots(figsize=(5.2, 3.2))
+            plot_trace(ax1, c, g, title, color, note)
+            f1.tight_layout()
+            out1 = f"{stem}_{suffix}{ext}"
+            f1.savefig(out1, dpi=200, bbox_inches="tight"); plt.close(f1)
+            print("wrote", out1)
+
+        # bar panels
+        x = np.arange(len(LEVELS))
+        for suffix, col in zip(
+            ["bar_events", "bar_plateau", "bar_length"],
+            ["E_events",   "P_plateau",   "L_length"],
+        ):
+            color, name, unit = METRIC_STYLE[col]
+            mean, sem = bars[col]
+            f2, ax2 = plt.subplots(figsize=(3.2, 3.2))
+            ax2.bar(x, mean, yerr=sem, capsize=4, color=color, edgecolor="black",
+                    linewidth=0.6, width=0.62)
+            ax2.set_xticks(x); ax2.set_xticklabels(LEVELS)
+            ax2.set_xlabel("difficulty (by measured SR)")
+            ax2.set_ylabel(f"{name}\n({unit})", fontsize=9)
+            ax2.grid(axis="y", alpha=0.3)
+            f2.tight_layout()
+            out2 = f"{stem}_{suffix}{ext}"
+            f2.savefig(out2, dpi=200, bbox_inches="tight"); plt.close(f2)
+            print("wrote", out2)
 
 
 if __name__ == "__main__":

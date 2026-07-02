@@ -27,7 +27,7 @@ export PYOPENGL_PLATFORM=${PYOPENGL_PLATFORM:-osmesa}
 PORT=${1:-8102}
 NUM_TRIALS=${2:-20}
 OUTPUT_PREFIX=${3:-"eval_simvla"}
-GPU=${4:-0}
+GPU=${4:-6}
 EXTRA_ARGS=${5:-}   # e.g. --no_video
 
 OUTPUT_DIR="./eval_simvla_${PORT}"
