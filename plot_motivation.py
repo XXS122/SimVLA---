@@ -75,15 +75,16 @@ def gripper_events(g):
     return list(np.where(np.diff(s) != 0)[0] + 1)
 
 
-def plot_trace(ax, c, g, title, color, note):
+def plot_trace(ax, c, g, title, color, note, xmax=None):
     t = np.arange(len(c))
     for a, b in detect_plateaus(c):
-        ax.axvspan(a, b, color=PLAT_C, alpha=0.9, zorder=0)
+        ax.axvspan(a, b, color=PLAT_C, alpha=0.35, zorder=0)
     ax.plot(t, c, color=color, lw=1.4, zorder=3)
     ax.axhline(PLATEAU_THRESH, ls=":", color="grey", lw=0.8, zorder=1)
-    for e in gripper_events(g):
-        ax.axvline(e, color=EVT_C, lw=1.0, ls="--", alpha=0.7, zorder=2)
-    ax.set_xlim(0, len(c)); ax.set_ylim(0, 1.0)
+    # shared time axis: a short demo visibly stops early, making the length
+    # contrast (the signal that actually separates easy/hard on LIBERO) the
+    # dominant read.
+    ax.set_xlim(0, xmax or len(c)); ax.set_ylim(0, 1.0)
     ax.set_title(title, fontsize=10)
     ax.set_xlabel("time step"); ax.set_ylabel("action change rate")
     if note:
@@ -92,23 +93,22 @@ def plot_trace(ax, c, g, title, color, note):
                 bbox=dict(boxstyle="round", fc="white", ec="0.8", alpha=0.9))
 
 
-def synth_easy(rng):
-    T = 120
-    c = np.full(T, 0.45) + rng.randn(T) * 0.04
-    c[54:61] = 0.12 + rng.randn(7) * 0.02          # one short grasp plateau
-    c[:8] = np.linspace(0.30, 0.45, 8); c[-8:] = np.linspace(0.45, 0.30, 8)
-    g = np.ones(T); g[57:] = -1.0                  # close once -> 1 event
-    return np.clip(c, 0, 1), g
-
-
-def synth_hard(rng):
-    T = 240
+def make_trace(T, plateau_frac, n_events, rng):
+    """Synthetic change-rate trace with ~plateau_frac steps in low-speed
+    plateaus and n_events gripper toggles -- faithful to LIBERO proportions
+    (even easy tasks are ~40% plateau; the real separator is length)."""
     c = np.full(T, 0.5) + rng.randn(T) * 0.05
-    for a, b in [(28, 40), (78, 92), (128, 140), (172, 188), (208, 220)]:
-        c[a:b] = 0.12 + rng.randn(b - a) * 0.02    # 5 fine-alignment plateaus
-    c[:8] = np.linspace(0.05, 0.5, 8); c[-8:] = np.linspace(0.5, 0.05, 8)
+    target, placed, pos = int(plateau_frac * T), 0, 8
+    while placed < target and pos < T - 8:
+        seg = rng.randint(6, 15)
+        c[pos:pos + seg] = 0.12 + rng.randn(seg) * 0.02
+        placed += seg
+        pos += seg + rng.randint(8, 18)
     g = np.ones(T)
-    g[45:100] = -1; g[100:150] = 1; g[150:200] = -1; g[200:] = 1   # 4 events
+    sign = 1
+    for p in np.linspace(T * 0.18, T * 0.85, n_events).astype(int):
+        sign *= -1
+        g[p:] = sign
     return np.clip(c, 0, 1), g
 
 
@@ -139,6 +139,8 @@ def bar_data_from_csv(difficulty, uniform_sr):
 
 
 def synth_bars():
+    # mirrors the user's real run (gripper flat/non-monotonic, plateau weak,
+    # length clearest) -- a faithful preview, not an idealised one.
     return {
         "E_events":  (np.array([3.2, 2.5, 2.0]), np.array([0.28, 0.22, 0.18])),
         "P_plateau": (np.array([0.57, 0.41, 0.28]), np.array([0.025, 0.022, 0.018])),
@@ -162,7 +164,8 @@ def main():
     use_mock = args.mock or not (args.demo_easy and args.demo_hard)
     rng = np.random.RandomState(1)
     if use_mock:
-        ce, ge = synth_easy(rng); ch, gh = synth_hard(rng)
+        ce, ge = make_trace(137, 0.43, 2, rng)      # ~salad dressing
+        ch, gh = make_trace(457, 0.58, 4, rng)      # ~moka pots
     else:
         ce, ge = load_trace(args.demo_easy); ch, gh = load_trace(args.demo_hard)
     bars = synth_bars() if (use_mock or not (args.difficulty and args.uniform_sr)) \
@@ -179,21 +182,17 @@ def main():
 
     ax_e = fig.add_subplot(gs[0, 0:3])
     ax_h = fig.add_subplot(gs[0, 3:6])
-    ne = f"{len(gripper_events(ge))} gripper events\n" \
-         f"{len(detect_plateaus(ce))} plateau(s), len={len(ce)}"
-    nh = f"{len(gripper_events(gh))} gripper events\n" \
-         f"{len(detect_plateaus(ch))} plateaus, len={len(ch)}"
+    ne = f"{len(detect_plateaus(ce))} plateau(s), len={len(ce)}"
+    nh = f"{len(detect_plateaus(ch))} plateaus, len={len(ch)}"
     plot_trace(ax_e, ce, ge, "Easy task (high success rate)", EASY_C, ne)
     plot_trace(ax_h, ch, gh, "Hard task (low success rate)", HARD_C, nh)
     handles = [Patch(fc=PLAT_C, ec="0.7", label="low-speed plateau"),
-               Line2D([0], [0], color=EVT_C, ls="--", label="gripper event"),
                Line2D([0], [0], color="grey", ls=":", label="plateau threshold")]
     ax_e.legend(handles=handles, fontsize=7, frameon=False, loc="lower left")
 
-    axes2 = [fig.add_subplot(gs[1, 0:2]), fig.add_subplot(gs[1, 2:4]),
-             fig.add_subplot(gs[1, 4:6])]
+    axes2 = [fig.add_subplot(gs[1, 0:3]), fig.add_subplot(gs[1, 3:6])]
     x = np.arange(len(LEVELS))
-    for ax, col in zip(axes2, ["E_events", "P_plateau", "L_length"]):
+    for ax, col in zip(axes2, ["P_plateau", "L_length"]):
         color, name, unit = METRIC_STYLE[col]
         mean, sem = bars[col]
         ax.bar(x, mean, yerr=sem, capsize=4, color=color, edgecolor="black",
