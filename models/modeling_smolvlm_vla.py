@@ -440,6 +440,158 @@ class SmolVLMVLA(PreTrainedModel):
         
         return self.action_space.postprocess(x_t)
 
+    @torch.no_grad()
+    def generate_actions_tts(
+        self,
+        input_ids: torch.LongTensor,
+        image_input: torch.FloatTensor,
+        image_mask: torch.Tensor,
+        proprio: torch.Tensor,
+        steps: int = 10,
+        num_samples: int = 1,
+        selector: str = "consensus",
+        adaptive_threshold: float | None = None,
+        return_diagnostics: bool = False,
+        return_candidates: bool = False,
+    ):
+        """
+        Test-time-scaled Flow Matching inference.
+
+        Draws `num_samples` candidate action chunks from independent noise
+        seeds and integrates them in one batched Euler loop. The VLM prefix
+        (`forward_vlm_efficient`) is computed once and shared across all
+        candidates, so extra candidates only cost action-transformer forwards.
+
+        Selectors (applied in normalized action space, before postprocess):
+          - "consensus":  candidate closest to the mean of all candidates
+          - "smoothness": candidate with the lowest squared jerk (2nd diff)
+          - "first":      candidate 0 (equivalent to plain single sampling)
+
+        Uncertainty probes (returned in diagnostics):
+          - uncertainty_v1: variance of the velocity field across candidates
+            at the first Euler step (t=1) — available before integration ends
+          - uncertainty_x0: variance of the final candidates
+
+        If `adaptive_threshold` is set (batch size 1 only), integration
+        collapses to a single candidate after the first step whenever
+        uncertainty_v1 falls below the threshold, saving compute on easy
+        states while keeping full sampling on hard ones.
+
+        Returns
+        -------
+        action : [B, num_actions, dim_action] post-processed selected chunk
+        diagnostics : dict (only when return_diagnostics=True)
+        """
+        self.eval()
+        enc = self.forward_vlm_efficient(image_input, image_mask, input_ids)
+        vlm_features = enc["vlm_features"]
+
+        B = input_ids.shape[0]
+        N = max(1, int(num_samples))
+        D = self.action_space.dim_action
+        device = proprio.device
+        dtype = proprio.dtype
+
+        if adaptive_threshold is not None and B != 1:
+            raise ValueError("adaptive_threshold is only supported for batch size 1")
+
+        # Normalize proprio
+        if hasattr(self.action_space, 'normalize_state'):
+            proprio_norm = self.action_space.normalize_state(proprio)
+        elif hasattr(self.action_space, 'normalize'):
+            proprio_norm = self.action_space.normalize(proprio)
+        else:
+            proprio_norm = proprio
+
+        # Expand conditions across candidates (VLM prefix shared, computed once)
+        vlm_rep = vlm_features.repeat_interleave(N, dim=0)
+        proprio_rep = proprio_norm.repeat_interleave(N, dim=0)
+
+        steps = max(1, int(steps))
+        dt = -1.0 / steps
+
+        x_t = torch.randn(B * N, self.num_actions, D, device=device, dtype=dtype)
+        t = 1.0
+
+        uncertainty_v1 = None
+        num_forwards = 0
+        n_active = N
+        step_idx = 0
+
+        while t > -dt / 2:
+            rows = x_t.shape[0]
+            t_tensor = torch.full((rows,), t, device=device, dtype=dtype)
+
+            v_t = self.transformer(
+                vlm_features=vlm_rep[:rows],
+                action_with_noise=x_t,
+                proprio=proprio_rep[:rows],
+                t=t_tensor,
+            )
+            num_forwards += rows
+
+            if step_idx == 0 and N > 1:
+                v1 = v_t.view(B, N, self.num_actions, D)
+                uncertainty_v1 = v1.var(dim=1, unbiased=False).mean(dim=(1, 2))  # [B]
+
+            x_t = x_t + dt * v_t
+
+            # Adaptive collapse: easy state -> keep one candidate for the rest
+            if (
+                step_idx == 0
+                and adaptive_threshold is not None
+                and N > 1
+                and uncertainty_v1 is not None
+                and float(uncertainty_v1[0]) < adaptive_threshold
+            ):
+                x_t = x_t[:1]
+                n_active = 1
+
+            t = t + dt
+            step_idx += 1
+
+        cands = x_t.view(B, n_active, self.num_actions, D)
+        uncertainty_x0 = (
+            cands.var(dim=1, unbiased=False).mean(dim=(1, 2)) if n_active > 1 else None
+        )
+
+        # Candidate selection in normalized action space
+        if n_active == 1 or selector == "first":
+            idx = torch.zeros(B, dtype=torch.long, device=device)
+        elif selector == "consensus":
+            dist = (cands - cands.mean(dim=1, keepdim=True)).pow(2).mean(dim=(2, 3))
+            idx = dist.argmin(dim=1)
+        elif selector == "smoothness":
+            jerk = (
+                cands[:, :, 2:] - 2 * cands[:, :, 1:-1] + cands[:, :, :-2]
+            ).pow(2).mean(dim=(2, 3))
+            idx = jerk.argmin(dim=1)
+        else:
+            raise ValueError(f"Unknown selector '{selector}'")
+
+        selected = cands[torch.arange(B, device=device), idx]
+        action = self.action_space.postprocess(selected)
+
+        if not return_diagnostics:
+            return action
+
+        diagnostics = {
+            "num_samples": N,
+            "num_active_samples": n_active,
+            "steps": steps,
+            "selector": selector,
+            "transformer_forwards": num_forwards,
+            "selected_index": idx,
+            "uncertainty_v1": uncertainty_v1,
+            "uncertainty_x0": uncertainty_x0,
+        }
+        if return_candidates:
+            flat = cands.reshape(B * n_active, self.num_actions, D)
+            diagnostics["candidates"] = self.action_space.postprocess(flat).view(
+                B, n_active, self.num_actions, D
+            )
+        return action, diagnostics
+
     # =============================== FastAPI service =============================
     def _build_app(self, processor):
         """Build FastAPI app for SmolVLM-VLA inference."""

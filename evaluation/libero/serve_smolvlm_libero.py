@@ -56,7 +56,57 @@ CONFIG = {
     "action_dim": 7,
     "action_horizon": 10,
     "image_size": 384,
+    # Test-time scaling defaults (overridable per request via "tts/*" keys)
+    "ode_steps": 10,
+    "num_samples": 1,
+    "selector": "consensus",
+    "adaptive_threshold": None,
 }
+
+# Diagnostics logging (enabled via --diag_log)
+DIAG_LOG_PATH: Optional[str] = None
+_diag_call_idx = 0
+
+
+def log_diagnostics(observation: Dict[str, Any], diag: Dict[str, Any], actions: np.ndarray):
+    """Append one JSONL record of per-call test-time-scaling diagnostics."""
+    global _diag_call_idx
+    if DIAG_LOG_PATH is None:
+        return
+    import json
+    import time as _time
+
+    def _scalar(v):
+        if v is None:
+            return None
+        if isinstance(v, torch.Tensor):
+            return float(v.reshape(-1)[0].item())
+        return float(v)
+
+    record = {
+        "call_idx": _diag_call_idx,
+        "time": _time.time(),
+        "prompt": observation.get("prompt", ""),
+        "num_samples": diag["num_samples"],
+        "num_active_samples": diag["num_active_samples"],
+        "steps": diag["steps"],
+        "selector": diag["selector"],
+        "transformer_forwards": diag["transformer_forwards"],
+        "selected_index": int(diag["selected_index"].reshape(-1)[0].item()),
+        "uncertainty_v1": _scalar(diag["uncertainty_v1"]),
+        "uncertainty_x0": _scalar(diag["uncertainty_x0"]),
+        # Gripper command channel of the selected chunk (for event alignment)
+        "gripper_cmd": [float(a) for a in actions[:, -1]],
+    }
+    # Optional client-side metadata for offline joins (task/episode/step)
+    for key in ("meta/task_suite", "meta/task_id", "meta/episode", "meta/env_step"):
+        if key in observation:
+            v = observation[key]
+            record[key.split("/", 1)[1]] = v.item() if hasattr(v, "item") else v
+
+    _diag_call_idx += 1
+    with open(DIAG_LOG_PATH, "a") as f:
+        f.write(json.dumps(record) + "\n")
 
 
 def load_model(checkpoint_path: str, norm_stats_path: str = None, smolvlm_model_path: str = None):
@@ -173,18 +223,35 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
         # Proprioception
         proprio_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
         
+        # Test-time scaling parameters: server defaults + per-request overrides
+        def _req(key, default, cast):
+            v = observation.get(f"tts/{key}", default)
+            if v is None:
+                return None
+            return cast(v.item() if hasattr(v, "item") else v)
+
+        ode_steps = _req("ode_steps", CONFIG["ode_steps"], int)
+        num_samples = _req("num_samples", CONFIG["num_samples"], int)
+        selector = _req("selector", CONFIG["selector"], str)
+        adaptive_threshold = _req("adaptive_threshold", CONFIG["adaptive_threshold"], float)
+
         # Inference
         with torch.no_grad():
-            actions = model.generate_actions(
+            actions, diag = model.generate_actions_tts(
                 input_ids=lang['input_ids'],
                 image_input=images,
                 image_mask=image_mask,
                 proprio=proprio_tensor,
-                steps=CONFIG["action_horizon"],
+                steps=ode_steps,
+                num_samples=num_samples,
+                selector=selector,
+                adaptive_threshold=adaptive_threshold,
+                return_diagnostics=True,
             )
-        
-        actions = actions.cpu().numpy()[0]
-        
+
+        actions = actions.float().cpu().numpy()[0]
+        log_diagnostics(observation, diag, actions)
+
         return {"actions": actions}
         
     except Exception as e:
@@ -272,17 +339,41 @@ def main():
                         help="SmolVLM model path or HuggingFace repo")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
-    
+    # Test-time scaling defaults (client can override per request via tts/* keys)
+    parser.add_argument("--ode_steps", type=int, default=10,
+                        help="Euler integration steps for flow matching")
+    parser.add_argument("--num_samples", type=int, default=1,
+                        help="Candidate action chunks sampled per state (best-of-N)")
+    parser.add_argument("--selector", type=str, default="consensus",
+                        choices=["consensus", "smoothness", "first"],
+                        help="Training-free candidate selector")
+    parser.add_argument("--adaptive_threshold", type=float, default=None,
+                        help="Collapse to 1 candidate when uncertainty_v1 is below this")
+    parser.add_argument("--diag_log", type=str, default=None,
+                        help="Path to JSONL file for per-call TTS diagnostics")
+
     args = parser.parse_args()
-    
+
     if not HAS_MSGPACK:
         logger.warning("msgpack_numpy not installed! Install with: pip install msgpack-numpy")
-    
+
+    CONFIG["ode_steps"] = args.ode_steps
+    CONFIG["num_samples"] = args.num_samples
+    CONFIG["selector"] = args.selector
+    CONFIG["adaptive_threshold"] = args.adaptive_threshold
+
+    global DIAG_LOG_PATH
+    DIAG_LOG_PATH = args.diag_log
+
     load_model(args.checkpoint, args.norm_stats, args.smolvlm_model)
-    
+
     logger.info(f"Starting SimVLA server on {args.host}:{args.port}")
     logger.info(f"  Image size: {CONFIG['image_size']}x{CONFIG['image_size']}")
     logger.info(f"  Action horizon: {CONFIG['action_horizon']}")
+    logger.info(f"  TTS defaults: steps={CONFIG['ode_steps']}, N={CONFIG['num_samples']}, "
+                f"selector={CONFIG['selector']}, adaptive={CONFIG['adaptive_threshold']}")
+    if DIAG_LOG_PATH:
+        logger.info(f"  Diagnostics log: {DIAG_LOG_PATH}")
     
     asyncio.run(serve(args.host, args.port))
 

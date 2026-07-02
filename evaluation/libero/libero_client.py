@@ -89,18 +89,20 @@ class WebSocketClient:
     
     Requires: pip install openpi-client
     """
-    def __init__(self, host: str, port: int, replan_steps: int = 5, resize_size: int = 224):
+    def __init__(self, host: str, port: int, replan_steps: int = 5, resize_size: int = 224,
+                 extra: Optional[Dict] = None):
         if not HAS_WS_CLIENT:
             raise ImportError("openpi_client not installed. Run: pip install openpi-client")
         self.client = ws_client.WebsocketClientPolicy(host, port)
         self.replan_steps = replan_steps
         self.resize_size = resize_size
+        self.extra = extra or {}  # e.g. tts/* overrides forwarded to the server
         self.reset()
 
     def reset(self) -> None:
         self.action_plan: Deque[np.ndarray] = collections.deque()
 
-    def step(self, obs: Dict, goal: str) -> np.ndarray:
+    def step(self, obs: Dict, goal: str, meta: Optional[Dict] = None) -> np.ndarray:
         if not self.action_plan:
             # Preprocess images
             img = image_tools.convert_to_uint8(
@@ -109,7 +111,7 @@ class WebSocketClient:
             wrist_img = image_tools.convert_to_uint8(
                 image_tools.resize_with_pad(obs["wrist_image"], self.resize_size, self.resize_size)
             )
-            
+
             # Build observation dict
             element = {
                 "observation/image": img,
@@ -117,7 +119,11 @@ class WebSocketClient:
                 "observation/state": obs["state"],
                 "prompt": goal,
             }
-            
+            element.update(self.extra)
+            if meta:
+                for k, v in meta.items():
+                    element[f"meta/{k}"] = v
+
             # Query server
             result = self.client.infer(element)
             action_chunk = result["actions"]
@@ -139,9 +145,11 @@ class HTTPClient:
     """
     HTTP client for SimVLA server.
     """
-    def __init__(self, host: str, port: int, replan_steps: int = 5):
+    def __init__(self, host: str, port: int, replan_steps: int = 5,
+                 extra: Optional[Dict] = None):
         self.url = f"http://{host}:{port}/act"
         self.replan_steps = replan_steps
+        self.extra = extra or {}
         self.reset()
 
     def reset(self) -> None:
@@ -167,7 +175,7 @@ class HTTPClient:
         except Exception as e:
             raise RuntimeError(f"Policy server request failed: {e}") from e
 
-    def step(self, obs: Dict, goal: str) -> np.ndarray:
+    def step(self, obs: Dict, goal: str, meta: Optional[Dict] = None) -> np.ndarray:
         if not self.action_plan:
             element = {
                 "observation/image": obs["image"],
@@ -175,7 +183,8 @@ class HTTPClient:
                 "observation/state": obs["state"],
                 "prompt": goal,
             }
-            
+            element.update(self.extra)
+
             result = self.infer(element)
             action_chunk = result["actions"]
             
@@ -205,6 +214,7 @@ def eval_libero(
     seed: int = 7,
     video_out_path: str = "data/libero/videos",
     save_video: bool = True,
+    log_results: Optional[str] = None,
 ) -> float:
     """
     Run LIBERO evaluation across all tasks in a suite.
@@ -271,7 +281,16 @@ def eval_libero(
                     }
                     
                     # Get action (7D delta action)
-                    action = client.step(obs_dict, task_description)
+                    action = client.step(
+                        obs_dict,
+                        task_description,
+                        meta={
+                            "task_suite": task_suite_name,
+                            "task_id": int(task_id),
+                            "episode": int(ep),
+                            "env_step": int(t),
+                        },
+                    )
                     
                     # Execute (send delta action directly)
                     obs, reward, done, info = env.step(action.tolist())
@@ -288,7 +307,22 @@ def eval_libero(
                     break
 
             total_episodes += 1
-            
+
+            # Log per-episode outcome (joins with server-side diagnostics
+            # via task_suite/task_id/episode metadata)
+            if log_results:
+                record = {
+                    "task_suite": task_suite_name,
+                    "task_id": int(task_id),
+                    "task_description": task_description,
+                    "episode": int(ep),
+                    "success": bool(done),
+                    "env_steps": int(t),
+                    "time": time.time(),
+                }
+                with open(log_results, "a") as f:
+                    f.write(json.dumps(record) + "\n")
+
             # Save video
             suffix = "success" if done else "failure"
             task_segment = task_description.replace(" ", "_")[:50]
@@ -328,6 +362,17 @@ def main():
     parser.add_argument("--replan_steps", type=int, default=5)
     parser.add_argument("--video_out", type=str, default="./eval_results")
     parser.add_argument("--no_video", action="store_true", help="Disable video recording for faster evaluation")
+    # Test-time scaling overrides (forwarded to the server per request)
+    parser.add_argument("--num_samples", type=int, default=None,
+                        help="Candidate action chunks per state (best-of-N)")
+    parser.add_argument("--ode_steps", type=int, default=None,
+                        help="Euler integration steps")
+    parser.add_argument("--selector", type=str, default=None,
+                        choices=["consensus", "smoothness", "first"])
+    parser.add_argument("--adaptive_threshold", type=float, default=None,
+                        help="Uncertainty threshold for adaptive compute collapse")
+    parser.add_argument("--log_results", type=str, default=None,
+                        help="Path to JSONL file for per-episode outcomes")
 
     args = parser.parse_args()
 
@@ -352,12 +397,25 @@ def main():
     print(f"   Replan steps: {args.replan_steps}")
     print()
     
+    # Test-time scaling overrides forwarded to the server
+    extra = {}
+    if args.num_samples is not None:
+        extra["tts/num_samples"] = args.num_samples
+    if args.ode_steps is not None:
+        extra["tts/ode_steps"] = args.ode_steps
+    if args.selector is not None:
+        extra["tts/selector"] = args.selector
+    if args.adaptive_threshold is not None:
+        extra["tts/adaptive_threshold"] = args.adaptive_threshold
+    if extra:
+        print(f"   TTS overrides: {extra}")
+
     # Initialize client
     if args.client_type == "websocket":
-        client = WebSocketClient(args.host, args.port, replan_steps=args.replan_steps)
+        client = WebSocketClient(args.host, args.port, replan_steps=args.replan_steps, extra=extra)
     else:
-        client = HTTPClient(args.host, args.port, replan_steps=args.replan_steps)
-    
+        client = HTTPClient(args.host, args.port, replan_steps=args.replan_steps, extra=extra)
+
     # Run evaluation
     video_path = Path(args.video_out) / args.task_suite
     eval_libero(
@@ -367,6 +425,7 @@ def main():
         seed=args.seed,
         video_out_path=str(video_path),
         save_video=not args.no_video,
+        log_results=args.log_results,
     )
 
 
