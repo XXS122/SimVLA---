@@ -114,12 +114,18 @@ def load_model(checkpoint_path: str, norm_stats_path: str = None, smolvlm_model_
     global model, processor
     
     logger.info(f"Loading SimVLA from {checkpoint_path}...")
-    
-    model = SmolVLMVLA.from_pretrained(checkpoint_path)
+
+    smolvlm_path = (
+        smolvlm_model_path
+        or os.environ.get("SIMVLA_SMOLVLM_MODEL")
+        or "HuggingFaceTB/SmolVLM-500M-Instruct"
+    )
+    # Override the backbone path stored in the checkpoint config so a
+    # checkpoint trained on another machine still loads locally
+    model = SmolVLMVLA.from_pretrained(checkpoint_path, smolvlm_model_path=smolvlm_path)
     model = model.to(device)
     model.eval()
-    
-    smolvlm_path = smolvlm_model_path or "HuggingFaceTB/SmolVLM-500M-Instruct"
+
     processor = SmolVLMVLAProcessor.from_pretrained(smolvlm_path)
     
     if norm_stats_path and os.path.exists(norm_stats_path):
@@ -334,9 +340,10 @@ def main():
                         help="Path to SimVLA checkpoint")
     parser.add_argument("--norm_stats", type=str, default=None,
                         help="Path to normalization stats JSON")
-    parser.add_argument("--smolvlm_model", type=str, 
-                        default="HuggingFaceTB/SmolVLM-500M-Instruct",
-                        help="SmolVLM model path or HuggingFace repo")
+    parser.add_argument("--smolvlm_model", type=str,
+                        default=os.environ.get("SIMVLA_SMOLVLM_MODEL",
+                                               "HuggingFaceTB/SmolVLM-500M-Instruct"),
+                        help="SmolVLM model path or HF repo (default: $SIMVLA_SMOLVLM_MODEL)")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     # Test-time scaling defaults (client can override per request via tts/* keys)

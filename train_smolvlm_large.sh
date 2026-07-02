@@ -9,13 +9,22 @@
 set -e
 
 # =============================================================================
+# Environment (paths.env is auto-sourced when present; see paths.env.example)
+# =============================================================================
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "${SCRIPT_DIR}/paths.env" ]; then
+    echo "Sourcing ${SCRIPT_DIR}/paths.env"
+    source "${SCRIPT_DIR}/paths.env"
+fi
+
+# =============================================================================
 # Command line arguments (with defaults)
 # =============================================================================
 
 BATCH_SIZE=${1:-64}
 LEARNING_COEF=${2:-0.1}
-OUTPUT_DIR=${3:-./runs/simvla_libero_large}
-RESUME_CKPT=${4:-""}
+OUTPUT_DIR=${3:-"${SIMVLA_CHECKPOINTS:-./runs}/simvla_libero_large"}
+RESUME_CKPT=${4:-"${SIMVLA_RESUME_CKPT:-}"}
 
 echo "Training parameters:"
 echo "   batch_size: $BATCH_SIZE"
@@ -23,8 +32,10 @@ echo "   learning_coef: $LEARNING_COEF"
 echo "   output_dir: $OUTPUT_DIR"
 echo "   resume_ckpt: ${RESUME_CKPT:-'None (training from scratch)'}"
 
-# GPU configuration
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+# GPU configuration ($CUDA_DEVICES / $NUM_GPUS from paths.env)
+export CUDA_VISIBLE_DEVICES="${CUDA_DEVICES:-4,5,6,7}"
+NUM_PROCESSES="${NUM_GPUS:-4}"
+echo "   GPUs: $CUDA_VISIBLE_DEVICES (processes: $NUM_PROCESSES)"
 
 # Suppress TensorFlow logs
 export TF_CPP_MIN_LOG_LEVEL=2
@@ -32,12 +43,12 @@ export TF_CPP_MIN_LOG_LEVEL=2
 # =============================================================================
 # Path configuration
 # =============================================================================
-LIBERO_DATA_DIR="./datasets/metas"
+LIBERO_DATA_DIR="${LIBERO_DATASETS:-./datasets/metas}"
 NORM_STATS_PATH="./norm_stats/libero_norm.json"
 TRAIN_METAS_PATH="./datasets/metas/libero_train.json"
 
 # SmolVLM backbone (can be local path or HuggingFace repo)
-SMOLVLM_MODEL="HuggingFaceTB/SmolVLM-500M-Instruct"
+SMOLVLM_MODEL="${SIMVLA_SMOLVLM_MODEL:-HuggingFaceTB/SmolVLM-500M-Instruct}"
 
 # =============================================================================
 # Training hyperparameters
@@ -144,7 +155,7 @@ echo "============================================================"
 # Multi-GPU training
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 accelerate launch \
-    --num_processes=4 \
+    --num_processes=${NUM_PROCESSES} \
     --main_process_port 29504 \
     --mixed_precision bf16 \
     train_smolvlm.py ${ARGS}

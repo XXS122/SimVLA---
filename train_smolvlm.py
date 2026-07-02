@@ -85,9 +85,11 @@ def get_args_parser():
                         help="Directory to save checkpoints")
 
     # SmolVLM backbone
-    parser.add_argument("--smolvlm_model_path", type=str, 
-                        default="HuggingFaceTB/SmolVLM-500M-Instruct",
-                        help="Path or HF repo for SmolVLM backbone")
+    parser.add_argument("--smolvlm_model_path", type=str,
+                        default=os.environ.get("SIMVLA_SMOLVLM_MODEL",
+                                               "HuggingFaceTB/SmolVLM-500M-Instruct"),
+                        help="Path or HF repo for SmolVLM backbone "
+                             "(default: $SIMVLA_SMOLVLM_MODEL)")
     
     # Data
     parser.add_argument("--train_metas_path", type=str, required=True, 
@@ -308,7 +310,9 @@ def main(args):
     
     if load_path and os.path.isdir(load_path) and os.path.exists(os.path.join(load_path, "model.safetensors")):
         logger.info(f"Loading SmolVLM-VLA from checkpoint: {load_path}")
-        model = SmolVLMVLA.from_pretrained(load_path)
+        # Override the backbone path stored in the checkpoint config so a
+        # checkpoint trained on another machine still loads locally
+        model = SmolVLMVLA.from_pretrained(load_path, smolvlm_model_path=args.smolvlm_model_path)
         
         if args.action_mode != model.action_mode:
             logger.warning(f"Overriding model action_mode from '{model.action_mode}' to '{args.action_mode}'")

@@ -19,6 +19,11 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+if [ -f "${REPO_ROOT}/paths.env" ]; then
+    echo "Sourcing ${REPO_ROOT}/paths.env"
+    source "${REPO_ROOT}/paths.env"
+fi
 export LIBERO_ROOT="${LIBERO_ROOT:-${SCRIPT_DIR}/LIBERO}"
 export PYTHONPATH="${LIBERO_ROOT}:${PYTHONPATH}"
 

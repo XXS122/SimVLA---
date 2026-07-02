@@ -129,8 +129,9 @@ def create_libero_meta(
 
 def main():
     parser = argparse.ArgumentParser(description="Create LIBERO training metadata")
-    parser.add_argument("--data_dir", type=str, required=True,
-                        help="LIBERO dataset root directory")
+    parser.add_argument("--data_dir", type=str,
+                        default=os.environ.get("LIBERO_DATASETS"),
+                        help="LIBERO dataset root directory (default: $LIBERO_DATASETS)")
     parser.add_argument("--subsets", type=str, nargs="+",
                         default=["libero_10", "libero_goal", "libero_object", "libero_spatial"],
                         help="Subsets to include (default 4 subsets, excluding libero_90)")
@@ -139,7 +140,10 @@ def main():
                         help="Output file path")
     
     args = parser.parse_args()
-    
+
+    if not args.data_dir:
+        parser.error("--data_dir is required (or set $LIBERO_DATASETS in the environment)")
+
     create_libero_meta(
         data_dir=args.data_dir,
         subsets=args.subsets,
