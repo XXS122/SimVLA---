@@ -121,10 +121,13 @@ def stage_baseline(ws: C.Workspace, extra: list[str], split: str, iters: int | N
     _run(cmd)
 
 
-def stage_train_lam(ws: C.Workspace, extra: list[str]):
-    _run([sys.executable, "-m", "latent_action.train_lam",
-          "--meta_path", ws.meta_path("p100"),
-          "--output_dir", ws.lam_dir] + extra)
+def stage_train_lam(ws: C.Workspace, extra: list[str], iters: int | None):
+    cmd = [sys.executable, "-m", "latent_action.train_lam",
+           "--meta_path", ws.meta_path("p100"),
+           "--output_dir", ws.lam_dir]
+    if iters:
+        cmd += ["--iters", iters]
+    _run(cmd + extra)
 
 
 def stage_label(ws: C.Workspace, extra: list[str], ego_aug: bool):
@@ -233,7 +236,7 @@ def main():
     elif args.stage == "baseline":
         stage_baseline(ws, extra, args.split, args.iters)
     elif args.stage == "train-lam":
-        stage_train_lam(ws, extra)
+        stage_train_lam(ws, extra, args.iters)
     elif args.stage == "label":
         stage_label(ws, extra, args.ego_aug)
     elif args.stage == "probe":
