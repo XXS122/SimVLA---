@@ -239,21 +239,21 @@ def _point_biserial(pairs):
 
 
 def uncertainty_vs_success(results_by_config, diag_by_config, field="uncertainty_x0",
-                           early_k=10):
+                           k_list=(5, 10, 20, 40)):
     """
     Point-biserial correlation between episode uncertainty and success.
 
-    Reports two correlations per config:
-      - r_full : mean over ALL policy calls of the episode. Confounded:
-        failed episodes run to the step limit, so post-failure flailing
-        inflates their mean.
-      - r_first{K} : mean over only the FIRST K calls. This is the honest
-        predictive signal — whether early uncertainty forecasts the final
-        outcome before failure has happened.
+    Reports, per config:
+      - r_full    : mean over ALL policy calls. Confounded: failed episodes
+        run to the step limit, so post-failure flailing inflates their mean.
+      - r_firstK  : mean over only the first K calls, for each K in k_list.
+        Sweeping K shows WHEN the outcome becomes visible in the
+        uncertainty signal (the "predictability emergence" curve): small-K
+        correlations measure genuine early prediction; the K at which the
+        correlation strengthens marks where failures typically begin.
     """
     print(f"\n=== Episode uncertainty ({field}) vs success (point-biserial) ===")
-    print(f"    r_full = all calls (confounded by episode length); "
-          f"r_first{early_k} = first {early_k} calls only (predictive)")
+    print(f"    r_full = all calls (length-confounded); r_firstK = first K calls only")
     printed = False
     for key, eps in sorted(results_by_config.items()):
         diag = diag_by_config.get(key, [])
@@ -267,7 +267,8 @@ def uncertainty_vs_success(results_by_config, diag_by_config, field="uncertainty
                     (r.get("env_step", r["call_idx"]), r[field])
                 )
 
-        pairs_full, pairs_early = [], []
+        pairs_full = []
+        pairs_k = {k: [] for k in k_list}
         for e in eps:
             k = (e["task_id"], e["episode"])
             if k not in ep_unc:
@@ -276,20 +277,23 @@ def uncertainty_vs_success(results_by_config, diag_by_config, field="uncertainty
             vals = [v for _, v in calls]
             y = 1.0 if e["success"] else 0.0
             pairs_full.append((sum(vals) / len(vals), y))
-            early = vals[:early_k]
-            pairs_early.append((sum(early) / len(early), y))
+            for kk in k_list:
+                early = vals[:kk]
+                pairs_k[kk].append((sum(early) / len(early), y))
 
         if len(pairs_full) < 5:
             continue
         r_full = _point_biserial(pairs_full)
-        r_early = _point_biserial(pairs_early)
         if r_full is None:
             continue
         printed = True
         suite, n, s, sel = key
-        r_early_str = f"{r_early:+.3f}" if r_early is not None else "  n/a"
+        parts = []
+        for kk in k_list:
+            r_k = _point_biserial(pairs_k[kk])
+            parts.append(f"K{kk}={r_k:+.3f}" if r_k is not None else f"K{kk}=n/a")
         print(f"[{suite} | N={n} S={s} {sel}] episodes={len(pairs_full)}  "
-              f"r_full={r_full:+.3f}  r_first{early_k}={r_early_str}")
+              f"r_full={r_full:+.3f}  {'  '.join(parts)}")
 
     if not printed:
         print("(need N>1 configs with both results and diagnostics)")
@@ -347,8 +351,8 @@ def main():
     parser.add_argument("--unc_field", type=str, default="auto",
                         choices=["auto", "uncertainty_x0hat", "uncertainty_x0", "uncertainty_v1"],
                         help="Uncertainty probe field to analyze (auto prefers x0hat > x0 > v1)")
-    parser.add_argument("--early_k", type=int, default=10,
-                        help="Number of initial calls for the predictive (early-window) correlation")
+    parser.add_argument("--k_list", type=int, nargs="+", default=[5, 10, 20, 40],
+                        help="Early-window sizes (in calls) for the predictability emergence curve")
     args = parser.parse_args()
 
     results = load_results(Path(args.results_dir))
@@ -358,7 +362,7 @@ def main():
     if diag:
         field = pick_unc_field(diag, args.unc_field)
         uncertainty_alignment(diag, field=field, results_by_config=results)
-        uncertainty_vs_success(results, diag, field=field, early_k=args.early_k)
+        uncertainty_vs_success(results, diag, field=field, k_list=tuple(args.k_list))
     if args.plots and rows:
         make_plots(rows, args.plots)
 
