@@ -147,7 +147,25 @@ def gripper_events(calls):
     return events
 
 
-def uncertainty_alignment(diag_by_config, max_dist=10, field="uncertainty_x0"):
+def success_lookup(results_by_config):
+    """(config, task_id, episode) -> bool success, from client result logs."""
+    lookup = {}
+    for key, eps in results_by_config.items():
+        for e in eps:
+            lookup[(key, e["task_id"], e["episode"])] = bool(e["success"])
+    return lookup
+
+
+def uncertainty_alignment(diag_by_config, max_dist=10, field="uncertainty_x0",
+                          results_by_config=None):
+    """
+    Uncertainty binned by distance to the nearest gripper event.
+
+    When episode outcomes are available, successful and failed episodes are
+    reported separately: failed episodes run to the step limit and drift far
+    from any event, which otherwise contaminates the far-distance bins.
+    """
+    outcomes = success_lookup(results_by_config) if results_by_config else {}
     print(f"\n=== Uncertainty ({field}) vs distance to nearest gripper event ===")
     printed = False
     for key, records in sorted(diag_by_config.items()):
@@ -160,7 +178,8 @@ def uncertainty_alignment(diag_by_config, max_dist=10, field="uncertainty_x0"):
             if r.get(field) is not None:
                 episodes[episode_key(r)].append(r)
 
-        bins = defaultdict(list)
+        bins_succ = defaultdict(list)
+        bins_fail = defaultdict(list)
         for ep_key, calls in episodes.items():
             if ep_key == (None, None) or len(calls) < 3:
                 continue
@@ -168,21 +187,37 @@ def uncertainty_alignment(diag_by_config, max_dist=10, field="uncertainty_x0"):
             events = gripper_events(calls)
             if not events:
                 continue
+            succ = outcomes.get((key, ep_key[0], ep_key[1]))
+            target = bins_fail if succ is False else bins_succ
             for i, c in enumerate(calls):
                 d = min(abs(i - e) for e in events)
-                bins[min(d, max_dist)].append(c[field])
+                target[min(d, max_dist)].append(c[field])
 
-        if not bins:
+        if not bins_succ and not bins_fail:
             continue
         printed = True
-        print(f"\n[{suite} | N={n} S={s} {sel}]  (distance in policy calls)")
-        print(f"{'dist':>6} {'count':>7} {'mean_unc':>12} {'std':>10}")
-        for d in sorted(bins):
-            vals = bins[d]
+
+        def _stats(vals):
+            if not vals:
+                return 0, float("nan"), float("nan")
             mean = sum(vals) / len(vals)
             std = math.sqrt(sum((v - mean) ** 2 for v in vals) / len(vals))
-            label = f">={max_dist}" if d == max_dist else str(d)
-            print(f"{label:>6} {len(vals):>7} {mean:>12.5f} {std:>10.5f}")
+            return len(vals), mean, std
+
+        print(f"\n[{suite} | N={n} S={s} {sel}]  (distance in policy calls)")
+        if outcomes:
+            print(f"{'dist':>6} {'n_succ':>7} {'unc_succ':>10} {'n_fail':>7} {'unc_fail':>10}")
+            for d in sorted(set(bins_succ) | set(bins_fail)):
+                ns, ms, _ = _stats(bins_succ.get(d, []))
+                nf, mf, _ = _stats(bins_fail.get(d, []))
+                label = f">={max_dist}" if d == max_dist else str(d)
+                print(f"{label:>6} {ns:>7} {ms:>10.5f} {nf:>7} {mf:>10.5f}")
+        else:
+            print(f"{'dist':>6} {'count':>7} {'mean_unc':>12} {'std':>10}")
+            for d in sorted(bins_succ):
+                cnt, mean, std = _stats(bins_succ[d])
+                label = f">={max_dist}" if d == max_dist else str(d)
+                print(f"{label:>6} {cnt:>7} {mean:>12.5f} {std:>10.5f}")
 
     if not printed:
         print("(no N>1 diagnostics with episode metadata found)")
@@ -191,8 +226,34 @@ def uncertainty_alignment(diag_by_config, max_dist=10, field="uncertainty_x0"):
 # ---------------------------------------------------------------------------
 # 3. Episode-level uncertainty vs success
 # ---------------------------------------------------------------------------
-def uncertainty_vs_success(results_by_config, diag_by_config, field="uncertainty_x0"):
-    print(f"\n=== Episode mean uncertainty ({field}) vs success (point-biserial r) ===")
+def _point_biserial(pairs):
+    xs = [p[0] for p in pairs]
+    ys = [p[1] for p in pairs]
+    mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+    cov = sum((x - mx) * (y - my) for x, y in pairs)
+    vx = math.sqrt(sum((x - mx) ** 2 for x in xs))
+    vy = math.sqrt(sum((y - my) ** 2 for y in ys))
+    if vx == 0 or vy == 0:
+        return None
+    return cov / (vx * vy)
+
+
+def uncertainty_vs_success(results_by_config, diag_by_config, field="uncertainty_x0",
+                           early_k=10):
+    """
+    Point-biserial correlation between episode uncertainty and success.
+
+    Reports two correlations per config:
+      - r_full : mean over ALL policy calls of the episode. Confounded:
+        failed episodes run to the step limit, so post-failure flailing
+        inflates their mean.
+      - r_first{K} : mean over only the FIRST K calls. This is the honest
+        predictive signal — whether early uncertainty forecasts the final
+        outcome before failure has happened.
+    """
+    print(f"\n=== Episode uncertainty ({field}) vs success (point-biserial) ===")
+    print(f"    r_full = all calls (confounded by episode length); "
+          f"r_first{early_k} = first {early_k} calls only (predictive)")
     printed = False
     for key, eps in sorted(results_by_config.items()):
         diag = diag_by_config.get(key, [])
@@ -202,27 +263,33 @@ def uncertainty_vs_success(results_by_config, diag_by_config, field="uncertainty
         ep_unc = defaultdict(list)
         for r in diag:
             if r.get(field) is not None:
-                ep_unc[episode_key(r)].append(r[field])
+                ep_unc[episode_key(r)].append(
+                    (r.get("env_step", r["call_idx"]), r[field])
+                )
 
-        pairs = []
+        pairs_full, pairs_early = [], []
         for e in eps:
             k = (e["task_id"], e["episode"])
-            if k in ep_unc:
-                pairs.append((sum(ep_unc[k]) / len(ep_unc[k]), 1.0 if e["success"] else 0.0))
+            if k not in ep_unc:
+                continue
+            calls = sorted(ep_unc[k])
+            vals = [v for _, v in calls]
+            y = 1.0 if e["success"] else 0.0
+            pairs_full.append((sum(vals) / len(vals), y))
+            early = vals[:early_k]
+            pairs_early.append((sum(early) / len(early), y))
 
-        if len(pairs) < 5:
+        if len(pairs_full) < 5:
             continue
-        xs = [p[0] for p in pairs]
-        ys = [p[1] for p in pairs]
-        mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
-        cov = sum((x - mx) * (y - my) for x, y in pairs)
-        vx = math.sqrt(sum((x - mx) ** 2 for x in xs))
-        vy = math.sqrt(sum((y - my) ** 2 for y in ys))
-        if vx == 0 or vy == 0:
+        r_full = _point_biserial(pairs_full)
+        r_early = _point_biserial(pairs_early)
+        if r_full is None:
             continue
         printed = True
         suite, n, s, sel = key
-        print(f"[{suite} | N={n} S={s} {sel}] episodes={len(pairs)}  r={cov / (vx * vy):+.3f}")
+        r_early_str = f"{r_early:+.3f}" if r_early is not None else "  n/a"
+        print(f"[{suite} | N={n} S={s} {sel}] episodes={len(pairs_full)}  "
+              f"r_full={r_full:+.3f}  r_first{early_k}={r_early_str}")
 
     if not printed:
         print("(need N>1 configs with both results and diagnostics)")
@@ -280,6 +347,8 @@ def main():
     parser.add_argument("--unc_field", type=str, default="auto",
                         choices=["auto", "uncertainty_x0hat", "uncertainty_x0", "uncertainty_v1"],
                         help="Uncertainty probe field to analyze (auto prefers x0hat > x0 > v1)")
+    parser.add_argument("--early_k", type=int, default=10,
+                        help="Number of initial calls for the predictive (early-window) correlation")
     args = parser.parse_args()
 
     results = load_results(Path(args.results_dir))
@@ -288,8 +357,8 @@ def main():
     rows = scaling_table(results, diag, out_csv=args.out)
     if diag:
         field = pick_unc_field(diag, args.unc_field)
-        uncertainty_alignment(diag, field=field)
-        uncertainty_vs_success(results, diag, field=field)
+        uncertainty_alignment(diag, field=field, results_by_config=results)
+        uncertainty_vs_success(results, diag, field=field, early_k=args.early_k)
     if args.plots and rows:
         make_plots(rows, args.plots)
 
