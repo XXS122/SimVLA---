@@ -1,0 +1,20 @@
+# Machine-local paths & secrets — never commit
+paths.env
+
+# Training artifacts
+runs/
+runnings*/
+wandb/
+*.log
+eval_results/
+evaluation/libero/scaling_results/
+
+# Data
+datasets/metas/
+*.hdf5
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/

@@ -10,6 +10,15 @@ A WebSocket-based policy server for LIBERO evaluation:
 
 State format (8D): [ee_pos(3), axis_angle(3), gripper_qpos(2)]
 Action format (7D): [delta_xyz(3), delta_axisangle(3), gripper_cmd(1)]
+
+Inference modes (Task-2):
+  flow     multi-step integration (--flow_steps, default 10). Works for both
+           flow-matching and MeanFlow checkpoints.
+  onestep  single-step generation (MeanFlow checkpoints).
+  bok      best-of-K: sample --num_samples one-step candidates, select the
+           argmin-energy one with the ActionEnergyVerifier (--verifier).
+
+Per-request latency is appended to --latency_log (JSONL) when given.
 """
 
 import argparse
@@ -41,6 +50,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from models.modeling_smolvlm_vla import SmolVLMVLA
 from models.processing_smolvlm_vla import SmolVLMVLAProcessor
+from models.verifier import ActionEnergyVerifier
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -48,6 +58,7 @@ logger = logging.getLogger(__name__)
 # Global state
 model: Optional[SmolVLMVLA] = None
 processor: Optional[SmolVLMVLAProcessor] = None
+verifier: Optional[ActionEnergyVerifier] = None
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Configuration
@@ -56,21 +67,33 @@ CONFIG = {
     "action_dim": 7,
     "action_horizon": 10,
     "image_size": 384,
+    "mode": "flow",        # flow | onestep | bok
+    "flow_steps": 10,      # integration steps for mode=flow
+    "num_samples": 8,      # K for mode=bok
+    "latency_log": None,   # JSONL path for per-request latency
 }
 
 
-def load_model(checkpoint_path: str, norm_stats_path: str = None, smolvlm_model_path: str = None):
-    """Load SimVLA model and processor."""
-    global model, processor
-    
+def load_model(checkpoint_path: str, norm_stats_path: str = None, smolvlm_model_path: str = None,
+               verifier_path: str = None):
+    """Load SimVLA model, processor and (optionally) the energy verifier."""
+    global model, processor, verifier
+
     logger.info(f"Loading SimVLA from {checkpoint_path}...")
-    
+
     model = SmolVLMVLA.from_pretrained(checkpoint_path)
     model = model.to(device)
     model.eval()
-    
+
     smolvlm_path = smolvlm_model_path or "HuggingFaceTB/SmolVLM-500M-Instruct"
     processor = SmolVLMVLAProcessor.from_pretrained(smolvlm_path)
+
+    if verifier_path:
+        logger.info(f"Loading energy verifier from {verifier_path}...")
+        verifier = ActionEnergyVerifier.from_pretrained(verifier_path)
+        verifier = verifier.to(device)
+        verifier.eval()
+        logger.info(f"Verifier params: {verifier.num_parameters / 1e6:.1f}M")
     
     if norm_stats_path and os.path.exists(norm_stats_path):
         logger.info(f"Loading norm stats from: {norm_stats_path}")
@@ -133,10 +156,78 @@ def decode_numpy(obj):
     return obj
 
 
+def _log_latency(latency_ms: float):
+    """Append per-request latency to the JSONL log (if configured)."""
+    path = CONFIG.get("latency_log")
+    if not path:
+        return
+    try:
+        import json as _json
+        with open(path, "a") as f:
+            f.write(_json.dumps({
+                "latency_ms": latency_ms,
+                "mode": CONFIG["mode"],
+                "num_samples": CONFIG["num_samples"],
+                "flow_steps": CONFIG["flow_steps"],
+            }) + "\n")
+    except Exception as e:
+        logger.warning(f"Failed to write latency log: {e}")
+
+
+def _generate(lang, images, image_mask, proprio_tensor):
+    """Dispatch action generation according to CONFIG['mode']."""
+    mode = CONFIG["mode"]
+
+    if mode == "flow":
+        actions = model.generate_actions(
+            input_ids=lang['input_ids'],
+            image_input=images,
+            image_mask=image_mask,
+            proprio=proprio_tensor,
+            steps=CONFIG["flow_steps"],
+        )
+        return actions
+
+    if mode == "onestep":
+        actions = model.generate_actions(
+            input_ids=lang['input_ids'],
+            image_input=images,
+            image_mask=image_mask,
+            proprio=proprio_tensor,
+            steps=1,
+        )
+        return actions
+
+    if mode == "bok":
+        if verifier is None:
+            raise RuntimeError("mode=bok requires --verifier")
+        # VLM runs once; candidates and verifier share the features.
+        enc = model.forward_vlm_efficient(images, image_mask, lang['input_ids'])
+        cands = model.sample_action_candidates(
+            input_ids=None, image_input=None, image_mask=None,
+            proprio=proprio_tensor,
+            num_samples=CONFIG["num_samples"],
+            steps=1,
+            vlm_features=enc["vlm_features"],
+        )
+        if hasattr(model.action_space, 'normalize_state'):
+            proprio_norm = model.action_space.normalize_state(proprio_tensor)
+        else:
+            proprio_norm = proprio_tensor
+        energies = verifier.score_candidates(
+            enc["vlm_features"], proprio_norm, cands["actions_norm"]
+        )  # [B, K]
+        best = energies.argmin(dim=1)  # [B]
+        idx = best.view(-1, 1, 1, 1).expand(-1, 1, *cands["actions"].shape[2:])
+        return cands["actions"].gather(1, idx).squeeze(1)
+
+    raise ValueError(f"Unknown inference mode: {mode}")
+
+
 def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
     """Run inference on a single observation."""
     global model, processor
-    
+
     try:
         # Extract observation fields
         image0 = observation.get("observation/image")
@@ -172,19 +263,19 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
         
         # Proprioception
         proprio_tensor = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
-        
-        # Inference
+
+        # Inference (timed)
+        import time as _time
+        t_start = _time.perf_counter()
         with torch.no_grad():
-            actions = model.generate_actions(
-                input_ids=lang['input_ids'],
-                image_input=images,
-                image_mask=image_mask,
-                proprio=proprio_tensor,
-                steps=CONFIG["action_horizon"],
-            )
-        
+            actions = _generate(lang, images, image_mask, proprio_tensor)
+        if device == "cuda":
+            torch.cuda.synchronize()
+        latency_ms = (_time.perf_counter() - t_start) * 1000.0
+        _log_latency(latency_ms)
+
         actions = actions.cpu().numpy()[0]
-        
+
         return {"actions": actions}
         
     except Exception as e:
@@ -267,23 +358,44 @@ def main():
                         help="Path to SimVLA checkpoint")
     parser.add_argument("--norm_stats", type=str, default=None,
                         help="Path to normalization stats JSON")
-    parser.add_argument("--smolvlm_model", type=str, 
+    parser.add_argument("--smolvlm_model", type=str,
                         default="HuggingFaceTB/SmolVLM-500M-Instruct",
                         help="SmolVLM model path or HuggingFace repo")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
-    
+    parser.add_argument("--mode", type=str, default="flow",
+                        choices=["flow", "onestep", "bok"],
+                        help="Inference mode (see module docstring)")
+    parser.add_argument("--flow_steps", type=int, default=10,
+                        help="Integration steps for mode=flow")
+    parser.add_argument("--num_samples", type=int, default=8,
+                        help="K candidates for mode=bok")
+    parser.add_argument("--verifier", type=str, default=None,
+                        help="ActionEnergyVerifier checkpoint dir (required for mode=bok)")
+    parser.add_argument("--latency_log", type=str, default=None,
+                        help="JSONL file to append per-request latency")
+
     args = parser.parse_args()
-    
+
     if not HAS_MSGPACK:
         logger.warning("msgpack_numpy not installed! Install with: pip install msgpack-numpy")
-    
-    load_model(args.checkpoint, args.norm_stats, args.smolvlm_model)
-    
+
+    CONFIG["mode"] = args.mode
+    CONFIG["flow_steps"] = args.flow_steps
+    CONFIG["num_samples"] = args.num_samples
+    CONFIG["latency_log"] = args.latency_log
+    if args.mode == "bok" and not args.verifier:
+        parser.error("--mode bok requires --verifier")
+
+    load_model(args.checkpoint, args.norm_stats, args.smolvlm_model,
+               verifier_path=args.verifier)
+
     logger.info(f"Starting SimVLA server on {args.host}:{args.port}")
     logger.info(f"  Image size: {CONFIG['image_size']}x{CONFIG['image_size']}")
     logger.info(f"  Action horizon: {CONFIG['action_horizon']}")
-    
+    logger.info(f"  Mode: {CONFIG['mode']} (flow_steps={CONFIG['flow_steps']}, "
+                f"K={CONFIG['num_samples']})")
+
     asyncio.run(serve(args.host, args.port))
 
 

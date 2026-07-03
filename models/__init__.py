@@ -29,6 +29,13 @@ from .transformer_smolvlm import (
     timestep_embedding,
 )
 
+# Task-2: action energy verifier (best-of-K test-time scaling)
+from .verifier import (
+    ActionEnergyVerifier,
+    ActionEnergyVerifierConfig,
+    info_nce_loss,
+)
+
 __all__ = [
     # SimVLA
     "SmolVLMVLAConfig",
@@ -48,4 +55,8 @@ __all__ = [
     "Attention",
     "Mlp",
     "timestep_embedding",
+    # Verifier
+    "ActionEnergyVerifier",
+    "ActionEnergyVerifierConfig",
+    "info_nce_loss",
 ]

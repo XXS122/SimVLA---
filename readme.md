@@ -69,6 +69,22 @@ cd evaluation/libero
 
 <img width="506" height="1220" alt="image" src="https://github.com/user-attachments/assets/6ee1cd5e-42c5-4cf7-9cce-6dc04c1a215f" />
 
+## Task-2: One-Step MeanFlow + Energy-Verified Best-of-K (Test-Time Scaling)
+
+Distill the 10-step flow-matching head into a one-step MeanFlow generator, train a
+lightweight action energy verifier, and evaluate best-of-K inference-time scaling
+on LIBERO. Full pipeline, dual-site (A100/A800) roles, and pre-registered
+falsifiable predictions: see [docs/TASK2_PIPELINE.md](docs/TASK2_PIPELINE.md).
+
+```bash
+cp paths.env.example paths.env   # edit machine-local paths (git-ignored)
+source paths.env
+bash scripts/task2_train_sft.sh                                        # Stage 0 (A100)
+bash scripts/task2_train_meanflow.sh $SIMVLA_CHECKPOINTS/task2_sft/ckpt-200000   # Stage 1 (A100)
+bash scripts/task2_train_verifier.sh <sft_ckpt> <meanflow_ckpt>        # Stage 2 (A800)
+cd evaluation/libero && bash run_scaling_eval.sh <meanflow_ckpt> <verifier_ckpt> # Stage 3
+```
+
 ## Model Architecture
 
 - **Vision-Language Backbone**: SmolVLM-500M-Instruct (576 hidden dim)

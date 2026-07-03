@@ -84,7 +84,19 @@ class SmolVLMVLA(PreTrainedModel):
 
         # DiT/AdaLN mode setting
         self.use_adaln = getattr(config, 'use_adaln', False)
-        
+
+        # MeanFlow mode setting (one-step / few-step average-velocity field)
+        self.use_meanflow = getattr(config, 'use_meanflow', False)
+        self.meanflow_ratio = getattr(config, 'meanflow_ratio', 0.5)
+        self.meanflow_adaptive_p = getattr(config, 'meanflow_adaptive_p', 1.0)
+        self.meanflow_adaptive_c = getattr(config, 'meanflow_adaptive_c', 1e-3)
+        # Optional frozen teacher velocity field (set externally by the distill
+        # script; never serialized with the checkpoint).
+        self.teacher_transformer = None
+        # Detach VLM features in the MeanFlow loss (backbone stays frozen
+        # during distillation, so skipping activation backprop saves memory).
+        self.meanflow_detach_vlm = True
+
         # Flow matching action head (SmolVLM version - no aux_visual)
         self.transformer = SmolVLMActionTransformer(
             hidden_size=config.hidden_size,
@@ -97,12 +109,15 @@ class SmolVLMVLA(PreTrainedModel):
             dim_time=config.dim_time,
             max_len_seq=config.max_len_seq,
             use_adaln=self.use_adaln,
+            use_meanflow=self.use_meanflow,
         )
-        
+
         if self.use_adaln:
             logging.info("✓ DiT/AdaLN mode enabled: conditions injected via Adaptive Layer Norm")
         else:
             logging.info("✓ Concat mode enabled: conditions concatenated to sequence")
+        if self.use_meanflow:
+            logging.info("✓ MeanFlow mode enabled: average-velocity field, one-step capable")
 
         # Deferred FastAPI app
         self.app: FastAPI | None = None
@@ -331,12 +346,18 @@ class SmolVLMVLA(PreTrainedModel):
     ) -> Dict[str, torch.Tensor]:
         """
         Flow Matching training.
-        
+
         1) Time sampling: t ~ Beta(1.5, 1) * 0.999 + 0.001
         2) Interpolation: x_t = t * noise + (1-t) * actions
         3) Target: velocity u_t = noise - actions
         4) Model predicts v_t, compute MSE(v_t, u_t)
+
+        When use_meanflow=True, trains the average-velocity field instead
+        (see forward_meanflow).
         """
+        if self.use_meanflow:
+            return self.forward_meanflow(input_ids, image_input, image_mask, proprio, action)
+
         enc = self.forward_vlm_efficient(image_input, image_mask, input_ids)
 
         B = input_ids.shape[0]
@@ -380,8 +401,122 @@ class SmolVLMVLA(PreTrainedModel):
         
         # MSE loss
         velocity_loss = torch.mean(torch.square(v_t - u_t))
-        
+
         return {"velocity_loss": velocity_loss}
+
+    # ============================== MeanFlow training ============================
+    def _normalize_inputs(self, proprio: torch.Tensor, action: torch.Tensor):
+        """Normalize action/proprio with whatever the action space provides."""
+        if hasattr(self.action_space, 'normalize_action'):
+            action_norm = self.action_space.normalize_action(action)
+        elif hasattr(self.action_space, 'normalize'):
+            action_norm = self.action_space.normalize(action)
+        else:
+            action_norm = action
+
+        if hasattr(self.action_space, 'normalize_state'):
+            proprio_norm = self.action_space.normalize_state(proprio)
+        elif hasattr(self.action_space, 'normalize'):
+            proprio_norm = self.action_space.normalize(proprio)
+        else:
+            proprio_norm = proprio
+        return proprio_norm, action_norm
+
+    def forward_meanflow(
+        self,
+        input_ids: torch.LongTensor,
+        image_input: torch.FloatTensor,
+        image_mask: torch.Tensor,
+        proprio: torch.Tensor,
+        action: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        MeanFlow training (one-step-capable average-velocity field).
+
+        The head u_theta(x_t, r, t) learns the average velocity over [r, t]:
+            (t - r) * u(x_t, r, t) = ∫_r^t v(x_τ, τ) dτ
+        via the MeanFlow identity (differentiating w.r.t. t):
+            u = v_t - (t - r) * d/dt u,   d/dt u = v_t · ∇_x u + ∂_t u
+        The total derivative is computed with one forward-mode JVP; the target
+        is stop-gradiented. When r == t the objective reduces to standard flow
+        matching, so a `meanflow_ratio` fraction of samples uses r < t and the
+        rest r = t.
+
+        v_t is the conditional velocity (noise - action) by default, or the
+        frozen teacher's predicted velocity when self.teacher_transformer is set.
+        """
+        if self.meanflow_detach_vlm:
+            with torch.no_grad():
+                enc = self.forward_vlm_efficient(image_input, image_mask, input_ids)
+            vlm_features = enc["vlm_features"].detach()
+        else:
+            enc = self.forward_vlm_efficient(image_input, image_mask, input_ids)
+            vlm_features = enc["vlm_features"]
+
+        B = input_ids.shape[0]
+        device = input_ids.device
+
+        proprio_norm, action_norm = self._normalize_inputs(proprio, action)
+
+        # Sample the time pair (r, t): two Beta(1.5, 1) draws, t = max, r = min;
+        # with probability (1 - meanflow_ratio) collapse to r = t (plain FM).
+        beta_dist = torch.distributions.Beta(
+            torch.tensor(1.5, device=device),
+            torch.tensor(1.0, device=device),
+        )
+        t1 = beta_dist.sample((B,)) * 0.999 + 0.001
+        t2 = beta_dist.sample((B,)) * 0.999 + 0.001
+        t = torch.maximum(t1, t2)
+        r = torch.minimum(t1, t2)
+        collapse = torch.rand(B, device=device) >= self.meanflow_ratio
+        r = torch.where(collapse, t, r)
+
+        noise = torch.randn_like(action_norm)
+        t_expanded = t.view(-1, 1, 1)
+        x_t = t_expanded * noise + (1 - t_expanded) * action_norm
+
+        # Instantaneous velocity at (x_t, t)
+        if self.teacher_transformer is not None:
+            with torch.no_grad():
+                v_t = self.teacher_transformer(
+                    vlm_features=vlm_features,
+                    action_with_noise=x_t,
+                    proprio=proprio_norm,
+                    t=t,
+                )
+        else:
+            v_t = noise - action_norm
+
+        def u_fn(z, r_, t_):
+            return self.transformer(
+                vlm_features=vlm_features,
+                action_with_noise=z,
+                proprio=proprio_norm,
+                t=t_,
+                r=r_,
+            )
+
+        # One JVP along (dz/dt, dr/dt, dt/dt) = (v_t, 0, 1) gives d/dt u.
+        u, dudt = torch.func.jvp(
+            u_fn,
+            (x_t, r, t),
+            (v_t, torch.zeros_like(r), torch.ones_like(t)),
+        )
+
+        u_tgt = (v_t - (t - r).view(-1, 1, 1) * dudt).detach()
+
+        # Adaptive weighting from the MeanFlow paper:
+        #   L = ||Δ||² / (sg(||Δ||²) + c)^p
+        err = u - u_tgt
+        delta_sq = err.pow(2).mean(dim=(1, 2))
+        weight = (delta_sq.detach() + self.meanflow_adaptive_c).pow(self.meanflow_adaptive_p)
+        meanflow_loss = (delta_sq / weight).mean()
+
+        # Stashed for logging only — the returned dict must contain pure loss
+        # terms because training loops sum its values.
+        self._last_meanflow_raw_mse = delta_sq.mean().detach()
+
+        return {"meanflow_loss": meanflow_loss}
 
     # ================================= inference =================================
     @torch.no_grad()
@@ -395,18 +530,20 @@ class SmolVLMVLA(PreTrainedModel):
     ) -> torch.Tensor:
         """
         Flow Matching inference (Euler integration).
-        
+
         1) Initialize x_t = noise (t=1)
         2) Loop t from 1 to 0:
            - Model predicts velocity v_t
            - Euler update: x_t = x_t + dt * v_t
         3) Final x_0 ≈ target action
+
+        MeanFlow models integrate the average-velocity field instead; with
+        steps=1 this is genuine one-step generation: x_0 = x_1 - u(x_1, 0, 1).
         """
         self.eval()
         enc = self.forward_vlm_efficient(image_input, image_mask, input_ids)
 
         B = input_ids.shape[0]
-        D = self.action_space.dim_action
         device = proprio.device
         dtype = proprio.dtype
 
@@ -418,27 +555,127 @@ class SmolVLMVLA(PreTrainedModel):
         else:
             proprio_norm = proprio
 
-        # Euler integration
+        x_t = self._integrate(
+            vlm_features=enc["vlm_features"],
+            proprio_norm=proprio_norm,
+            noise=None,
+            steps=steps,
+            device=device,
+            dtype=dtype,
+            batch=B,
+        )
+        return self.action_space.postprocess(x_t)
+
+    def _integrate(
+        self,
+        vlm_features: torch.Tensor,
+        proprio_norm: torch.Tensor,
+        noise: torch.Tensor | None,
+        steps: int,
+        device,
+        dtype,
+        batch: int,
+    ) -> torch.Tensor:
+        """Integrate the (mean) flow from t=1 noise to t=0 normalized actions."""
+        D = self.action_space.dim_action
         steps = max(1, int(steps))
+
+        x_t = noise if noise is not None else torch.randn(
+            batch, self.num_actions, D, device=device, dtype=dtype
+        )
+
+        if self.use_meanflow:
+            # Piecewise displacement with the average-velocity field:
+            #   x_{t_lo} = x_{t_hi} - (t_hi - t_lo) * u(x_{t_hi}, t_lo, t_hi)
+            grid = torch.linspace(1.0, 0.0, steps + 1, device=device, dtype=dtype)
+            for i in range(steps):
+                t_hi = torch.full((batch,), grid[i].item(), device=device, dtype=dtype)
+                t_lo = torch.full((batch,), grid[i + 1].item(), device=device, dtype=dtype)
+                u = self.transformer(
+                    vlm_features=vlm_features,
+                    action_with_noise=x_t,
+                    proprio=proprio_norm,
+                    t=t_hi,
+                    r=t_lo,
+                )
+                x_t = x_t - (grid[i] - grid[i + 1]) * u
+            return x_t
+
+        # Standard flow matching: Euler on the instantaneous velocity field.
         dt = -1.0 / steps
-        
-        x_t = torch.randn(B, self.num_actions, D, device=device, dtype=dtype)
         t = 1.0
-        
         while t > -dt / 2:
-            t_tensor = torch.full((B,), t, device=device, dtype=dtype)
-            
+            t_tensor = torch.full((batch,), t, device=device, dtype=dtype)
             v_t = self.transformer(
-                vlm_features=enc["vlm_features"],
+                vlm_features=vlm_features,
                 action_with_noise=x_t,
                 proprio=proprio_norm,
                 t=t_tensor,
             )
-        
             x_t = x_t + dt * v_t
             t = t + dt
-        
-        return self.action_space.postprocess(x_t)
+        return x_t
+
+    @torch.no_grad()
+    def sample_action_candidates(
+        self,
+        input_ids: torch.LongTensor,
+        image_input: torch.FloatTensor,
+        image_mask: torch.Tensor,
+        proprio: torch.Tensor,
+        num_samples: int = 8,
+        steps: int = 1,
+        vlm_features: torch.Tensor | None = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Draw num_samples action chunks per observation in one batched pass.
+
+        The VLM encoder runs once; only the (small) action head is replicated
+        K times, so best-of-K sampling costs a single head-batch forward per
+        integration step. Pass precomputed `vlm_features` to skip the VLM
+        entirely (used by the verifier trainer).
+
+        Returns
+        -------
+        {
+          "actions":      [B, K, T, D]  post-processed (unnormalized) actions,
+          "actions_norm": [B, K, T, D]  normalized actions (verifier input space),
+        }
+        """
+        self.eval()
+        if vlm_features is None:
+            enc = self.forward_vlm_efficient(image_input, image_mask, input_ids)
+            vlm_features = enc["vlm_features"]
+
+        B = vlm_features.shape[0]
+        K = max(1, int(num_samples))
+        device = proprio.device
+        dtype = proprio.dtype
+
+        if hasattr(self.action_space, 'normalize_state'):
+            proprio_norm = self.action_space.normalize_state(proprio)
+        elif hasattr(self.action_space, 'normalize'):
+            proprio_norm = self.action_space.normalize(proprio)
+        else:
+            proprio_norm = proprio
+
+        feats_k = vlm_features.repeat_interleave(K, dim=0)      # [B*K, T_vlm, D]
+        proprio_k = proprio_norm.repeat_interleave(K, dim=0)    # [B*K, dp]
+
+        x_norm = self._integrate(
+            vlm_features=feats_k,
+            proprio_norm=proprio_k,
+            noise=None,
+            steps=steps,
+            device=device,
+            dtype=dtype,
+            batch=B * K,
+        )
+
+        T, D = x_norm.shape[1], x_norm.shape[2]
+        actions_norm = x_norm.view(B, K, T, D)
+        actions = self.action_space.postprocess(x_norm).view(B, K, T, D)
+        return {"actions": actions, "actions_norm": actions_norm}
 
     # =============================== FastAPI service =============================
     def _build_app(self, processor):

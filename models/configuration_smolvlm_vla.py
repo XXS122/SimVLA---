@@ -46,7 +46,13 @@ class SmolVLMVLAConfig(PretrainedConfig):
         
         # === DiT/AdaLN Mode ===
         use_adaln: bool = False,
-        
+
+        # === MeanFlow (one-step generation) ===
+        use_meanflow: bool = False,
+        meanflow_ratio: float = 0.5,   # fraction of samples trained with r < t (rest reduce to FM)
+        meanflow_adaptive_p: float = 1.0,
+        meanflow_adaptive_c: float = 1e-3,
+
         # === Image settings ===
         image_size: int = 384,  # Can be 384 or 512
         num_views: int = 3,  # Number of camera views
@@ -71,7 +77,13 @@ class SmolVLMVLAConfig(PretrainedConfig):
         
         # DiT/AdaLN settings
         self.use_adaln = use_adaln
-        
+
+        # MeanFlow settings
+        self.use_meanflow = use_meanflow
+        self.meanflow_ratio = meanflow_ratio
+        self.meanflow_adaptive_p = meanflow_adaptive_p
+        self.meanflow_adaptive_c = meanflow_adaptive_c
+
         # Image settings
         self.image_size = image_size
         self.num_views = num_views

@@ -277,6 +277,7 @@ class SmolVLMActionTransformer(nn.Module):
         dim_time: int = 32,
         max_len_seq: int = 1024,
         use_adaln: bool = False,
+        use_meanflow: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -284,6 +285,7 @@ class SmolVLMActionTransformer(nn.Module):
         self.dim_time = dim_time
         self.dim_propio = dim_propio
         self.use_adaln = use_adaln
+        self.use_meanflow = use_meanflow
 
         if use_adaln:
             # ========== DiT Mode: AdaLN ==========
@@ -324,7 +326,7 @@ class SmolVLMActionTransformer(nn.Module):
             nn.init.normal_(self.pos_emb, std=0.02)
 
             self.norm = nn.LayerNorm(hidden_size)
-            
+
             # Action encoder/decoder
             action_input_dim = dim_action + dim_time + dim_propio
             self.action_encoder = nn.Linear(action_input_dim, hidden_size)
@@ -332,12 +334,26 @@ class SmolVLMActionTransformer(nn.Module):
 
         self.apply(basic_init)
 
+        # MeanFlow: extra conditioning on the interval start time r, injected
+        # additively through a zero-initialized projection. With r == t the
+        # network is numerically identical to the instantaneous-velocity
+        # teacher, so a distilled student can start exactly from SFT weights.
+        if use_meanflow:
+            self.interval_proj = nn.Sequential(
+                nn.Linear(dim_time, hidden_size),
+                nn.SiLU(),
+                nn.Linear(hidden_size, hidden_size),
+            )
+            nn.init.constant_(self.interval_proj[-1].weight, 0.0)
+            nn.init.constant_(self.interval_proj[-1].bias, 0.0)
+
     def forward(
         self,
         vlm_features: torch.Tensor,  # [B, T_vlm, D] - unified features from SmolVLM
         action_with_noise: torch.Tensor,
         proprio: torch.Tensor,
         t: torch.Tensor,
+        r: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Forward pass for SmolVLM Action Transformer.
@@ -348,26 +364,38 @@ class SmolVLMActionTransformer(nn.Module):
         action_with_noise : [B, T_action, dim_action]
         proprio : [B, dim_proprio]
         t : [B]
+        r : [B], optional - MeanFlow interval start time. When provided (and the
+            model was built with use_meanflow=True), the network predicts the
+            average velocity over [r, t] instead of the instantaneous velocity
+            at t. r=None behaves exactly like the original flow-matching model.
 
         Returns
         -------
-        Tensor: Predicted velocity, [B, T_action, dim_action]
+        Tensor: Predicted (average) velocity, [B, T_action, dim_action]
         """
         if self.use_adaln:
-            return self._forward_adaln(vlm_features, action_with_noise, proprio, t)
+            return self._forward_adaln(vlm_features, action_with_noise, proprio, t, r)
         else:
-            return self._forward_concat(vlm_features, action_with_noise, proprio, t)
-    
+            return self._forward_concat(vlm_features, action_with_noise, proprio, t, r)
+
+    def _interval_embedding(self, t: torch.Tensor, r: torch.Tensor | None) -> torch.Tensor | None:
+        """Embedding of the interval size h = t - r (zero at h=0 by init)."""
+        if not self.use_meanflow or r is None:
+            return None
+        h = t - r
+        return self.interval_proj(timestep_embedding(h, self.dim_time))  # [B, H]
+
     def _forward_concat(
         self,
         vlm_features: torch.Tensor,
         action_with_noise: torch.Tensor,
         proprio: torch.Tensor,
         t: torch.Tensor,
+        r: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Concat mode forward pass.
-        
+
         Simplified: x = torch.cat([x, self.vlm_proj(vlm_features)], dim=1)
         No aux_visual_inputs needed.
         """
@@ -377,9 +405,14 @@ class SmolVLMActionTransformer(nn.Module):
         time_emb = timestep_embedding(t, self.dim_time)
         time_tokens = time_emb.unsqueeze(1).expand(B, num_actions, self.dim_time)
         proprio_tokens = proprio.unsqueeze(1).expand(B, num_actions, proprio.shape[-1])
-        
+
         action_tokens = torch.cat([action_with_noise, proprio_tokens, time_tokens], dim=-1)
         x = self.action_encoder(action_tokens)  # [B, T_action, H]
+
+        # MeanFlow interval conditioning (zero at init / when r == t untrained)
+        interval_emb = self._interval_embedding(t, r)
+        if interval_emb is not None:
+            x = x + interval_emb.unsqueeze(1)
 
         # Project VLM features and concatenate (no aux_visual needed)
         x = torch.cat([x, self.vlm_proj(vlm_features)], dim=1)
@@ -405,28 +438,34 @@ class SmolVLMActionTransformer(nn.Module):
         action_with_noise: torch.Tensor,
         proprio: torch.Tensor,
         t: torch.Tensor,
+        r: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         DiT/AdaLN mode forward pass.
-        
+
         Conditions (time, vlm, proprio) injected via AdaLN.
         No aux_visual needed for SmolVLM.
         """
         B, num_actions = action_with_noise.shape[:2]
-        
+
         # ========== 1. Build global condition c ==========
         # Time embedding
         t_emb = timestep_embedding(t, self.hidden_size)
         t_emb = self.time_proj(t_emb)  # [B, H]
-        
+
         # VLM condition: Global Average Pooling
         vlm_cond = self.vlm_cond_proj(vlm_features.mean(dim=1))  # [B, H]
-        
+
         # Proprio condition
         proprio_cond = self.proprio_proj(proprio)  # [B, H]
-        
+
         # Fuse all conditions
         c = t_emb + vlm_cond + proprio_cond  # [B, H]
+
+        # MeanFlow interval conditioning (zero at init / when r == t untrained)
+        interval_emb = self._interval_embedding(t, r)
+        if interval_emb is not None:
+            c = c + interval_emb
         
         # ========== 2. Encode action sequence ==========
         x = self.action_encoder(action_with_noise)  # [B, T_action, H]
