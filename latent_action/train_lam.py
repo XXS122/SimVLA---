@@ -35,7 +35,7 @@ except RuntimeError:
     pass
 
 from latent_action import config as C
-from latent_action.data import FramePairDataset
+from latent_action.data import FramePairDataset, gpu_preprocess
 from latent_action.models import (
     FrozenVisionBackbone,
     LatentActionModel,
@@ -140,8 +140,9 @@ def main(args):
     amp_dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
     for batch in loader:
-        frames_t = batch["frames_t"].to(device, non_blocking=True)
-        frames_tk = batch["frames_tk"].to(device, non_blocking=True)
+        # workers ship raw uint8 frames; resize/normalize on GPU
+        frames_t = gpu_preprocess(batch["frames_t"], args.image_size, device)
+        frames_tk = gpu_preprocess(batch["frames_tk"], args.image_size, device)
 
         lr = cosine_lr(step, args.warmup_steps, args.iters, args.learning_rate)
         for g in optim.param_groups:

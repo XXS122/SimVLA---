@@ -22,7 +22,7 @@ import numpy as np
 import torch
 
 from latent_action import config as C
-from latent_action.data import _demo_frames, iter_demos, load_meta
+from latent_action.data import _demo_frames_raw, gpu_preprocess, iter_demos, load_meta
 from latent_action.models import FrozenVisionBackbone, load_lam, shared_ego_augment
 
 
@@ -66,8 +66,10 @@ def main(args):
             ts = np.arange(0, T - args.stride)
             for lo in range(0, len(ts), args.batch_size):
                 sub = ts[lo:lo + args.batch_size]
-                frames_t = _demo_frames(rec["demo"], sub, args.image_size).to(device)
-                frames_tk = _demo_frames(rec["demo"], sub + args.stride, args.image_size).to(device)
+                frames_t = gpu_preprocess(_demo_frames_raw(rec["demo"], sub),
+                                          args.image_size, device)
+                frames_tk = gpu_preprocess(_demo_frames_raw(rec["demo"], sub + args.stride),
+                                           args.image_size, device)
                 if args.ego_aug:
                     frames_t, frames_tk = shared_ego_augment(frames_t, frames_tk)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16,

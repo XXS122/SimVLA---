@@ -41,38 +41,50 @@ def load_meta(meta_path: str) -> dict:
         return json.load(f)
 
 
-def preprocess_frame(img: np.ndarray, image_size: int) -> torch.Tensor:
-    """uint8 [H, W, 3] (raw hdf5 orientation) -> float [3, S, S], normalized."""
-    img = img[::-1, ::-1].copy()  # same 180-degree rotation as LiberoHDF5Handler
-    t = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
-    if t.shape[-1] != image_size or t.shape[-2] != image_size:
-        t = F.interpolate(
-            t.unsqueeze(0), size=(image_size, image_size),
-            mode="bicubic", align_corners=False, antialias=True,
-        ).squeeze(0)
-    return (t - IMAGE_MEAN) / IMAGE_STD
-
-
-def _demo_frames(demo: h5py.Group, indices: np.ndarray, image_size: int) -> torch.Tensor:
-    """Return [N, V=2, 3, S, S] frames (agentview, wrist) at given indices."""
+def _demo_frames_raw(demo: h5py.Group, indices: np.ndarray) -> torch.Tensor:
+    """Return raw uint8 frames [N, V=2, H, W, 3] (agentview, wrist), rotated
+    180 degrees like LiberoHDF5Handler. Kept small (uint8, native resolution)
+    so DataLoader workers move ~100KB/sample through IPC instead of ~7MB of
+    preprocessed float tensors — resize/normalize happens on GPU
+    (gpu_preprocess), which also avoids /dev/shm exhaustion in containers.
+    """
     agent = demo["obs/agentview_rgb"]
     wrist = demo["obs/eye_in_hand_rgb"]
     out = []
     for t in indices:
-        a = preprocess_frame(np.asarray(agent[t]), image_size)
-        w = preprocess_frame(np.asarray(wrist[t]), image_size)
-        out.append(torch.stack([a, w], dim=0))
-    return torch.stack(out, dim=0)
+        a = np.asarray(agent[t])[::-1, ::-1].copy()
+        w = np.asarray(wrist[t])[::-1, ::-1].copy()
+        out.append(np.stack([a, w], axis=0))
+    return torch.from_numpy(np.stack(out, axis=0))
+
+
+def gpu_preprocess(frames_u8: torch.Tensor, image_size: int,
+                   device: torch.device | str) -> torch.Tensor:
+    """uint8 [B, V, H, W, 3] -> normalized float [B, V, 3, S, S] on device.
+
+    Same ops/order as the CPU pipeline in datasets/dataset_smolvlm.py:
+    scale to [0,1], bicubic+antialias resize, ImageNet normalization.
+    """
+    x = frames_u8.to(device, non_blocking=True)
+    B, V = x.shape[:2]
+    x = x.permute(0, 1, 4, 2, 3).float().div_(255.0).flatten(0, 1)  # [B*V,3,H,W]
+    if x.shape[-1] != image_size or x.shape[-2] != image_size:
+        x = F.interpolate(x, size=(image_size, image_size),
+                          mode="bicubic", align_corners=False, antialias=True)
+    mean = IMAGE_MEAN.to(device=x.device, dtype=x.dtype)
+    std = IMAGE_STD.to(device=x.device, dtype=x.dtype)
+    x = (x - mean) / std
+    return x.view(B, V, 3, image_size, image_size)
 
 
 class FramePairDataset(IterableDataset):
     """
     Yields frame pairs (o_t, o_{t+stride}) for LAM training.
 
-    Sample:
+    Sample (raw uint8; run gpu_preprocess on the batch before the encoder):
       {
-        "frames_t":  FloatTensor [V=2, 3, S, S],
-        "frames_tk": FloatTensor [V=2, 3, S, S],
+        "frames_t":  ByteTensor [V=2, H, W, 3],
+        "frames_tk": ByteTensor [V=2, H, W, 3],
         "action":    FloatTensor [7]   (a_t, probe/diagnostics only),
       }
     """
@@ -117,7 +129,7 @@ class FramePairDataset(IterableDataset):
                 else:
                     ts = valid
                 for t in ts:
-                    pair = _demo_frames(demo, np.array([t, t + self.stride]), self.image_size)
+                    pair = _demo_frames_raw(demo, np.array([t, t + self.stride]))
                     yield {
                         "frames_t": pair[0],
                         "frames_tk": pair[1],
