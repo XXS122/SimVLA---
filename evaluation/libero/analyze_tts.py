@@ -71,6 +71,24 @@ def episode_key(r):
     return (r.get("task_id"), r.get("episode"))
 
 
+def pick_unc_field(diag_by_config, requested: str = "auto") -> str:
+    """
+    Choose the uncertainty field to analyze.
+
+    Preference order: uncertainty_x0hat (noise-cancelled one-step estimate,
+    logged by newer servers) > uncertainty_x0 (final-candidate variance,
+    present in all logs) > uncertainty_v1 (raw velocity variance at t=1;
+    dominated by the noise itself — last resort only).
+    """
+    if requested != "auto":
+        return requested
+    for field in ("uncertainty_x0hat", "uncertainty_x0", "uncertainty_v1"):
+        for records in diag_by_config.values():
+            if any(r.get(field) is not None for r in records):
+                return field
+    return "uncertainty_v1"
+
+
 # ---------------------------------------------------------------------------
 # 1. Scaling table
 # ---------------------------------------------------------------------------
@@ -129,8 +147,8 @@ def gripper_events(calls):
     return events
 
 
-def uncertainty_alignment(diag_by_config, max_dist=10):
-    print("\n=== Uncertainty (v1) vs distance to nearest gripper event ===")
+def uncertainty_alignment(diag_by_config, max_dist=10, field="uncertainty_x0"):
+    print(f"\n=== Uncertainty ({field}) vs distance to nearest gripper event ===")
     printed = False
     for key, records in sorted(diag_by_config.items()):
         suite, n, s, sel = key
@@ -139,7 +157,7 @@ def uncertainty_alignment(diag_by_config, max_dist=10):
 
         episodes = defaultdict(list)
         for r in records:
-            if r.get("uncertainty_v1") is not None:
+            if r.get(field) is not None:
                 episodes[episode_key(r)].append(r)
 
         bins = defaultdict(list)
@@ -152,7 +170,7 @@ def uncertainty_alignment(diag_by_config, max_dist=10):
                 continue
             for i, c in enumerate(calls):
                 d = min(abs(i - e) for e in events)
-                bins[min(d, max_dist)].append(c["uncertainty_v1"])
+                bins[min(d, max_dist)].append(c[field])
 
         if not bins:
             continue
@@ -173,8 +191,8 @@ def uncertainty_alignment(diag_by_config, max_dist=10):
 # ---------------------------------------------------------------------------
 # 3. Episode-level uncertainty vs success
 # ---------------------------------------------------------------------------
-def uncertainty_vs_success(results_by_config, diag_by_config):
-    print("\n=== Episode mean uncertainty vs success (point-biserial r) ===")
+def uncertainty_vs_success(results_by_config, diag_by_config, field="uncertainty_x0"):
+    print(f"\n=== Episode mean uncertainty ({field}) vs success (point-biserial r) ===")
     printed = False
     for key, eps in sorted(results_by_config.items()):
         diag = diag_by_config.get(key, [])
@@ -183,8 +201,8 @@ def uncertainty_vs_success(results_by_config, diag_by_config):
 
         ep_unc = defaultdict(list)
         for r in diag:
-            if r.get("uncertainty_v1") is not None:
-                ep_unc[episode_key(r)].append(r["uncertainty_v1"])
+            if r.get(field) is not None:
+                ep_unc[episode_key(r)].append(r[field])
 
         pairs = []
         for e in eps:
@@ -259,6 +277,9 @@ def main():
                         help="Server-side diag.jsonl (enables uncertainty analyses)")
     parser.add_argument("--out", type=str, default=None, help="Optional summary CSV path")
     parser.add_argument("--plots", type=str, default=None, help="Optional directory for PNG plots")
+    parser.add_argument("--unc_field", type=str, default="auto",
+                        choices=["auto", "uncertainty_x0hat", "uncertainty_x0", "uncertainty_v1"],
+                        help="Uncertainty probe field to analyze (auto prefers x0hat > x0 > v1)")
     args = parser.parse_args()
 
     results = load_results(Path(args.results_dir))
@@ -266,8 +287,9 @@ def main():
 
     rows = scaling_table(results, diag, out_csv=args.out)
     if diag:
-        uncertainty_alignment(diag)
-        uncertainty_vs_success(results, diag)
+        field = pick_unc_field(diag, args.unc_field)
+        uncertainty_alignment(diag, field=field)
+        uncertainty_vs_success(results, diag, field=field)
     if args.plots and rows:
         make_plots(rows, args.plots)
 

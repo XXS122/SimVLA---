@@ -468,13 +468,19 @@ class SmolVLMVLA(PreTrainedModel):
           - "first":      candidate 0 (equivalent to plain single sampling)
 
         Uncertainty probes (returned in diagnostics):
-          - uncertainty_v1: variance of the velocity field across candidates
-            at the first Euler step (t=1) — available before integration ends
-          - uncertainty_x0: variance of the final candidates
+          - uncertainty_x0hat: variance across candidates of the one-step
+            denoised estimate x0_hat = x_t - t*v at the first Euler step.
+            Subtracting v cancels the noise term (at t=1, x0_hat equals the
+            model's action prediction), so this measures genuine predictive
+            uncertainty. Available before integration ends.
+          - uncertainty_v1: variance of the raw velocity field at t=1.
+            NOTE: dominated by the noise itself (empirically ~(1-1/N)*1.0
+            regardless of state) — kept for diagnostics only.
+          - uncertainty_x0: variance of the final integrated candidates.
 
         If `adaptive_threshold` is set (batch size 1 only), integration
         collapses to a single candidate after the first step whenever
-        uncertainty_v1 falls below the threshold, saving compute on easy
+        uncertainty_x0hat falls below the threshold, saving compute on easy
         states while keeping full sampling on hard ones.
 
         Returns
@@ -514,6 +520,7 @@ class SmolVLMVLA(PreTrainedModel):
         t = 1.0
 
         uncertainty_v1 = None
+        uncertainty_x0hat = None
         num_forwards = 0
         n_active = N
         step_idx = 0
@@ -533,6 +540,10 @@ class SmolVLMVLA(PreTrainedModel):
             if step_idx == 0 and N > 1:
                 v1 = v_t.view(B, N, self.num_actions, D)
                 uncertainty_v1 = v1.var(dim=1, unbiased=False).mean(dim=(1, 2))  # [B]
+                # One-step denoised estimate: x0_hat = x_t - t*v cancels the
+                # noise term, leaving genuine predictive uncertainty
+                x0_hat = (x_t - t * v_t).view(B, N, self.num_actions, D)
+                uncertainty_x0hat = x0_hat.var(dim=1, unbiased=False).mean(dim=(1, 2))
 
             x_t = x_t + dt * v_t
 
@@ -541,8 +552,8 @@ class SmolVLMVLA(PreTrainedModel):
                 step_idx == 0
                 and adaptive_threshold is not None
                 and N > 1
-                and uncertainty_v1 is not None
-                and float(uncertainty_v1[0]) < adaptive_threshold
+                and uncertainty_x0hat is not None
+                and float(uncertainty_x0hat[0]) < adaptive_threshold
             ):
                 x_t = x_t[:1]
                 n_active = 1
@@ -583,6 +594,7 @@ class SmolVLMVLA(PreTrainedModel):
             "transformer_forwards": num_forwards,
             "selected_index": idx,
             "uncertainty_v1": uncertainty_v1,
+            "uncertainty_x0hat": uncertainty_x0hat,
             "uncertainty_x0": uncertainty_x0,
         }
         if return_candidates:

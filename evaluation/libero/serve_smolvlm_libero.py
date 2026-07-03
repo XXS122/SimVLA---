@@ -93,8 +93,9 @@ def log_diagnostics(observation: Dict[str, Any], diag: Dict[str, Any], actions: 
         "selector": diag["selector"],
         "transformer_forwards": diag["transformer_forwards"],
         "selected_index": int(diag["selected_index"].reshape(-1)[0].item()),
-        "uncertainty_v1": _scalar(diag["uncertainty_v1"]),
-        "uncertainty_x0": _scalar(diag["uncertainty_x0"]),
+        "uncertainty_v1": _scalar(diag.get("uncertainty_v1")),
+        "uncertainty_x0hat": _scalar(diag.get("uncertainty_x0hat")),
+        "uncertainty_x0": _scalar(diag.get("uncertainty_x0")),
         # Gripper command channel of the selected chunk (for event alignment)
         "gripper_cmd": [float(a) for a in actions[:, -1]],
     }
