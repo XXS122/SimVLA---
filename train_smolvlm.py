@@ -26,7 +26,15 @@ from typing import Dict
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
+import torch.multiprocessing
 from torch.optim import AdamW
+
+# Avoid "DataLoader worker killed by Bus error" in containers with a small
+# /dev/shm: exchange tensors through the file system instead of shared memory.
+try:
+    torch.multiprocessing.set_sharing_strategy("file_system")
+except RuntimeError:
+    pass
 
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from datasets import create_smolvlm_dataloader

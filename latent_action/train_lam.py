@@ -23,8 +23,16 @@ import time
 from pathlib import Path
 
 import torch
+import torch.multiprocessing
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+
+# Avoid "DataLoader worker killed by Bus error" in containers with a small
+# /dev/shm: exchange tensors through the file system instead of shared memory.
+try:
+    torch.multiprocessing.set_sharing_strategy("file_system")
+except RuntimeError:
+    pass
 
 from latent_action import config as C
 from latent_action.data import FramePairDataset
