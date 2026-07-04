@@ -101,6 +101,8 @@ class WebSocketClient:
 
     def reset(self) -> None:
         self.action_plan: Deque[np.ndarray] = collections.deque()
+        self.last_uncertainty: Optional[float] = None
+        self.num_fetches: int = 0
 
     def step(self, obs: Dict, goal: str, meta: Optional[Dict] = None) -> np.ndarray:
         if not self.action_plan:
@@ -126,6 +128,8 @@ class WebSocketClient:
 
             # Query server
             result = self.client.infer(element)
+            self.last_uncertainty = result.get("uncertainty") if isinstance(result, dict) else None
+            self.num_fetches += 1
             action_chunk = result["actions"]
             
             # Ensure numpy array

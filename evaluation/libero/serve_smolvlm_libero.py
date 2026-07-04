@@ -259,7 +259,14 @@ def infer(observation: Dict[str, Any]) -> Dict[str, Any]:
         actions = actions.float().cpu().numpy()[0]
         log_diagnostics(observation, diag, actions)
 
-        return {"actions": actions}
+        # Return the uncertainty probe so clients can trigger interventions
+        unc = diag.get("uncertainty_x0hat")
+        if unc is None:
+            unc = diag.get("uncertainty_x0")
+        if isinstance(unc, torch.Tensor):
+            unc = float(unc.reshape(-1)[0].item())
+
+        return {"actions": actions, "uncertainty": unc}
         
     except Exception as e:
         logger.error(f"Inference error: {e}")
@@ -302,8 +309,10 @@ async def handle_connection(websocket, path=None):
                 actions = result["actions"]
                 if isinstance(actions, np.ndarray):
                     actions = actions.tolist()
-                
+
                 response_data = {"actions": actions}
+                if result.get("uncertainty") is not None:
+                    response_data["uncertainty"] = result["uncertainty"]
                 
                 if HAS_MSGPACK:
                     import msgpack
