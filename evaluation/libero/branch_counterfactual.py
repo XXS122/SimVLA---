@@ -148,6 +148,7 @@ def main():
         env, desc = get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
 
         for ep in range(args.num_trials):
+            print(f"[task {task_id} ep {ep}] rollout ...", flush=True)
             env.reset()
             client.reset()
             client.extra = main_extra
@@ -189,6 +190,12 @@ def main():
                 finished_before_trigger += 1
                 record.update(arm="none", success=bool(success), env_steps=int(t))
             else:
+                print(
+                    f"[task {task_id} ep {ep}] trigger: arm={trigger['arm']} "
+                    f"call={trigger['call']} unc={trigger['unc']} -> "
+                    f"{args.branches} branches ...",
+                    flush=True,
+                )
                 snapshot = env.get_sim_state()
                 t_trig = t
                 successes = 0
@@ -200,6 +207,11 @@ def main():
                         env, client, obs_b, t_trig, max_total, desc, None
                     )
                     successes += int(ok)
+                    print(
+                        f"[task {task_id} ep {ep}]   branch {m + 1}/{args.branches}: "
+                        f"{'success' if ok else 'fail'}",
+                        flush=True,
+                    )
                 record.update(
                     arm=trigger["arm"],
                     trigger_call=int(trigger["call"]),
