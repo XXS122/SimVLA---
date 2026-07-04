@@ -123,10 +123,21 @@ def main():
                         help="Branch here when no spike occurred (control arm)")
     parser.add_argument("--log", type=str, required=True,
                         help="Output JSONL path")
+    # Flow-DPO data collection mode
+    parser.add_argument("--save_pairs_dir", type=str, default=None,
+                        help="Save snapshot observations + per-branch first "
+                             "chunks here (turns the run into a matched-state "
+                             "preference-pair collector for Flow-DPO)")
+    parser.add_argument("--randomize_control", action="store_true", default=False,
+                        help="Draw the control branch point uniformly from "
+                             "[min_call, control_call] per episode (state "
+                             "diversity for data collection)")
     args = parser.parse_args()
 
     np.random.seed(args.seed)
     Path(args.log).parent.mkdir(parents=True, exist_ok=True)
+    if args.save_pairs_dir:
+        Path(args.save_pairs_dir).mkdir(parents=True, exist_ok=True)
 
     main_extra = {"tts/num_samples": args.num_samples, "tts/ode_steps": args.ode_steps}
     branch_extra = {"tts/num_samples": args.branch_num_samples, "tts/ode_steps": args.ode_steps}
@@ -158,10 +169,13 @@ def main():
             t = NUM_STEPS_WAIT
 
             trigger = {}
+            control_at = args.control_call
+            if args.randomize_control:
+                control_at = int(np.random.randint(args.min_call, args.control_call + 1))
 
-            def on_chunk(unc, t_now, _trigger=trigger):
+            def on_chunk(unc, t_now, _trigger=trigger, _control_at=control_at):
                 calls = client.num_fetches
-                if calls >= args.control_call:
+                if calls >= _control_at:
                     _trigger.update(arm="control", unc=unc, call=calls)
                     return True
                 if (
@@ -198,7 +212,25 @@ def main():
                 )
                 snapshot = env.get_sim_state()
                 t_trig = t
+
+                # Data-collection mode: save the snapshot observation once
+                snapshot_file = None
+                if args.save_pairs_dir:
+                    packed = build_obs(obs)
+                    snapshot_file = str(
+                        Path(args.save_pairs_dir)
+                        / f"snap_{args.task_suite}_t{task_id}_e{ep}.npz"
+                    )
+                    np.savez_compressed(
+                        snapshot_file,
+                        image=packed["image"].astype(np.uint8),
+                        wrist_image=packed["wrist_image"].astype(np.uint8),
+                        state=packed["state"].astype(np.float32),
+                        prompt=desc,
+                    )
+
                 successes = 0
+                branch_records = []
                 client.extra = branch_extra
                 for m in range(args.branches):
                     obs_b = env.set_init_state(snapshot)
@@ -214,10 +246,26 @@ def main():
                         inner.timestep = 0
                         inner.done = False
                     client.reset()
+
+                    # Grab the first chunk the branch samples at the snapshot
+                    # state: that action is the preference-pair candidate
+                    first_chunk = {}
+
+                    def grab_chunk(unc, t_now, _fc=first_chunk):
+                        if "chunk" not in _fc and client.last_chunk is not None:
+                            _fc["chunk"] = client.last_chunk.tolist()
+                        return False
+
                     _, _, _, ok = run_segment(
-                        env, client, obs_b, t_trig, max_total, desc, None
+                        env, client, obs_b, t_trig, max_total, desc,
+                        grab_chunk if args.save_pairs_dir else None,
                     )
                     successes += int(ok)
+                    if args.save_pairs_dir:
+                        branch_records.append({
+                            "success": bool(ok),
+                            "first_chunk": first_chunk.get("chunk"),
+                        })
                     print(
                         f"[task {task_id} ep {ep}]   branch {m + 1}/{args.branches}: "
                         f"{'success' if ok else 'fail'}",
@@ -231,6 +279,9 @@ def main():
                     branches=int(args.branches),
                     branch_successes=int(successes),
                 )
+                if args.save_pairs_dir:
+                    record["snapshot_file"] = snapshot_file
+                    record["branch_records"] = branch_records
                 arm_stats[trigger["arm"]].append(successes / args.branches)
 
             with open(args.log, "a") as f:

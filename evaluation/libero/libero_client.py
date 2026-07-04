@@ -102,6 +102,7 @@ class WebSocketClient:
     def reset(self) -> None:
         self.action_plan: Deque[np.ndarray] = collections.deque()
         self.last_uncertainty: Optional[float] = None
+        self.last_chunk: Optional[np.ndarray] = None
         self.num_fetches: int = 0
 
     def step(self, obs: Dict, goal: str, meta: Optional[Dict] = None) -> np.ndarray:
@@ -131,10 +132,11 @@ class WebSocketClient:
             self.last_uncertainty = result.get("uncertainty") if isinstance(result, dict) else None
             self.num_fetches += 1
             action_chunk = result["actions"]
-            
+
             # Ensure numpy array
             if not isinstance(action_chunk, np.ndarray):
                 action_chunk = np.array(action_chunk)
+            self.last_chunk = action_chunk.copy()
             
             assert len(action_chunk) >= self.replan_steps, \
                 f"Need {self.replan_steps} steps but got {len(action_chunk)}"
