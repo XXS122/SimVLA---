@@ -77,7 +77,17 @@ def main(args):
                 n_missing += 1
                 continue
             z = np.asarray(zf[key], dtype=np.float32)          # [T - stride, z_dim]
-            a = rec["actions"][: len(z)].astype(np.float32)    # aligned a_t
+            # z_t summarizes motion over [t, t+stride) -> regress against the
+            # window-mean action (== windowed delta up to the affine scale the
+            # probe absorbs anyway)
+            acts = rec["actions"].astype(np.float32)
+            if stride > 1:
+                csum = np.cumsum(np.concatenate([np.zeros((1, acts.shape[1]),
+                                                          dtype=np.float32), acts]), axis=0)
+                a = (csum[stride:] - csum[:-stride]) / float(stride)  # [T-stride+1, 7]
+                a = a[: len(z)]
+            else:
+                a = acts[: len(z)]
             a = (a - a_mean) / (a_std + 1e-6)
             if rng.rand() < args.val_fraction:                 # episode-level split
                 Z_va.append(z); A_va.append(a)

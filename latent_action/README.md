@@ -53,6 +53,12 @@ These three baselines are the "random init" line of the main figure
 ./run_pipeline.sh probe                           # PASS iff mean R^2 >= 0.6
 ```
 
+**Early health check (first hour of train-lam):** `recon` is normalized —
+1.0 means the decoder predicts zero change and z is useless; it must drop
+clearly below 1 (e.g. ≤0.7). If it hugs 1.0 after ~1h, kill the run and
+escalate (larger `--stride`, larger `--lam_dim/--enc_depth`) instead of
+waiting for the probe.
+
 **Stop rule:** if `probe` reports mean R² < 0.6 after reasonable tuning of
 `--var_coef/--cov_coef/--inv_coef`, the identifiability premise fails —
 stop here and pivot.

@@ -157,7 +157,7 @@ class LatentActionModel(nn.Module):
             x = blk(x)
         return self.to_z(x[:, -1])
 
-    # ---- forward model: (o_t, z) -> o_{t+k} tokens ----
+    # ---- forward model: (o_t, z) -> feature CHANGE (o_{t+k} - o_t) tokens ----
     def decode(self, feats_t: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         B, P, _ = feats_t.shape
         x = self.proj_in(feats_t) + self.pos_emb[:, :P]
@@ -170,13 +170,32 @@ class LatentActionModel(nn.Module):
     def forward(
         self, feats_t: torch.Tensor, feats_tk: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
+        """Predict the feature-space delta f_{t+k} - f_t from (f_t, z).
+
+        Predicting the delta (instead of f_{t+k} itself) removes the copy
+        shortcut: a decoder that ignores z can copy f_t and still score well
+        on next-frame reconstruction, leaving z gradient-free and letting the
+        variance regularizer fill it with scene identity instead of motion.
+
+        recon_loss is normalized by the delta energy, so it has an absolute
+        scale: 1.0 == "predicts zero change / z is useless"; it must drop
+        clearly below 1 for z to carry action information.
+        """
         z = self.encode(feats_t, feats_tk)
         vq_loss = feats_t.new_zeros(())
         if self.vq is not None:
             z, vq_loss, _ = self.vq(z)
-        pred = self.decode(feats_t, z)
-        recon = F.mse_loss(pred, feats_tk)
-        return {"z": z, "pred": pred, "recon_loss": recon, "vq_loss": vq_loss}
+        pred_delta = self.decode(feats_t, z)
+        target_delta = feats_tk - feats_t
+        delta_energy = target_delta.pow(2).mean().detach()
+        recon = F.mse_loss(pred_delta, target_delta) / (delta_energy + 1e-8)
+        return {
+            "z": z,
+            "pred": pred_delta,
+            "recon_loss": recon,
+            "vq_loss": vq_loss,
+            "delta_energy": delta_energy,
+        }
 
     def config_dict(self) -> dict:
         return {

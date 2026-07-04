@@ -35,7 +35,9 @@ def get_args_parser():
                    help="write pretraining meta JSON (dataset_name=libero_z)")
     p.add_argument("--smolvlm_model_path", type=str, default=C.SMOLVLM_MODEL)
     p.add_argument("--image_size", type=int, default=384)
-    p.add_argument("--stride", type=int, default=1)
+    p.add_argument("--stride", type=int, default=0,
+                   help="frame gap; 0 = read automatically from the LAM "
+                        "checkpoint so labeling always matches training")
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--ego_aug", action="store_true", default=False,
                    help="apply shared ego-motion warp (stress-test labels)")
@@ -47,6 +49,11 @@ def main(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     backbone = FrozenVisionBackbone(args.smolvlm_model_path).to(device)
     lam = load_lam(args.lam_ckpt).to(device).eval()
+
+    if args.stride <= 0:  # auto: match the stride the LAM was trained with
+        payload = torch.load(args.lam_ckpt, map_location="cpu", weights_only=False)
+        args.stride = int(payload.get("extra", {}).get("args", {}).get("stride", 1))
+        print(f"[label_z] stride auto-detected from checkpoint: {args.stride}")
 
     meta = load_meta(args.meta_path)
     out_path = Path(args.output)

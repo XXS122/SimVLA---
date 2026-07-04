@@ -58,7 +58,9 @@ def get_args_parser():
     p.add_argument("--smolvlm_model_path", type=str, default=C.SMOLVLM_MODEL)
     # data
     p.add_argument("--image_size", type=int, default=384)
-    p.add_argument("--stride", type=int, default=1)
+    p.add_argument("--stride", type=int, default=4,
+                   help="frame gap of a pair; at 10Hz LIBERO, 1 step of motion "
+                        "is nearly invisible in coarse VLM features — use >=4")
     p.add_argument("--batch_size", type=int, default=96)
     p.add_argument("--num_workers", type=int, default=8)
     # model
@@ -183,7 +185,10 @@ def main(args):
             t0 = time.time()
             logs = {
                 "loss": loss.item(),
+                # recon is normalized: 1.0 == z useless (zero-change predictor);
+                # healthy training must push it clearly below 1.
                 "recon": outputs["recon_loss"].item(),
+                "delta_energy": float(outputs["delta_energy"]),
                 "var": reg["var_loss"].item(),
                 "cov": reg["cov_loss"].item(),
                 "inv": float(inv_loss),
