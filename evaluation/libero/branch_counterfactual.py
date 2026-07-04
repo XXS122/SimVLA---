@@ -202,6 +202,17 @@ def main():
                 client.extra = branch_extra
                 for m in range(args.branches):
                     obs_b = env.set_init_state(snapshot)
+                    # set_init_state restores the MuJoCo state but not the
+                    # robosuite wrapper's step counter/done flag; they keep
+                    # accumulating across branches and step() raises
+                    # "executing action in terminated episode" once the
+                    # wrapper horizon (1000) is crossed. Clear them so each
+                    # branch gets a fresh wrapper budget (our own t budget
+                    # remains the binding limit).
+                    inner = getattr(env, "env", None)
+                    if inner is not None:
+                        inner.timestep = 0
+                        inner.done = False
                     client.reset()
                     _, _, _, ok = run_segment(
                         env, client, obs_b, t_trig, max_total, desc, None
