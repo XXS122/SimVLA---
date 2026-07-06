@@ -80,6 +80,12 @@ def get_args_parser():
                              "noise came from 7/8-type snapshots)")
     parser.add_argument("--max_branch_rate", type=float, default=None,
                         help="Keep only snapshots with branch success rate <= this")
+    parser.add_argument("--arm_filter", type=str, nargs="+", default=None,
+                        choices=["spike", "control"],
+                        help="Keep only snapshots triggered by these arms "
+                             "(e.g. --arm_filter spike to test whether "
+                             "uncertainty-triggered branch points carry "
+                             "cleaner preference signal than fixed-point ones)")
 
     parser.add_argument("--save_interval", type=int, default=1000)
     parser.add_argument("--log_interval", type=int, default=20)
@@ -170,6 +176,7 @@ def main(args):
         max_pairs_per_snapshot=args.max_pairs_per_snapshot,
         min_branch_rate=args.min_branch_rate,
         max_branch_rate=args.max_branch_rate,
+        arm_filter=args.arm_filter,
     )
     loader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True,

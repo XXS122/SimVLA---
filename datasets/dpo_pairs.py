@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
 import numpy as np
 import torch
@@ -46,6 +46,7 @@ def build_pair_index(
     max_pairs_per_snapshot: int = 4,
     min_branch_rate: float | None = None,
     max_branch_rate: float | None = None,
+    arm_filter: Sequence[str] | None = None,
 ) -> List[dict]:
     """
     Scan collector JSONL file(s) and enumerate (snapshot, winner, loser) pairs.
@@ -57,6 +58,14 @@ def build_pair_index(
     noise (this poisoned round 1). Keeping rates in e.g. [0.2, 0.8]
     restricts training to states where the first action plausibly decides
     the outcome.
+
+    arm_filter keeps only snapshots whose trigger arm is in the given set
+    (e.g. ["spike"]). Spike snapshots are branched at a genuine
+    model-perceived difficulty moment; control snapshots are branched at a
+    fixed/randomized call index regardless of difficulty and may carry more
+    outcome variance from environment stochasticity than from action
+    quality. Comparing spike-only vs control-only training tests whether
+    that distinction matters for how much real signal a pair carries.
     """
     if isinstance(records_paths, (str, Path)):
         records_paths = [records_paths]
@@ -72,6 +81,8 @@ def build_pair_index(
                 branch_records = r.get("branch_records")
                 snap = r.get("snapshot_file")
                 if not branch_records or not snap:
+                    continue
+                if arm_filter is not None and r.get("arm") not in arm_filter:
                     continue
                 rate = sum(1 for b in branch_records if b["success"]) / len(branch_records)
                 if min_branch_rate is not None and rate < min_branch_rate:
@@ -116,10 +127,12 @@ class DPOPairDataset(Dataset):
         max_pairs_per_snapshot: int = 4,
         min_branch_rate: float | None = None,
         max_branch_rate: float | None = None,
+        arm_filter: Sequence[str] | None = None,
     ):
         self.pairs = build_pair_index(
             records_path, max_pairs_per_snapshot,
             min_branch_rate=min_branch_rate, max_branch_rate=max_branch_rate,
+            arm_filter=arm_filter,
         )
         if not self.pairs:
             raise ValueError(
