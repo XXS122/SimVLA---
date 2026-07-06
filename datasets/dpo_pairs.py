@@ -41,40 +41,66 @@ IMAGE_MEAN = (0.485, 0.456, 0.406)
 IMAGE_STD = (0.229, 0.224, 0.225)
 
 
-def build_pair_index(records_path: str, max_pairs_per_snapshot: int = 4) -> List[dict]:
-    """Scan the collector JSONL and enumerate (snapshot, winner, loser) pairs."""
+def build_pair_index(
+    records_paths,
+    max_pairs_per_snapshot: int = 4,
+    min_branch_rate: float | None = None,
+    max_branch_rate: float | None = None,
+) -> List[dict]:
+    """
+    Scan collector JSONL file(s) and enumerate (snapshot, winner, loser) pairs.
+
+    min/max_branch_rate filter snapshots by their branch success rate:
+    outcome labels only carry chunk-level credit at PIVOTAL states. At a
+    7/8-success snapshot the single failure was almost certainly caused
+    later in that branch, not by its first chunk — such pairs are label
+    noise (this poisoned round 1). Keeping rates in e.g. [0.2, 0.8]
+    restricts training to states where the first action plausibly decides
+    the outcome.
+    """
+    if isinstance(records_paths, (str, Path)):
+        records_paths = [records_paths]
     pairs = []
-    with open(records_path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            r = json.loads(line)
-            branch_records = r.get("branch_records")
-            snap = r.get("snapshot_file")
-            if not branch_records or not snap:
-                continue
-            winners = [b["first_chunk"] for b in branch_records
-                       if b["success"] and b["first_chunk"]]
-            losers = [b["first_chunk"] for b in branch_records
-                      if not b["success"] and b["first_chunk"]]
-            if not winners or not losers:
-                continue
-            count = 0
-            for w in winners:
-                for l in losers:
-                    pairs.append({
-                        "snapshot_file": snap,
-                        "action_w": w,
-                        "action_l": l,
-                        "arm": r.get("arm"),
-                        "task_id": r.get("task_id"),
-                    })
-                    count += 1
+    for records_path in records_paths:
+        root = Path(records_path).parent
+        with open(records_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                r = json.loads(line)
+                branch_records = r.get("branch_records")
+                snap = r.get("snapshot_file")
+                if not branch_records or not snap:
+                    continue
+                rate = sum(1 for b in branch_records if b["success"]) / len(branch_records)
+                if min_branch_rate is not None and rate < min_branch_rate:
+                    continue
+                if max_branch_rate is not None and rate > max_branch_rate:
+                    continue
+                winners = [b["first_chunk"] for b in branch_records
+                           if b["success"] and b["first_chunk"]]
+                losers = [b["first_chunk"] for b in branch_records
+                          if not b["success"] and b["first_chunk"]]
+                if not winners or not losers:
+                    continue
+                count = 0
+                for w in winners:
+                    for l in losers:
+                        pairs.append({
+                            "snapshot_file": snap,
+                            "records_root": str(root),
+                            "action_w": w,
+                            "action_l": l,
+                            "arm": r.get("arm"),
+                            "task_id": r.get("task_id"),
+                            "branch_rate": rate,
+                        })
+                        count += 1
+                        if count >= max_pairs_per_snapshot:
+                            break
                     if count >= max_pairs_per_snapshot:
                         break
-                if count >= max_pairs_per_snapshot:
-                    break
     return pairs
 
 
@@ -83,21 +109,26 @@ class DPOPairDataset(Dataset):
 
     def __init__(
         self,
-        records_path: str,
+        records_path,
         image_size: int = 384,
         num_views: int = 3,
         training: bool = True,
         max_pairs_per_snapshot: int = 4,
+        min_branch_rate: float | None = None,
+        max_branch_rate: float | None = None,
     ):
-        self.pairs = build_pair_index(records_path, max_pairs_per_snapshot)
+        self.pairs = build_pair_index(
+            records_path, max_pairs_per_snapshot,
+            min_branch_rate=min_branch_rate, max_branch_rate=max_branch_rate,
+        )
         if not self.pairs:
             raise ValueError(
                 f"No preference pairs found in {records_path}. The collector "
-                "must be run with --save_pairs_dir, and snapshots need both "
-                "successful and failed branches."
+                "must be run with --save_pairs_dir, snapshots need both "
+                "successful and failed branches, and the branch-rate filter "
+                "must not exclude everything."
             )
         self.num_views = num_views
-        self.records_root = Path(records_path).parent
 
         transform_list = [
             transforms.Resize((image_size, image_size),
@@ -121,16 +152,17 @@ class DPOPairDataset(Dataset):
     def __len__(self) -> int:
         return len(self.pairs)
 
-    def _resolve(self, path: str) -> str:
-        p = Path(path)
+    @staticmethod
+    def _resolve(pair: dict) -> str:
+        p = Path(pair["snapshot_file"])
         if p.exists():
             return str(p)
         # Collector may have logged paths relative to its own cwd
-        return str(self.records_root / p.name)
+        return str(Path(pair["records_root"]) / p.name)
 
     def __getitem__(self, idx: int) -> Dict:
         pair = self.pairs[idx]
-        snap = np.load(self._resolve(pair["snapshot_file"]), allow_pickle=True)
+        snap = np.load(self._resolve(pair), allow_pickle=True)
 
         imgs = [
             self.image_aug(Image.fromarray(snap["image"])),

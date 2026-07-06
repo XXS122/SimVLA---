@@ -52,8 +52,9 @@ def get_args_parser():
     parser = argparse.ArgumentParser("Flow-DPO training", add_help=False)
     parser.add_argument("--models", type=str, required=True,
                         help="BC checkpoint to start from (also the reference)")
-    parser.add_argument("--pairs", type=str, required=True,
-                        help="branches.jsonl from the pair collector")
+    parser.add_argument("--pairs", type=str, nargs="+", required=True,
+                        help="branches.jsonl file(s) from the pair collector "
+                             "(pass several to merge multiple collection runs)")
     parser.add_argument("--output_dir", type=str, default="./runs/flow_dpo")
     parser.add_argument("--smolvlm_model_path", type=str,
                         default=os.environ.get("SIMVLA_SMOLVLM_MODEL",
@@ -73,6 +74,12 @@ def get_args_parser():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--max_pairs_per_snapshot", type=int, default=4)
     parser.add_argument("--image_size", type=int, default=384)
+    parser.add_argument("--min_branch_rate", type=float, default=None,
+                        help="Keep only snapshots with branch success rate >= "
+                             "this (filters non-pivotal states; round-1 label "
+                             "noise came from 7/8-type snapshots)")
+    parser.add_argument("--max_branch_rate", type=float, default=None,
+                        help="Keep only snapshots with branch success rate <= this")
 
     parser.add_argument("--save_interval", type=int, default=1000)
     parser.add_argument("--log_interval", type=int, default=20)
@@ -161,6 +168,8 @@ def main(args):
         image_size=args.image_size,
         training=True,
         max_pairs_per_snapshot=args.max_pairs_per_snapshot,
+        min_branch_rate=args.min_branch_rate,
+        max_branch_rate=args.max_branch_rate,
     )
     loader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True,
