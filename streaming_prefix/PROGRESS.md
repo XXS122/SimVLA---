@@ -6,50 +6,73 @@ every experiment. Newest status at the top.
 
 ---
 
-## Current status (last updated: after Phase B code delivery)
+## Current status (last updated: after Phase B training completed)
 
-**Phase A (profiling) result: clear "go" signal, with a refined design
-target.** On the real SmolVLM-500M backbone (batch=1, LIBERO-scale
-config), at the default 10 Euler steps: **vlm_frac = 45.5%** — VLM
-prefix re-encoding is a large, worth-attacking share of per-control-step
-latency. Breakdown of the VLM forward itself: vision tower 4.86ms (23%),
-connector 0.07ms (~0%), **fused text-model forward 15.19ms (72%)**. At
-1 Euler step (increasingly common with fast/few-step flow heads),
-vlm_frac rises to 83.1% — the bottleneck gets *worse*, not better, as
-action heads get faster.
+**Phase B training SUCCEEDED (teacher-forced).** 30k-step distillation
+run on real SmolVLM-500M + full LIBERO finished at **recon = 0.504**
+(delta_energy 0.174). recon started at exactly 1.0 (zero-init "predict no
+change" baseline) and dropped to ~0.50 — i.e. the state-update operator
+explains ~50% of the frame-to-frame variance in the fused text-model
+output, cleanly beating the "just copy the previous step" baseline. This
+is a genuine positive (contrast Innovation 4's LAM, which stalled at
+R²≈0): the mechanism works.
 
-**Key design decision this forced:** target the **fused text-model
-forward** (the actual 72% bottleneck), not the vision tower (what
-existing caching work like VLA-Cache/TTF-VLA already targets, and which
-is cheap here anyway — recompute it fresh every step, don't bother
-caching it).
+**IMPORTANT caveat on what 0.50 means (and does NOT mean):** this is the
+*teacher-forced* training error — every step is fed the REAL previous
+fused output as cached state. At deployment the operator will be fed its
+OWN previous prediction between resets, so error can compound across
+steps (exposure bias). 0.50 is therefore the optimistic, single-step,
+ideal-cache number; it does not by itself establish closed-loop
+viability. Whether recursive self-conditioning drifts geometrically
+(bounded) or diverges is exactly the paper's core theoretical claim and
+**must be measured in Phase C, not assumed.**
 
-**Phase B code delivered** (commit pending push): `PrefixStateUpdater`
-replaces the ~15ms text-model forward with a small transformer that
-predicts the *delta* from the previous step's real fused output, given
-this step's cheaply-recomputed (vision+connector+text-embed) features.
-Verified at the unit level: identity at init (zero-initialized output
-projection → predicts no change), loss baseline exactly 1.0 for a
-"predict no change" prediction, and the operator can overfit a single
-real (teacher, tiny-model) pair from loss 1.0 down to 0.07 in 30 steps —
-confirms gradient flow and learnability of the mechanism itself
-end-to-end (data loading → teacher forward → updater forward → loss →
-backward → checkpoint).
+**Phase A (profiling) result that motivated all this:** at the default
+10 Euler steps, VLM prefix re-encoding is **45.5%** of per-step latency;
+within it the fused text-model forward is 72% (15.19ms) vs. vision tower
+23% (4.86ms) — so this work targets the text-model forward, the opposite
+of where VLA-Cache/TTF-VLA intervene. As Euler steps shrink (faster flow
+heads), vlm_frac *rises* (to 83% at 1 step), strengthening the motivation.
 
-**Next action (real training, not yet run):**
+**Phase C diagnostic code delivered (commit pending), not yet run on
+real model.** Two scripts, both verified end-to-end on CPU/tiny model:
+
+Run these next (needs the trained `updater_final.pt` from Phase B):
 ```bash
 git pull
-CUDA_VISIBLE_DEVICES=6 python -m streaming_prefix.train_student \
+# 1. recursive drift: bounded (geometric) or divergent?
+CUDA_VISIBLE_DEVICES=6 python -m streaming_prefix.eval_drift \
     --meta_path runs/latent_action_ws/metas/libero_train.json \
-    --output_dir runs/latent_action_ws/streaming_prefix \
-    --iters 30000 --batch_size 64 --num_workers 16 --stride 1 \
-    2>&1 | tee logs/train_updater.log
+    --updater_ckpt runs/latent_action_ws/streaming_prefix/updater_final.pt \
+    --horizon 20 --num_episodes 50 \
+    --output logs/drift_report.json 2>&1 | tee logs/eval_drift.log
+
+# 2. end-to-end latency: streaming vs full re-encode
+CUDA_VISIBLE_DEVICES=6 python -m streaming_prefix.eval_latency \
+    --updater_ckpt runs/latent_action_ws/streaming_prefix/updater_final.pt \
+    --euler_steps 1 5 10 --reset_periods 5 10 20 \
+    --output logs/latency_report.json 2>&1 | tee logs/eval_latency.log
 ```
-**Health check (same convention as the LAM lesson in Innovation 4):**
-`recon` must drop clearly below 1.0 within the first hour. It starts at
-exactly 1.0 (zero-init). If it doesn't move, kill and escalate (more
-depth/hidden capacity, or reconsider stride) before waiting for a full
-run.
+
+**What each answers, and the go/no-go read:**
+- `eval_drift`: prints recursive-drift vs. teacher-forced error at each
+  step k, their gap (exposure bias), the implied safe reset period for a
+  drift budget, and whether drift saturates (consistent with a geometric
+  bound) or diverges. **If drift diverges, the streaming approach is not
+  closed-loop viable and the theory framing fails — this is the real
+  go/no-go, more than the 0.50 training number.**
+- `eval_latency`: prints per-step full-vs-streaming speedup and the
+  amortized speedup/Hz folding in one full re-encode per reset period.
+  Confirms whether Phase A's predicted headroom is realized. (Note:
+  meaningless on tiny test models — the replaced text-model must be big
+  enough to matter, as it is at 500M.)
+
+After these two, the remaining Phase C work is the closed-loop LIBERO
+success-rate comparison (streaming vs. full re-encode vs.
+VLA-Cache/TTF-VLA baselines) on the time-vs-success Pareto plot — the
+paper's headline figure — which requires wiring the updater into the
+evaluation serving path (`evaluation/libero/serve_smolvlm_libero.py`),
+not yet done.
 
 ---
 
@@ -173,12 +196,40 @@ not started.
 
 ---
 
+### 3. Phase B training result + Phase C diagnostic code (this commit)
+
+Phase B training on real SmolVLM-500M + full LIBERO (30k steps,
+batch 64, stride 1) finished at **recon=0.504** (from a 1.0 zero-init
+baseline) — the state-update operator explains ~50% of the fused
+text-model output's frame-to-frame variance under teacher forcing. Clear
+positive; but this is single-step, ideal-cache error and does not settle
+closed-loop viability (see caveat in Current status).
+
+Added Phase C diagnostics:
+- `streaming_prefix/eval_drift.py` — recursive drift measurement:
+  starting from a real reset, applies the updater recursively on its own
+  output for up to `--horizon` steps, recording normalized drift vs. the
+  real full re-encode at each k, alongside a teacher-forced reference
+  (the gap = exposure bias). Reports implied safe reset period and a
+  crude saturation check for the geometric-bound claim.
+- `streaming_prefix/eval_latency.py` — end-to-end per-step latency,
+  streaming (cheap_forward + updater + action head) vs. full
+  (cheap_forward + real text model + action head), plus amortized
+  speedup/Hz folding in one reset per period.
+
+Both verified end-to-end on CPU with the tiny local Idefics3 (structure,
+normalization, teacher-forced reference, reset-period derivation, JSON
+reports all correct; absolute numbers meaningless at tiny scale — an
+untrained updater correctly shows drift≈1.0, a tiny text-model correctly
+shows ~1.0x speedup).
+
 ## Commit reference
 
 | Commit | What |
 |---|---|
 | `cba0e34` | Phase A — `profile_prefix.py` latency profiling |
-| *(pending)* | Phase B — `PrefixStateUpdater` + distillation training |
+| `b0fd755` | Phase B — `PrefixStateUpdater` + distillation training |
+| *(this)* | Phase B result (recon=0.50) + Phase C drift/latency diagnostics |
 
 ## Open design questions for Phase C (not yet decided)
 
