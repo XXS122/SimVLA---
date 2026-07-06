@@ -226,7 +226,10 @@ def eval_libero(
     Run LIBERO evaluation across all tasks in a suite.
     """
     np.random.seed(seed)
-    
+
+    if log_results:
+        Path(log_results).parent.mkdir(parents=True, exist_ok=True)
+
     # Initialize task suite
     task_suite = benchmark_dict[task_suite_name]()
     num_tasks = task_suite.n_tasks
