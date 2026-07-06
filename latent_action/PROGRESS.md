@@ -6,40 +6,30 @@ status always at the top; full chronological log below for detail/audit.
 
 ---
 
-## Current status (last updated: after rotation-composition probe fix)
+## Current status (last updated: after rotation-fix result — decision point reached)
 
-**Blocked on:** waiting for the user to re-run the probe with the
-rotation-composition fix (no retraining needed — reuses the existing
-v2 z-labels):
+**The rotation-composition bug is REFUTED as the explanation for the real
+data's low R².** Re-ran the probe on the *same* v2 z-labels with the
+SO(3)-composition fix; numbers are essentially unchanged from before the
+fix (see § 11 below for the full comparison). The bug was real and worth
+having fixed (confirmed on synthetic data to single-handedly turn a
+perfect affine relationship into R²≈0), but it is not what's holding
+back this dataset.
 
-```bash
-git pull
-./run_pipeline.sh probe --nonlinear 2>&1 | tee logs/probe_v2_fixed.log
-```
+**Free calculation (no rerun needed):** restricting the nonlinear probe
+to just the 5 dims with an obvious visual footprint (dx, dy, dz, dyaw,
+gripper — excluding roll/pitch) gives mean R² ≈ **0.342**. Still far
+below the 0.6 gate. This rules out "it's fine except for 2 unobservable
+dims" as a full explanation — every dimension, including the visually
+obvious ones, is only partially decodable.
 
-**Why we're here:** two LAM variants have both failed the go/no-go gate
-(mean affine R² ≥ 0.6) — v1 at R²=0.03 (z-collapse), v2 at R²=0.04 despite
-recon improving substantially (delta-prediction fix worked, z carries
-real signal — nonlinear probe R²=0.28, 7x above chance). A bug was found
-in how the probe's rotation-dimension target was computed (naive Euler
-averaging instead of proper SO(3) composition), confirmed on synthetic
-data to be capable of turning a *perfect* affine relationship into
-R²≈0 on roll/pitch/yaw specifically. Translation/gripper dims are
-mathematically unaffected by this bug, so the 0.27–0.45 nonlinear R²
-already measured on those dims should be trustworthy as-is.
-
-**Decision pending on the new numbers:**
-- If mean R² clears ≥0.6 (or comes close) → gate passes, resume the
-  normal pipeline (§ README pretrain → finetune).
-- If rotation dims recover strongly but overall mean still < 0.6 →
-  translation/gripper signal strength (not a bug) is now the limiting
-  factor → next lever is LAM capacity/training length, not more probe
-  fixes.
-- If nothing changes → the rotation-composition bug was a red herring
-  for the real (noisy, non-synthetic) data; the earlier concern stands
-  that z may be capturing scene/object dynamics more than the robot's
-  own action → this is the point to have the CLAM-style few-shot
-  grounding vs. pivot-to-Innovation-5 conversation for real (not before).
+**This is now a genuine decision point, not a bug hunt.** Two structural
+hypotheses (z-collapse/copy-shortcut; rotation-composition math) have
+been found, fixed, and confirmed non-explanatory for the remaining gap.
+Three ways forward were put to the user (see § 11): scale up the LAM
+(cheap, uncertain payoff), add CLAM-style few-shot real-action grounding
+(likely bigger payoff, shifts the paper's core "fully action-free"
+claim), or pivot to Innovation 5. **Awaiting the user's choice.**
 
 ---
 
@@ -290,7 +280,73 @@ and must be re-measured.
 git pull
 ./run_pipeline.sh probe --nonlinear 2>&1 | tee logs/probe_v2_fixed.log
 ```
-Result pending — see "Current status" at the top of this document.
+
+### 11. Rotation fix result on real data: essentially no change → hypothesis refuted
+
+```
+=== affine probe (val R^2) ===
+  dx .0241  dy .0365  dz .0655  droll .0130  dpitch .0078  dyaw .0317  gripper .0996   mean .0397
+(reverse a->z mean R^2: 0.0118)
+=== nonlinear (MLP) probe ===
+  dx .3298  dy .3380  dz .2758  droll .0444  dpitch .1362  dyaw .3200  gripper .4460   mean .2700
+```
+
+Side-by-side with the pre-fix run (§ 8–9):
+
+| dim | affine before | affine after | nonlinear before | nonlinear after |
+|---|---|---|---|---|
+| dx | .0241 | .0241 | .3290 | .3298 |
+| dy | .0365 | .0365 | .3324 | .3380 |
+| dz | .0655 | .0655 | .2732 | .2758 |
+| droll | .0116 | .0130 | .0814 | .0444 |
+| dpitch | .0078 | .0078 | .1392 | .1362 |
+| dyaw | .0328 | .0317 | .3393 | .3200 |
+| gripper | .0996 | .0996 | .4465 | .4460 |
+| **mean** | **.0397** | **.0397** | **.2773** | **.2700** |
+
+Identical to within MLP-training noise, on *every* dimension, not just
+the rotation ones. This cleanly refutes "the composition bug explains
+the real data's rotation deficit" — the fix demonstrably works (§ 10's
+synthetic test), it just isn't the bottleneck here.
+
+**Free follow-up calculation** (no code/rerun needed — just averaging the
+already-reported per-dim numbers): restricting to the 5 dims with an
+obvious visual footprint, dx+dy+dz+dyaw+gripper:
+`(.3298+.3380+.2758+.3200+.4460)/5 = 0.342`. Still well below 0.6. So the
+"roll/pitch are unobservable, the rest is fine" reframe does not by
+itself rescue the gate — signal is weak-to-moderate (0.27–0.45)
+across the board, not "6 good dims + 2 bad ones."
+
+**Where this leaves the three original explanations for the v2 recon/R²
+tension (§ 8):**
+- Copy-shortcut / z-collapse (§ 6–7 cause) — fixed, ruled out (recon
+  moved, var healthy).
+- Rotation-composition math (§ 10) — fixed, ruled out for real data
+  (this section).
+- Remaining candidate: z's ~15–25% explained delta-energy is genuinely
+  dominated by something other than the robot's own commanded action
+  (object motion, contact dynamics, scene context) that happens to
+  correlate moderately with the visually-large dims (translation, yaw,
+  gripper) and weakly with the visually-subtle ones (roll, pitch) —
+  i.e. mostly the contamination hypothesis, not a fixable bug.
+
+**Decision point put to the user** (three options, trade-offs as
+reasoned above):
+1. Scale up the LAM (bigger `--lam_dim`/`--enc_depth`/`--dec_depth`,
+   more iters) — cheap (~1 GPU-day), tests capacity/training-length
+   before bigger changes, doesn't change the paper's claim.
+2. CLAM-style few-shot grounding — mix a small amount of real
+   action-labeled data into LAM training as an auxiliary supervised
+   loss. Likely bigger payoff, but shifts the paper's core claim from
+   "fully action-free" to "action-free + light grounding" (still
+   defensible, matches published precedent, but is a real pivot in
+   framing).
+3. Pivot to Innovation 5 (hybrid discrete-continuous flow matching for
+   the gripper) — cut losses, redeploy effort; has a cheap same-day
+   motivation check (contact-frame gripper-prediction histogram on the
+   existing SimVLA baseline checkpoint).
+
+Awaiting the user's call — see "Current status" at the top.
 
 ---
 
