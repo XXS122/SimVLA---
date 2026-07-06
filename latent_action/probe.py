@@ -19,6 +19,7 @@ from pathlib import Path
 
 import h5py
 import numpy as np
+from scipy.spatial.transform import Rotation as Rot
 
 from latent_action.data import iter_demos, load_meta
 
@@ -67,6 +68,40 @@ def _ridge(X: np.ndarray, Y: np.ndarray, lam: float):
     A = Xb.T @ Xb + lam * np.eye(d, dtype=X.dtype)
     W = np.linalg.solve(A, Xb.T @ Y)  # [d, out]
     return W[:-1], W[-1]
+
+
+def _windowed_action_target(acts: np.ndarray, stride: int) -> np.ndarray:
+    """Net action over a sliding window of `stride` raw per-step actions,
+    on the SAME per-step scale as the 1-step action (so it's comparable to
+    the action norm-stats computed on single steps).
+
+    Translation (dims 0:3) and gripper (dim 6) simply average — vector sums
+    and near-binary gripper commands compose linearly/trivially.
+
+    Rotation (dims 3:6) does NOT: naive averaging/summing of per-step Euler
+    deltas ignores that finite rotations don't commute/add, which biases
+    the regression target and can depress R^2 for roll/pitch specifically
+    (small rotations about axes with little linear-algebra "room" to
+    average correctly). We instead compose the per-step delta rotations as
+    proper SO(3) elements (R_total = R_{k-1} @ ... @ R_0) and convert the
+    net rotation back to a single equivalent Euler delta.
+    """
+    T = len(acts)
+    if stride <= 1:
+        return acts
+    n = T - stride
+    out = np.empty((n, acts.shape[1]), dtype=np.float32)
+    out[:, 0:3] = np.stack(
+        [acts[i:i + stride, 0:3].mean(axis=0) for i in range(n)]
+    )
+    out[:, 6] = np.stack([acts[i:i + stride, 6].mean() for i in range(n)])
+    for i in range(n):
+        rots = Rot.from_euler("xyz", acts[i:i + stride, 3:6])
+        net = rots[stride - 1]
+        for j in range(stride - 2, -1, -1):
+            net = net * rots[j]
+        out[i, 3:6] = net.as_euler("xyz") / stride
+    return out
 
 
 def _r2(Y: np.ndarray, Y_hat: np.ndarray) -> np.ndarray:
@@ -132,17 +167,12 @@ def main(args):
                 n_missing += 1
                 continue
             z = np.asarray(zf[key], dtype=np.float32)          # [T - stride, z_dim]
-            # z_t summarizes motion over [t, t+stride) -> regress against the
-            # window-mean action (== windowed delta up to the affine scale the
-            # probe absorbs anyway)
+            # z_t summarizes motion over [t, t+stride); regress against the
+            # properly SO(3)-composed net action over the same window (see
+            # _windowed_action_target — naive Euler-angle averaging is wrong
+            # for rotations and depresses R^2 on roll/pitch specifically).
             acts = rec["actions"].astype(np.float32)
-            if stride > 1:
-                csum = np.cumsum(np.concatenate([np.zeros((1, acts.shape[1]),
-                                                          dtype=np.float32), acts]), axis=0)
-                a = (csum[stride:] - csum[:-stride]) / float(stride)  # [T-stride+1, 7]
-                a = a[: len(z)]
-            else:
-                a = acts[: len(z)]
+            a = _windowed_action_target(acts, stride)[: len(z)]
             a = (a - a_mean) / (a_std + 1e-6)
             if rng.rand() < args.val_fraction:                 # episode-level split
                 Z_va.append(z); A_va.append(a)
