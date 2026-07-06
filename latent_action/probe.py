@@ -33,6 +33,19 @@ def get_args_parser():
     p.add_argument("--ridge_lambda", type=float, default=1e-3)
     p.add_argument("--val_fraction", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--nonlinear", action="store_true", default=False,
+                   help="also fit a small MLP z->a_norm probe (diagnostic only, "
+                        "no adapter is derived from it). Disambiguates two "
+                        "failure modes when the affine R^2 is low: high "
+                        "nonlinear R^2 means the action info IS in z but not "
+                        "affinely decodable (adapter/theory needs to change); "
+                        "low nonlinear R^2 too means z is not really encoding "
+                        "the action at all (LAM itself needs to change). "
+                        "Runs in a couple minutes on existing z labels, no GPU "
+                        "training required.")
+    p.add_argument("--mlp_hidden", type=int, default=256)
+    p.add_argument("--mlp_epochs", type=int, default=150)
+    p.add_argument("--mlp_lr", type=float, default=1e-3)
     return p
 
 
@@ -60,6 +73,48 @@ def _r2(Y: np.ndarray, Y_hat: np.ndarray) -> np.ndarray:
     sse = ((Y - Y_hat) ** 2).sum(axis=0)
     sst = ((Y - Y.mean(axis=0)) ** 2).sum(axis=0) + 1e-8
     return 1.0 - sse / sst
+
+
+def _mlp_probe(
+    Z_tr: np.ndarray, A_tr: np.ndarray, Z_va: np.ndarray, A_va: np.ndarray,
+    hidden: int, epochs: int, lr: float, seed: int = 0,
+) -> np.ndarray:
+    """Diagnostic-only nonlinear probe z -> a_norm (2-layer MLP, ridge-style
+    weight decay). Not used to build the adapter — purely to tell apart
+    'no affine map exists but the info is there' from 'the info isn't there'.
+    """
+    import torch
+    import torch.nn as nn
+
+    torch.manual_seed(seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    Ztr = torch.from_numpy(Z_tr).to(device)
+    Atr = torch.from_numpy(A_tr).to(device)
+    Zva = torch.from_numpy(Z_va).to(device)
+
+    model = nn.Sequential(
+        nn.Linear(Z_tr.shape[1], hidden), nn.ReLU(),
+        nn.Linear(hidden, hidden), nn.ReLU(),
+        nn.Linear(hidden, A_tr.shape[1]),
+    ).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+
+    n = Ztr.shape[0]
+    batch_size = min(4096, n)
+    for _ in range(epochs):
+        perm = torch.randperm(n, device=device)
+        for i in range(0, n, batch_size):
+            idx = perm[i:i + batch_size]
+            pred = model(Ztr[idx])
+            loss = nn.functional.mse_loss(pred, Atr[idx])
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+
+    model.eval()
+    with torch.no_grad():
+        pred_va = model(Zva).cpu().numpy()
+    return _r2(A_va, pred_va)
 
 
 def main(args):
@@ -120,6 +175,33 @@ def main(args):
     gate = "PASS" if r2.mean() >= 0.6 else "FAIL"
     print(f"\n>>> go/no-go gate (mean R^2 >= 0.6): {gate}")
 
+    nl_r2 = None
+    if args.nonlinear:
+        print("\n=== diagnostic: nonlinear (MLP) probe z -> a_norm (val R^2) ===")
+        nl_r2 = _mlp_probe(Z_tr, A_tr, Z_va, A_va,
+                           hidden=args.mlp_hidden, epochs=args.mlp_epochs,
+                           lr=args.mlp_lr, seed=args.seed)
+        for name, v in zip(dims, nl_r2):
+            print(f"  {name:8s}: {v:.4f}")
+        print(f"  mean    : {nl_r2.mean():.4f}")
+        if nl_r2.mean() >= 0.5:
+            print("\n>>> diagnosis: action info IS in z, but NOT affinely decodable.")
+            print("    -> affine identifiability hypothesis falsified; z needs a")
+            print("       nonlinear adapter, or the LAM needs an explicit affine-")
+            print("       inducing regularizer.")
+        elif nl_r2.mean() >= 0.2:
+            print("\n>>> diagnosis: weak/partial action signal in z, still far from")
+            print("    usable. Some info, but z is dominated by something else")
+            print("    (object motion / contact dynamics / scene context).")
+        else:
+            print("\n>>> diagnosis: z carries ~no recoverable action information,")
+            print("    linearly or nonlinearly. recon improving means z explains")
+            print("    SOME feature-space delta, but that delta is likely driven")
+            print("    by scene/object dynamics, not the robot's own action.")
+            print("    -> LAM objective itself needs to change (e.g. CLAM-style")
+            print("       few-shot grounding with a small amount of real action")
+            print("       labels), not just probe/adapter tuning.")
+
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
@@ -142,6 +224,9 @@ def main(args):
         "n_train": int(len(Z_tr)), "n_val": int(len(Z_va)),
         "z_labels": str(args.z_labels), "gate": gate,
     }
+    if nl_r2 is not None:
+        report["r2_nonlinear_per_dim"] = {k: float(v) for k, v in zip(dims, nl_r2)}
+        report["r2_nonlinear_mean"] = float(nl_r2.mean())
     report_path = Path(args.report_out) if args.report_out else out.with_suffix(".json")
     with open(report_path, "w") as f:
         json.dump(report, f, indent=2)
