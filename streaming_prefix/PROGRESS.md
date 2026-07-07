@@ -4,7 +4,32 @@
 
 ---
 
-## 当前状态（最后更新：rollout 修复失败 → 转向"锚定部署"设计）
+## 当前状态（最后更新：修正归一化后 → 转向"动作空间漂移"这一真正指标）
+
+**带修正归一化的特征漂移结果不乐观，但特征 L2 只是代理指标。** 用修正后的 eval（按整段平均单步变化能量归一，消除开局静止的假象）重测，三列结果：teacher_forced（gap-1、喂真实状态，即性能下限）中段约 0.52–0.64、后段（抓取/接触）爬到 0.8–1.07；anchored 只比 recursive 好一点点（现有模型是 rollout 训的、没在锚定分布上训过）；两者 reset period 都是 0。即便最理想的 gap-1 情形也只解释约 50% 的单步特征变化，后段更是退化到接近"无用"。
+
+**但这只是融合特征的 L2 误差——真正决定成败的是这些近似特征喂给动作头后动作差多少。** 0.5 的特征误差可能让动作面目全非，也可能动作头根本不敏感。只看特征 L2 会误判（正如创新点四不能只看 recon）。所以下一步不急着重训、也不急着上仿真，而是一个更便宜、直击要害的诊断：**动作空间漂移**——用已训练好的 SimVLA 动作头，对比"真实特征生成的动作"vs"锚定近似特征生成的动作"（固定流匹配噪声以隔离特征效应），看动作本身差多少，且按平移/旋转/夹爪分组。不需要仿真器。
+
+**下一步（需要一个已训练好的 SimVLA checkpoint 作为动作头）：**
+```bash
+git pull
+CUDA_VISIBLE_DEVICES=6 python -m streaming_prefix.eval_action_drift \
+    --checkpoint <已训练的 SmolVLMVLA 目录，如发布的 SimVLA 模型或你训的 baseline> \
+    --updater_ckpt runs/latent_action_ws/streaming_prefix_rollout/updater_final.pt \
+    --meta_path runs/latent_action_ws/metas/libero_train.json \
+    --norm_stats_path runs/latent_action_ws/norm_stats/libero_norm.json \
+    --horizon 12 --num_episodes 30 --euler_steps 10 \
+    --output logs/action_drift.json 2>&1 | tee logs/eval_action_drift.log
+```
+判读：动作漂移 = RMS(近似动作 − 真实动作) / RMS(真实动作)。
+- 若 anchored 动作漂移在若干步内保持小（<~0.15）→ 特征漂移**不**转化为坏动作，方法可行，直接进闭环 LIBERO 评测。
+- 若立刻爆掉 → 特征保真度确实重要，应把蒸馏目标从"匹配特征"改为**穿过冻结动作头匹配动作**（action-level distillation），这是更任务相关、也更宽容的目标。
+
+（若手头没有已训练的 SimVLA 动作头 checkpoint，需先训一个 baseline 或用发布的 SimVLA 模型；`$SIMVLA_CHECKPOINTS` 里那个模型路径可能就是。）
+
+---
+
+## （上一阶段状态）rollout 修复失败 → 转向"锚定部署"设计
 
 **rollout + scheduled sampling 修复几乎无效。** 重训后重测递归漂移，与修复前基本一致：recursive drift 仍在 0.8 高位，exposure_gap 只从 0.55 微降到 0.45（k=10），安全重置周期仍为 0 步。递归展开这条路收益太小。
 
