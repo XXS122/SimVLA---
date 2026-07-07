@@ -1,58 +1,24 @@
-# Progress Log — Streaming Recursive Prefix Encoding (Innovation 3)
+# 进度日志 —— 流式递归前缀编码（创新点三）
 
-Living document for this research thread (separate from
-`latent_action/PROGRESS.md`, which tracks Innovation 4). Updated after
-every experiment. Newest status at the top.
+本研究线的实时文档（与追踪创新点四的 `latent_action/PROGRESS.md` 分开维护）。每次实验后更新。最新状态置于顶部。
 
 ---
 
-## Current status (last updated: after Phase C results — drift fix delivered)
+## 当前状态（最后更新：Phase C 结果出炉后 —— 漂移修复已交付）
 
-**Split verdict from Phase C, and a design fix in response.**
+**Phase C 给出一半成功一半问题的结论，并据此做了一处设计修复。**
 
-**Latency (eval_latency): clean success, beats Phase A's prediction.**
-Per-step streaming-vs-full speedup: **1.51x @ 10 Euler steps, 1.84x @ 5,
-2.78x @ 1**. Amortized with a reset every P steps (P=10): 1.43x–2.36x,
-lifting achievable control frequency to 33–103 Hz. The compute headroom
-is real and realized.
+**时延（eval_latency）：干净的成功，甚至超过 Phase A 的预测。** 单步 streaming vs 全量重编码加速比：**10 步 Euler 下 1.51x，5 步 1.84x，1 步 2.78x**。按每 P 步重置一次摊销（P=10）：1.43x–2.36x，把可达控制频率提升到 33–103 Hz。算力富余是真实且已兑现的。
 
-**Drift (eval_drift): teacher-forced OK, recursive DIVERGENT — a real
-problem, traced to a training/deployment mismatch.** Over 50 episodes:
-teacher-forced error stays healthy (0.36–0.62, matching the 0.50 training
-recon), but recursive self-conditioned drift jumps to 0.82 at step 1 and
-sits at 0.73–0.94 thereafter; the exposure gap reaches 0.55 by step 10.
-Implied safe reset period at a 0.3 drift budget: **0 steps** — the
-operator cannot recurse on its own output even once. (The script's
-"SATURATING" note is a coarse tail-slope check and is misleading here:
-drift plateaus at a *high* level ~0.8, it does not stay bounded near 0.)
+**漂移（eval_drift）：teacher-forced 正常，但递归发散 —— 一个真问题，根源在训练与部署不匹配。** 在 50 个 episode 上：teacher-forced 误差保持健康（0.36–0.62，与训练 recon 0.50 一致），但递归自我条件化的漂移在第 1 步就跳到 0.82，此后维持在 0.73–0.94；到第 10 步 exposure gap 达 0.55。在 0.3 漂移预算下推算出的安全重置周期为 **0 步** —— 算子连一步都无法在自身输出上递归。（脚本里那句 "SATURATING" 是个粗糙的尾部斜率判断，在这里有误导性：漂移是在 *0.8 这个高位* 趋平，并非在接近 0 处封顶。）
 
-**Root cause (my Phase B design error):** `train_student.py` trained
-purely teacher-forced (always fed the REAL previous fused output). The
-operator never saw its own erroneous predictions, so it learned a mapping
-that is brittle to input error — textbook exposure bias / covariate shift
-(the DAgger problem). Evidence is exact: teacher-forced and recursive
-drift are *identical* at step 1 (both fed the real reset) and only
-diverge from step 2 on, when the recursive path starts eating its own
-error.
+**根因（我 Phase B 的设计错误）：** `train_student.py` 采用纯 teacher-forced 训练（始终喂真实的上一帧融合输出）。算子从未见过自己带误差的预测，于是学到一个对输入误差极其脆弱的映射 —— 教科书式的 exposure bias / 协变量漂移（DAgger 问题）。证据精确：teacher-forced 和 recursive 的漂移在第 1 步*完全相等*（两者都喂真实 reset），从第 2 步才分叉，此时递归路径开始吞噬自己的误差。
 
-**Fix delivered (this commit):** recursive-rollout training with
-scheduled sampling — the operator is now unrolled `--rollout_len` steps
-per window and fed its OWN (detached) previous prediction with a
-probability ramped 0 → `--max_ss_prob` over training, with the loss
-averaged over all rollout steps. This puts the operator's own error
-distribution into training, exactly what's needed to learn drift
-correction. This also turns the paper's geometric-drift-bound claim from
-an assertion into a *trained* property (push the effective Lipschitz
-constant below 1 so recursive drift provably saturates), which is a
-stronger contribution than assuming it.
+**已交付的修复（本次提交）：** 带 scheduled sampling 的递归展开训练 —— 算子现在每个窗口展开 `--rollout_len` 步，并以从 0 爬升到 `--max_ss_prob` 的概率喂它*自己*（detach 后）的上一步预测，损失在所有展开步上取平均。这把算子自身的误差分布带进了训练，正是学会漂移纠正所需要的。这也把论文里的“几何漂移界”主张从一个断言变成一个*被训练出来的*性质（把有效 Lipschitz 常数压到 1 以下，使递归漂移可证地饱和），比单纯假设它成立是更强的贡献。
 
-**Verified** (this commit): full rollout loop runs end-to-end; and on a
-controlled toy dynamical system with real temporal structure, rollout+
-scheduled-sampling reduces final-step recursive drift vs. pure teacher
-forcing (0.616 → 0.522), confirming the fix is directionally correct, not
-just runnable.
+**已验证**（本次提交）：完整的 rollout 循环端到端跑通；且在一个具有真实时序结构的受控玩具动力系统上，rollout+scheduled-sampling 相比纯 teacher forcing 降低了末步递归漂移（0.616 → 0.522），证明这个修复方向正确，而不只是“能跑”。
 
-**Next action (re-train, then re-run the SAME drift eval):**
+**下一步动作（重训，然后重跑同一个漂移评测）：**
 ```bash
 git pull
 CUDA_VISIBLE_DEVICES=6 python -m streaming_prefix.train_student \
@@ -68,116 +34,60 @@ CUDA_VISIBLE_DEVICES=6 python -m streaming_prefix.eval_drift \
     --horizon 20 --num_episodes 50 \
     --output logs/drift_report_rollout.json 2>&1 | tee logs/eval_drift_rollout.log
 ```
-Go/no-go: recursive drift at the target reset period (say P=8–10) must
-fall well under the teacher-forced-only run's 0.8 — ideally into the
-0.3–0.5 band so `implied safe reset period` becomes ≥ a useful number.
-Watch `recon_stepK` during training (the hardest, last-rollout-step loss):
-it should track below the step-1 loss's naive recursion, and the
-`ss_prob` log confirms scheduled sampling is ramping. Batch dropped to 32
-because each step now does `rollout_len+1` teacher forward passes.
+Go/no-go 判据：目标重置周期处（比如 P=8–10）的递归漂移必须明显低于纯 teacher-forced 那次的 0.8 —— 理想落到 0.3–0.5 区间，使 `implied safe reset period` 变成一个有用的正数。训练时盯 `recon_stepK`（最难的、最后一个展开步的损失）：它应低于“第 1 步损失做朴素递归”的水平；`ss_prob` 日志确认 scheduled sampling 在爬升。batch 降到 32，因为现在每步要做 `rollout_len+1` 次教师前向。
 
 ---
 
-## (previous status) after Phase B training completed
+## （上一阶段状态）Phase B 训练完成后
 
-**Phase B training SUCCEEDED (teacher-forced).** 30k-step distillation
-run on real SmolVLM-500M + full LIBERO finished at **recon = 0.504**
-(delta_energy 0.174). recon started at exactly 1.0 (zero-init "predict no
-change" baseline) and dropped to ~0.50 — i.e. the state-update operator
-explains ~50% of the frame-to-frame variance in the fused text-model
-output, cleanly beating the "just copy the previous step" baseline. This
-is a genuine positive (contrast Innovation 4's LAM, which stalled at
-R²≈0): the mechanism works.
+**Phase B 训练成功（teacher-forced）。** 在真实 SmolVLM-500M + 全量 LIBERO 上跑了 3 万步蒸馏，收尾于 **recon = 0.504**（delta_energy 0.174）。recon 从精确的 1.0（零初始化的“预测无变化”基线）降到约 0.50 —— 即状态更新算子解释了融合语言模型输出中约 50% 的逐帧方差，干净地跑赢了“直接抄上一步”的基线。这是一个真实的正面结果（对比创新点四的 LAM 卡在 R²≈0）：机制是有效的。
 
-**IMPORTANT caveat on what 0.50 means (and does NOT mean):** this is the
-*teacher-forced* training error — every step is fed the REAL previous
-fused output as cached state. At deployment the operator will be fed its
-OWN previous prediction between resets, so error can compound across
-steps (exposure bias). 0.50 is therefore the optimistic, single-step,
-ideal-cache number; it does not by itself establish closed-loop
-viability. Whether recursive self-conditioning drifts geometrically
-(bounded) or diverges is exactly the paper's core theoretical claim and
-**must be measured in Phase C, not assumed.**
+**关于 0.50 含义的重要说明（它*不*代表什么）：** 这是 *teacher-forced* 的训练误差 —— 每一步都喂真实的上一帧融合输出作为缓存状态。部署时算子在两次重置之间会被喂它*自己*的上一步预测，误差会跨步累积（exposure bias）。因此 0.50 是乐观的、单步的、理想缓存下的数字；它本身并不能确立闭环可行性。递归自我条件化究竟是几何式漂移（有界）还是发散，恰恰是论文的核心理论主张，**必须在 Phase C 实测，不能假设。**
 
-**Phase A (profiling) result that motivated all this:** at the default
-10 Euler steps, VLM prefix re-encoding is **45.5%** of per-step latency;
-within it the fused text-model forward is 72% (15.19ms) vs. vision tower
-23% (4.86ms) — so this work targets the text-model forward, the opposite
-of where VLA-Cache/TTF-VLA intervene. As Euler steps shrink (faster flow
-heads), vlm_frac *rises* (to 83% at 1 step), strengthening the motivation.
+**驱动这一切的 Phase A（profiling）结果：** 在默认 10 步 Euler 下，VLM 前缀重编码占单步时延的 **45.5%**；其内部，融合语言模型前向占 72%（15.19ms），视觉塔占 23%（4.86ms） —— 所以本工作瞄准语言模型前向，与 VLA-Cache/TTF-VLA 介入的位置相反。随着 Euler 步数减少（更快的流匹配头），vlm_frac *上升*（1 步时达 83%），使动机更强。
 
-**Phase C diagnostic code delivered (commit pending), not yet run on
-real model.** Two scripts, both verified end-to-end on CPU/tiny model:
+**Phase C 诊断代码已交付（提交待推），尚未在真实模型上运行。** 两个脚本，均在 CPU/微型模型上端到端验证：
 
-Run these next (needs the trained `updater_final.pt` from Phase B):
+接下来运行（需要 Phase B 训好的 `updater_final.pt`）：
 ```bash
 git pull
-# 1. recursive drift: bounded (geometric) or divergent?
+# 1. 递归漂移：有界（几何式）还是发散？
 CUDA_VISIBLE_DEVICES=6 python -m streaming_prefix.eval_drift \
     --meta_path runs/latent_action_ws/metas/libero_train.json \
     --updater_ckpt runs/latent_action_ws/streaming_prefix/updater_final.pt \
     --horizon 20 --num_episodes 50 \
     --output logs/drift_report.json 2>&1 | tee logs/eval_drift.log
 
-# 2. end-to-end latency: streaming vs full re-encode
+# 2. 端到端时延：streaming vs 全量重编码
 CUDA_VISIBLE_DEVICES=6 python -m streaming_prefix.eval_latency \
     --updater_ckpt runs/latent_action_ws/streaming_prefix/updater_final.pt \
     --euler_steps 1 5 10 --reset_periods 5 10 20 \
     --output logs/latency_report.json 2>&1 | tee logs/eval_latency.log
 ```
 
-**What each answers, and the go/no-go read:**
-- `eval_drift`: prints recursive-drift vs. teacher-forced error at each
-  step k, their gap (exposure bias), the implied safe reset period for a
-  drift budget, and whether drift saturates (consistent with a geometric
-  bound) or diverges. **If drift diverges, the streaming approach is not
-  closed-loop viable and the theory framing fails — this is the real
-  go/no-go, more than the 0.50 training number.**
-- `eval_latency`: prints per-step full-vs-streaming speedup and the
-  amortized speedup/Hz folding in one full re-encode per reset period.
-  Confirms whether Phase A's predicted headroom is realized. (Note:
-  meaningless on tiny test models — the replaced text-model must be big
-  enough to matter, as it is at 500M.)
+**各自回答什么，以及 go/no-go 判读：**
+- `eval_drift`：打印每一步 k 的递归漂移 vs teacher-forced 误差、两者差距（exposure bias）、给定漂移预算下推算的安全重置周期，以及漂移是饱和（符合几何界）还是发散。**如果漂移发散，流式方案闭环不可行，理论框架也就站不住 —— 这才是真正的 go/no-go，比 0.50 那个训练数字重要得多。**
+- `eval_latency`：打印单步 full-vs-streaming 加速比，以及按每个重置周期折入一次全量重编码后的摊销加速/Hz。确认 Phase A 预测的富余空间是否兑现。（注意：在微型测试模型上无意义 —— 被替换的语言模型必须大到值得替换，正如 500M 规模下那样。）
 
-After these two, the remaining Phase C work is the closed-loop LIBERO
-success-rate comparison (streaming vs. full re-encode vs.
-VLA-Cache/TTF-VLA baselines) on the time-vs-success Pareto plot — the
-paper's headline figure — which requires wiring the updater into the
-evaluation serving path (`evaluation/libero/serve_smolvlm_libero.py`),
-not yet done.
+这两个之后，Phase C 剩余的工作是闭环 LIBERO 成功率对比（streaming vs 全量重编码 vs VLA-Cache/TTF-VLA 基线），画在时延-成功率 Pareto 图上 —— 即论文主图 —— 这需要把更新算子接入评测服务路径（`evaluation/libero/serve_smolvlm_libero.py`），尚未完成。
 
 ---
 
-## Environment / hardware context
+## 环境 / 硬件背景
 
-Same shared server as Innovation 4 (see `latent_action/PROGRESS.md`):
-8x A800-80GB, GPU 6, `reserve_gpu.py` holding spare memory. Profiling
-(Phase A) needs only a few hundred MB; training (Phase B) will need
-re-sizing the reservation once real-model memory use is observed (this
-architecture reuses the frozen ~500M teacher VLM for forward passes only
-— no backprop through it — so memory should be well under the
-`pretrain`/`finetune`-stage ~70GB ballpark, but not yet measured).
+与创新点四同一台共享服务器（见 `latent_action/PROGRESS.md`）：8× A800-80GB，GPU 6，`reserve_gpu.py` 占着富余显存。Profiling（Phase A）只需几百 MB；训练（Phase B）需要在观测到真实模型显存占用后重新调整占用大小（该架构复用冻结的约 500M 教师 VLM，仅做前向、不反传，因此显存应远低于 `pretrain`/`finetune` 阶段约 70GB 的量级，但尚未实测）。
 
 ---
 
-## Chronological log
+## 时间线日志
 
-### 1. Phase A: latency profiling (commit `cba0e34`)
+### 1. Phase A：时延 profiling（commit `cba0e34`）
 
-Built `streaming_prefix/profile_prefix.py`: times `forward_vlm_efficient`
-(the VLM prefix, called once per `generate_actions` call) against the
-full inference call across a range of Euler step counts, with no
-trained checkpoint required (latency is weight-independent). `--breakdown`
-additionally splits the VLM forward into vision-tower / connector /
-fused-text-model timings.
+编写了 `streaming_prefix/profile_prefix.py`：在一系列 Euler 步数下，对比 `forward_vlm_efficient`（VLM 前缀，每次 `generate_actions` 调用一次）与完整推理调用的耗时，不需要训练好的 checkpoint（时延与权重无关）。`--breakdown` 进一步把 VLM 前向拆成视觉塔 / 连接器 / 融合语言模型三段计时。
 
-Verified end-to-end on CPU with a tiny local Idefics3 (mocked processor
-loading) before handing off — ran without error, produced the table,
-breakdown, and JSON report (numbers meaningless at that scale, mechanics
-confirmed correct).
+在交付前，用一个微型本地 Idefics3（mock 掉 processor 加载）在 CPU 上端到端验证 —— 无报错，产出表格、拆解和 JSON 报告（该规模下数字无意义，机制正确性已确认）。
 
-**Real result** (SmolVLM-500M, batch=1, `hidden_size=768 depth=12
-num_heads=12 image_size=384 num_views=2`, `--repeats 30 --warmup 10`):
+**真实结果**（SmolVLM-500M，batch=1，`hidden_size=768 depth=12 num_heads=12 image_size=384 num_views=2`，`--repeats 30 --warmup 10`）：
 
 ```
 VLM prefix forward (1x per control step): 21.00 +/- 0.05 ms
@@ -192,289 +102,151 @@ VLM prefix forward (1x per control step): 21.00 +/- 0.05 ms
     20      69.64      21.00      48.63     30.2%     14.4
 ```
 
-**Interpretation:**
-- At the standard 10-step config, VLM re-encoding is 45.5% of total
-  latency — a large, worth-attacking share.
-- The fused text-model forward (72% of the VLM's own cost) dominates
-  over the vision tower (23%) by ~3x. This is the opposite of where
-  existing VLA-caching literature (VLA-Cache, TTF-VLA) intervenes — they
-  target the vision tower, which here is comparatively cheap already.
-- As Euler steps shrink (the direction the field is moving — 1-4 step
-  flow-matching action heads), vlm_frac *rises* (30%→45%→60%→83%): the
-  VLM-prefix bottleneck becomes proportionally worse precisely as action
-  heads get faster. Strengthens the motivation rather than weakening it.
+**解读：**
+- 在标准 10 步配置下，VLM 重编码占总时延 45.5% —— 一个大到值得攻击的份额。
+- 融合语言模型前向（占 VLM 自身成本的 72%）比视觉塔（23%）高约 3 倍。这与现有 VLA 缓存文献（VLA-Cache、TTF-VLA）介入的位置相反 —— 它们瞄准视觉塔，而这里视觉塔本就相对便宜。
+- 随着 Euler 步数减少（也正是领域前进的方向 —— 1–4 步的流匹配动作头），vlm_frac *上升*（30%→45%→60%→83%）：动作头越快，VLM 前缀瓶颈占比反而越重。这加强而非削弱了动机。
 
-**Decision:** proceed to Phase B, retargeted to approximate the
-fused text-model forward specifically (not the vision tower).
+**决策：** 进入 Phase B，并把目标重新锁定为逼近融合语言模型前向（而非视觉塔）。
 
-### 2. Phase B: PrefixStateUpdater + distillation training (this commit)
+### 2. Phase B：PrefixStateUpdater + 蒸馏训练（commit `b0fd755`）
 
-Added:
+新增：
 - `streaming_prefix/models.py`
-  - `VLMPrefixTeacher`: wraps a frozen SmolVLM to expose
-    `cheap_forward` (vision tower + connector + text-embedding lookup +
-    padding — ~23% of VLM cost, safe to recompute every step) and
-    `expensive_forward` (the fused text-model forward — the ~72%
-    target) separately.
-  - `PrefixStateUpdater`: small transformer (reuses `TransformerBlock`
-    from `models/transformer_smolvlm.py` for consistency with the rest
-    of the codebase) predicting `vlm_features_t` as
-    `cached_state_{t-1} + delta_hat`, where `delta_hat` is computed from
-    `(cached_state_{t-1}, cheap_features_t)`. Output projection is
-    zero-initialized, so the model starts as an exact identity (predicts
-    no change) — deliberately mirroring the delta-prediction fix from
-    Innovation 4's LAM (`latent_action/models.py`), including the same
-    normalized-loss convention: **1.0 = predicts zero change / useless**.
-  - `distillation_loss`: masked (via `attention_mask`, since padded
-    batch elements shouldn't count), normalized MSE, same 1.0-baseline
-    convention.
-- `streaming_prefix/data.py`: `InstructionFramePairDataset` — reuses
-  `latent_action.data`'s raw-uint8 frame reading (same shm-safety
-  properties as the Innovation 4 fix) and adds per-episode instruction
-  tokenization (no action labels needed — purely a feature-distillation
-  target).
-- `streaming_prefix/train_student.py`: teacher-forced distillation loop.
-  Per pair `(frame_t, frame_{t+stride})` from the same episode: compute
-  the REAL teacher output at both `t` and `t+stride`; train the updater
-  to predict the real `t+stride` output given the real `t` output as
-  cached state. **Known limitation, flagged for Phase C:** training is
-  teacher-forced (always conditions on the *real* previous output); at
-  inference the updater will condition on its *own* previous prediction
-  between resets, which can compound drift faster than the training loss
-  suggests (exposure bias) — this is exactly what the paper's geometric
-  drift bound (`δ/(1−L)` argument) is meant to characterize and bound,
-  and Phase C's evaluation must check it empirically, not just assume it.
+  - `VLMPrefixTeacher`：包装一个冻结的 SmolVLM，分别暴露 `cheap_forward`（视觉塔 + 连接器 + 文本 embedding 查表 + padding —— 占 VLM 成本约 23%，每步重算是安全的）和 `expensive_forward`（融合语言模型前向 —— 约 72% 的目标）。
+  - `PrefixStateUpdater`：一个小型 Transformer（复用 `models/transformer_smolvlm.py` 的 `TransformerBlock` 以与代码库其余部分保持一致），把 `vlm_features_t` 预测为 `cached_state_{t-1} + delta_hat`，其中 `delta_hat` 由 `(cached_state_{t-1}, cheap_features_t)` 计算。输出投影层零初始化，所以模型初始时是精确的恒等映射（预测无变化）—— 刻意复刻创新点四 LAM（`latent_action/models.py`）里的差分预测修复，包括同样的归一化损失约定：**1.0 = 预测零变化 / 无用**。
+  - `distillation_loss`：带掩码（通过 `attention_mask`，因为 padding 的 batch 元素不该计入）的归一化 MSE，同样的 1.0 基线约定。
+- `streaming_prefix/data.py`：`InstructionFramePairDataset` —— 复用 `latent_action.data` 的原始 uint8 帧读取（与创新点四的修复具有相同的 shm 安全性），并加入按 episode 的指令 tokenize（不需要动作标签 —— 纯粹是特征蒸馏目标）。
+- `streaming_prefix/train_student.py`：teacher-forced 蒸馏循环。对同一 episode 的每个 pair `(frame_t, frame_{t+stride})`：计算 `t` 和 `t+stride` 处的真实教师输出；训练更新算子，在给定真实 `t` 输出作为缓存状态时，预测真实的 `t+stride` 输出。**已知局限，已标注给 Phase C：** 训练是 teacher-forced 的（始终以*真实*上一步输出为条件）；推理时更新算子在两次重置之间会以它*自己*的上一步预测为条件，漂移可能比训练损失所暗示的更快累积（exposure bias）—— 这正是论文的几何漂移界（`δ/(1−L)` 论证）要刻画并封顶的东西，Phase C 的评测必须实测检验，不能假设。
 
-**Verified** (CPU, tiny local Idefics3, synthetic LIBERO fixture):
-- `PrefixStateUpdater` is an exact identity at init (`pred == cached_state`
-  to 1e-6).
-- `distillation_loss` on a "predict zero change" baseline is exactly
-  1.0, as designed.
-- The operator can overfit a single real teacher-generated pair from
-  loss 1.0 down to 0.07 in 30 Adam steps — confirms the mechanism is
-  learnable, not just correctly wired.
-- Full `train_student.py` main() loop runs end-to-end (data loading →
-  teacher forward → updater forward → loss → backward → checkpoint
-  save/load with correct config round-trip, including a bug found and
-  fixed: `config_dict()` was missing `mlp_ratio`, silently reloading
-  checkpoints with the wrong MLP width).
+**已验证**（CPU，微型本地 Idefics3，合成 LIBERO 数据）：
+- `PrefixStateUpdater` 初始化时是精确恒等（`pred == cached_state`，误差 1e-6）。
+- `distillation_loss` 对“预测零变化”基线精确等于 1.0，符合设计。
+- 算子能在 30 个 Adam 步内把单个真实（教师生成，微型模型）pair 的损失从 1.0 过拟合到 0.07 —— 证明机制可学习，而不只是接线正确。
+- 完整 `train_student.py` main() 循环端到端跑通（数据加载 → 教师前向 → 更新算子前向 → 损失 → 反传 → checkpoint 保存/加载且配置正确往返，其间发现并修复一个 bug：`config_dict()` 漏了 `mlp_ratio`，导致重新加载 checkpoint 时静默用错 MLP 宽度）。
 
-**Not yet done:** real training on the actual LIBERO data + real
-SmolVLM-500M backbone (the "Next action" command at the top of this
-document). Everything below Phase B (drift measurement, reset-period
-tuning, Pareto comparison against full re-encoding / VLA-Cache / TTF-VLA
-baselines, LIBERO closed-loop success-rate evaluation) is still Phase C,
-not started.
+**尚未完成：** 在真实 LIBERO 数据 + 真实 SmolVLM-500M 骨干上做真实训练（本文档顶部的“下一步动作”命令）。Phase B 之后的一切（漂移测量、重置周期调优、与全量重编码 / VLA-Cache / TTF-VLA 基线的 Pareto 对比、LIBERO 闭环成功率评测）都属于 Phase C，尚未开始。
 
 ---
 
-### 3. Phase B training result + Phase C diagnostic code (this commit)
+### 3. Phase B 训练结果 + Phase C 诊断代码（commit `160f9da`）
 
-Phase B training on real SmolVLM-500M + full LIBERO (30k steps,
-batch 64, stride 1) finished at **recon=0.504** (from a 1.0 zero-init
-baseline) — the state-update operator explains ~50% of the fused
-text-model output's frame-to-frame variance under teacher forcing. Clear
-positive; but this is single-step, ideal-cache error and does not settle
-closed-loop viability (see caveat in Current status).
+在真实 SmolVLM-500M + 全量 LIBERO 上的 Phase B 训练（3 万步，batch 64，stride 1）收尾于 **recon=0.504**（从 1.0 的零初始化基线降下来）—— 状态更新算子在 teacher forcing 下解释了融合语言模型输出中约 50% 的逐帧方差。明确的正面结果；但这是单步/理想缓存的误差，并不决定闭环可行性（见“当前状态”里的说明）。
 
-Added Phase C diagnostics:
-- `streaming_prefix/eval_drift.py` — recursive drift measurement:
-  starting from a real reset, applies the updater recursively on its own
-  output for up to `--horizon` steps, recording normalized drift vs. the
-  real full re-encode at each k, alongside a teacher-forced reference
-  (the gap = exposure bias). Reports implied safe reset period and a
-  crude saturation check for the geometric-bound claim.
-- `streaming_prefix/eval_latency.py` — end-to-end per-step latency,
-  streaming (cheap_forward + updater + action head) vs. full
-  (cheap_forward + real text model + action head), plus amortized
-  speedup/Hz folding in one reset per period.
+新增 Phase C 诊断：
+- `streaming_prefix/eval_drift.py` —— 递归漂移测量：从一次真实 reset 出发，让更新算子在自身输出上递归作用至多 `--horizon` 步，记录每步 k 相对真实全量重编码的归一化漂移，并附带一个 teacher-forced 参照（两者之差 = exposure bias）。报告推算的安全重置周期，以及一个针对几何界主张的粗略饱和判断。
+- `streaming_prefix/eval_latency.py` —— 端到端单步时延，streaming（cheap_forward + 更新算子 + 动作头）vs full（cheap_forward + 真实语言模型 + 动作头），外加按每周期折入一次重置后的摊销加速/Hz。
 
-Both verified end-to-end on CPU with the tiny local Idefics3 (structure,
-normalization, teacher-forced reference, reset-period derivation, JSON
-reports all correct; absolute numbers meaningless at tiny scale — an
-untrained updater correctly shows drift≈1.0, a tiny text-model correctly
-shows ~1.0x speedup).
+两者均在 CPU + 微型本地 Idefics3 上端到端验证（结构、归一化、teacher-forced 参照、重置周期推算、JSON 报告全部正确；微型规模下绝对数字无意义 —— 未训练的更新算子正确显示漂移≈1.0，微型语言模型正确显示约 1.0x 加速）。
 
-## Commit reference
+### 4. Exposure-bias 漂移修复：递归展开 + scheduled sampling（commit `6ed0559`）
 
-| Commit | What |
-|---|---|
-| `cba0e34` | Phase A — `profile_prefix.py` latency profiling |
-| `b0fd755` | Phase B — `PrefixStateUpdater` + distillation training |
-| `160f9da` | Phase B result (recon=0.50) + Phase C drift/latency diagnostics |
-| `6ed0559` | Exposure-bias fix — recursive-rollout + scheduled-sampling training |
+Phase C 诊断给出泾渭分明的结论：时延是干净的胜利（streaming 10 步 1.51x、5 步 1.84x、1 步 2.78x；摊销 1.43–2.36x，33–103 Hz），但递归漂移发散 —— teacher-forced 误差维持约 0.5，而自我条件化漂移第 1 步跳到 0.82，到第 10 步 exposure gap 达 0.55，推算安全重置周期为 0 步。
 
-## Open design questions for Phase C (not yet decided)
+根因：Phase B 采用纯 teacher-forced 训练（始终喂真实上一步融合输出），算子从未见过自己的误差，学到一个对输入误差脆弱的映射 —— 教科书式 exposure bias。证据精确：teacher-forced 与 recursive 漂移在第 1 步相等（都喂真实 reset），从第 2 步才分叉，此时递归路径开始累积自身误差。
 
-- **Reset period:** how many control steps between forced full
-  re-encodings? Original theory framing suggested aligning to action-chunk
-  boundaries (`num_actions`, default 10); needs an empirical drift-vs-period
-  sweep once training completes.
-- **Exposure-bias check:** does recursive (self-conditioned) application
-  at inference drift faster than the teacher-forced training loss
-  predicts? This is the paper's core theoretical claim (geometric bound)
-  and must be measured directly, not assumed.
-- **Stride:** currently defaulting to 1 (matches the real per-control-step
-  deployment cadence at 10Hz). Unlike Innovation 4's LAM (where stride=1
-  motion was invisible in pooled features), here we specifically care
-  about the stride=1 operating point since that's what real deployment
-  needs — but if the health-check recon doesn't move at stride=1, larger
-  strides are worth a diagnostic look before concluding failure.
+修复：`train_student.py` 现在每个窗口把算子展开 `--rollout_len` 步，并以从 0 爬升到 `--max_ss_prob` 的概率喂它*自己*（detach 后）的上一步预测（scheduled sampling），把归一化损失在所有展开步上取平均。这把算子自身误差分布带进训练，并把论文的几何漂移界主张变成一个被训练出来的性质而非假设。
+
+- `data.py`：`InstructionSequenceDataset` 产出连续帧窗口 `[K+1, V, H, W, 3]`（而非旧的随机 pair）。
+- `models.py`：`masked_norm_mse` —— 各展开步共享一个一致的分母（真实单步变化能量），使 1.0 = “预测无变化”的约定在 scheduled sampling 下依然稳定。
+- `train_student.py`：rollout 循环；记录 `recon_step1` / `recon_stepK` / `ss_prob`；batch 默认 32（每步现在做 rollout_len+1 次教师前向）。`rollout_len=1` 退化为旧的 teacher-forced 行为。
+
+已验证：完整循环端到端跑通；在一个具真实时序结构的受控玩具动力系统上，rollout+scheduled-sampling 相比 teacher forcing 降低了末步递归漂移（0.616 → 0.522），确认修复方向正确，而不只是能跑。
 
 ---
 
-# Reference (stable — the framing, not the running log)
+# 参考（稳定内容 —— 框架而非流水账）
 
-## Paper skeleton (abstract structure)
+## 论文骨架（摘要结构）
 
-**Scientific gap.** Deployed VLA policies re-encode the full
-vision-language prefix at every control step, even though a robot's
-consecutive observations are nearly identical. Existing accelerators for
-this redundancy (VLA-Cache, arXiv:2502.02175; TTF-VLA, arXiv:2508.19257)
-are (i) training-free cosine-similarity heuristics that fail under camera
-motion / lighting change, (ii) validated on *discrete-autoregressive*
-decoders, not flow-matching heads, and (iii) targeted at the vision
-encoder. Our profiling shows the vision encoder is *not* the bottleneck
-in a modern compact VLA — the fused text-model forward over image+text
-tokens is (72% of prefix cost vs. 23%), and no prior work touches it in a
-principled, learned way. Worse, the bottleneck *grows* as flow-matching
-action heads move to few-/one-step generation (2025–2026 trend, e.g.
-SnapFlow arXiv:2604.05656): at 1 Euler step the prefix is 83% of latency.
+**科学问题（缺口）。** 部署中的 VLA 策略每个控制步都重新编码整个视觉-语言前缀，尽管机器人相邻观测几乎相同。针对这种冗余的现有加速方法（VLA-Cache，arXiv:2502.02175；TTF-VLA，arXiv:2508.19257）都是：（i）基于余弦相似度的免训练启发式，在相机运动/光照变化下失效；（ii）在*离散自回归*解码器上验证，而非流匹配头；（iii）瞄准视觉编码器。而我们的 profiling 表明，在现代紧凑 VLA 中视觉编码器*并非*瓶颈 —— 对图文 token 的融合语言模型前向才是（占前缀成本 72% vs 23%），且没有任何先前工作以有原理、可学习的方式触及它。更糟的是，随着流匹配动作头转向少步/一步生成（2025–2026 趋势，如 SnapFlow arXiv:2604.05656），这个瓶颈会*增大*：在 1 步 Euler 下前缀占时延的 83%。
 
-**Core challenge.** Replacing the fused text-model forward with a cheap
-recurrent state update raises a stability question unique to this
-setting: the cached features condition an entire multi-step ODE
-integration in the flow head, and at inference the update operator must
-be applied recursively on its *own* previous output between periodic
-resets — so single-step accuracy does not imply closed-loop stability.
-Reconstruction error can compound geometrically across steps.
+**核心挑战。** 用一个廉价的递归状态更新替换融合语言模型前向，引出一个本设置特有的稳定性问题：缓存的特征要条件化流匹配头中一整条多步 ODE 积分，且推理时更新算子必须在两次周期性重置之间递归作用于它*自己*的上一步输出 —— 因此单步精度并不蕴含闭环稳定性。重建误差可能跨步几何式累积。
 
-**Method.** A learned state-update operator (`PrefixStateUpdater`) that,
-given the previous step's real fused features and this step's cheaply
-recomputed vision+text-embedding features, predicts the *change* in the
-fused output — replacing the expensive text-model forward at non-reset
-steps. Trained by self-distillation against the frozen teacher VLM, with
-**recursive-rollout + scheduled-sampling** training so the operator learns
-to correct its own accumulated error. We prove a geometric drift bound
-(error ≤ δ/(1−L)) that makes periodic-reset scheduling a principled design
-rule, and show rollout training is what pushes the effective Lipschitz
-constant L below 1.
+**方法。** 一个可学习的状态更新算子（`PrefixStateUpdater`），给定上一步的真实融合特征和本步廉价重算的视觉+文本 embedding 特征，预测融合输出的*变化量* —— 在非重置步替换掉昂贵的语言模型前向。通过对冻结教师 VLM 的自蒸馏训练，并采用**递归展开 + scheduled sampling**训练，使算子学会纠正自己的累积误差。我们证明一个几何漂移界（误差 ≤ δ/(1−L)），使周期性重置调度成为一条有原理的设计准则，并说明 rollout 训练正是把有效 Lipschitz 常数 L 压到 1 以下的关键。
 
-**Key experiments / falsifiable predictions.** (1) Latency: streaming
-must Pareto-dominate full re-encode and both heuristic baselines on a
-time-vs-success plot — *confirmed*, 1.43–2.36× amortized speedup,
-33–103 Hz. (2) Drift: recursive drift must stay geometrically bounded
-under rollout training; if it diverges (as it does under teacher-forced
-training — *observed*), the approach is not closed-loop viable. (3)
-Closed-loop LIBERO success must stay within <1% of full re-encode at the
-safe reset period. (4) Under camera motion / lighting change, the learned
-operator must hold accuracy where the cosine-similarity heuristics
-collapse.
+**关键实验 / 可证伪预言。**（1）时延：streaming 必须在时延-成功率图上 Pareto 支配全量重编码和两个启发式基线 —— *已确认*，摊销加速 1.43–2.36×，33–103 Hz。（2）漂移：递归漂移在 rollout 训练下必须几何式有界；若发散（在 teacher-forced 训练下确实发散 —— *已观测*），则方案闭环不可行。（3）闭环 LIBERO 成功率在安全重置周期处必须与全量重编码相差 <1%。（4）在相机运动/光照变化下，可学习算子必须保持精度，而余弦相似度启发式在此崩溃。
 
-## Architecture & data flow
+## 架构与数据流
 
-Split of `forward_vlm_efficient` (the per-step VLM prefix), with the two
-halves the profiler measured:
+`forward_vlm_efficient`（每步 VLM 前缀）的拆分，以及 profiler 测量的两个半部：
 
 ```
- per control step t:
-   images_t ─► vision tower ─► connector ─┐         CHEAP  (~23%, 4.9 ms)
-   instruction ─► text embeddings ────────┼─► combined_embeds_t
-                                           │        recompute EVERY step
+ 每个控制步 t：
+   images_t ─► 视觉塔 ─► 连接器 ──────────┐         便宜（约 23%，4.9 ms）
+   指令 ─► 文本 embedding ────────────────┼─► combined_embeds_t
+                                          │         每步重算
    ─────────────────────────────────────────────────────────────────────
-   combined_embeds_t ─► text_model forward ─► vlm_features_t   EXPENSIVE
-                                                        (~72%, 15.2 ms)
+   combined_embeds_t ─► 语言模型前向 ─► vlm_features_t          昂贵
+                                                       （约 72%，15.2 ms）
                                         ▲
-                                        │  replaced at non-reset steps by:
-   cached vlm_features_{t-1} ──┐        │
+                                        │  非重置步由以下替换：
+   缓存的 vlm_features_{t-1} ──┐        │
    combined_embeds_t ──────────┼─► PrefixStateUpdater ─► vlm_features_t
-                                        (cheap; predicts the delta)
+                                        （便宜；预测差分）
 ```
 
-- **Reset step** (every P steps): run the real expensive forward,
-  refresh the cache. Cost = full.
-- **Non-reset step**: run only the cheap half + the updater. Cost =
-  cheap + updater ≪ full.
-- Amortized per-step cost = `(full + (P−1)·streaming) / P`.
+- **重置步**（每 P 步一次）：运行真实的昂贵前向，刷新缓存。成本 = full。
+- **非重置步**：只运行便宜半部 + 更新算子。成本 = cheap + updater ≪ full。
+- 摊销单步成本 = `(full + (P−1)·streaming) / P`。
 
-The updater (`PrefixStateUpdater`) is a small transformer over the
-prefix-token sequence: `new_proj(combined_embeds_t) +
-cache_proj(cached_state) + pos_emb` → TransformerBlocks → `out_proj`
-(zero-initialized) → **delta**, returned as `cached_state + delta`. Zero
-init makes it an exact identity ("predict no change") at start, so the
-normalized loss begins at exactly 1.0.
+更新算子（`PrefixStateUpdater`）是一个作用于前缀 token 序列的小型 Transformer：`new_proj(combined_embeds_t) + cache_proj(cached_state) + pos_emb` → 若干 TransformerBlock → `out_proj`（零初始化）→ **差分**，返回 `cached_state + 差分`。零初始化使它一开始是精确恒等（“预测无变化”），因此归一化损失起始精确为 1.0。
 
-## Theory: the geometric drift bound
+## 理论：几何漂移界
 
-Let `g` be the updater, `c_k` the cheap features at step k, `s*_k` the
-true full re-encode, and `s_k = g(s_{k−1}, c_k)` the recursive inference
-state (with `s_0 = s*_0` at a reset). Define error `e_k = ‖s_k − s*_k‖`.
+设 `g` 为更新算子，`c_k` 为第 k 步的便宜特征，`s*_k` 为真实全量重编码，`s_k = g(s_{k−1}, c_k)` 为递归推理状态（重置处 `s_0 = s*_0`）。定义误差 `e_k = ‖s_k − s*_k‖`。
 
-- Single-step (teacher-forced) reconstruction error:
-  `δ = ‖g(s*_{k−1}, c_k) − s*_k‖` — what Phase B minimizes.
-- If `g` is `L`-Lipschitz in its cached-state argument:
-  `‖g(s_{k−1},c_k) − g(s*_{k−1},c_k)‖ ≤ L·e_{k−1}`.
-- Triangle inequality: `e_k ≤ L·e_{k−1} + δ`, so
-  `e_k ≤ δ·(1 + L + … + L^{k−1})`.
-- **If L < 1:** `e_k ≤ δ/(1−L)` — bounded; a target drift budget maps to
-  a safe reset period P. **If L ≥ 1:** diverges.
+- 单步（teacher-forced）重建误差：`δ = ‖g(s*_{k−1}, c_k) − s*_k‖` —— Phase B 最小化的量。
+- 若 `g` 对其缓存状态参数是 `L`-Lipschitz 的：`‖g(s_{k−1},c_k) − g(s*_{k−1},c_k)‖ ≤ L·e_{k−1}`。
+- 三角不等式：`e_k ≤ L·e_{k−1} + δ`，故 `e_k ≤ δ·(1 + L + … + L^{k−1})`。
+- **若 L < 1：** `e_k ≤ δ/(1−L)` —— 有界；给定目标漂移预算即可映射出安全重置周期 P。**若 L ≥ 1：** 发散。
 
-**This is the crux.** Teacher-forced training drives δ down but does
-nothing about L — and empirically the trained L was ≥ 1 (drift diverged,
-Phase C). Recursive-rollout + scheduled-sampling training penalizes `e_k`
-over multiple steps directly, which is exactly the pressure that pushes L
-below 1. So the bound is not an assumption the paper makes about the
-model — it's a property the training procedure is designed to *induce*,
-and the drift eval measures whether it succeeded.
+**这是关键。** Teacher-forced 训练把 δ 压小，但对 L 毫无作为 —— 而经验上训练出的 L ≥ 1（漂移发散，Phase C）。递归展开 + scheduled sampling 训练直接惩罚多步上的 `e_k`，这正是把 L 压到 1 以下所需的压力。所以这个界不是论文对模型做的一个假设 —— 而是训练过程被设计出来*诱导*的一个性质，漂移评测则检验它是否成功。
 
-## Code map
+## 代码地图
 
-| File | Role | Key pieces |
+| 文件 | 角色 | 关键部分 |
 |---|---|---|
-| `profile_prefix.py` | Phase A | `profile_breakdown` (vision/connector/text split), per-Euler-step table, `vlm_frac` |
-| `models.py` | core | `VLMPrefixTeacher.cheap_forward` / `expensive_forward`; `PrefixStateUpdater` (delta, zero-init identity); `distillation_loss`, `masked_norm_mse` (1.0 = predict-no-change); `save/load_updater` |
-| `data.py` | data | `InstructionSequenceDataset` (consecutive windows for rollout); `InstructionFramePairDataset` (legacy pairs) — both action-free, raw-uint8 via `latent_action.data` |
-| `train_student.py` | Phase B | recursive-rollout loop; scheduled sampling (`--rollout_len`, `--max_ss_prob`, `--ss_ramp_frac`); logs `recon_step1/recon_stepK/ss_prob` |
-| `eval_drift.py` | Phase C | recursive vs. teacher-forced drift per step; implied safe reset period |
-| `eval_latency.py` | Phase C | streaming vs. full per-step + amortized speedup/Hz |
+| `profile_prefix.py` | Phase A | `profile_breakdown`（视觉/连接器/语言模型拆分）、按 Euler 步数的表、`vlm_frac` |
+| `models.py` | 核心 | `VLMPrefixTeacher.cheap_forward` / `expensive_forward`；`PrefixStateUpdater`（差分，零初始化恒等）；`distillation_loss`、`masked_norm_mse`（1.0 = 预测无变化）；`save/load_updater` |
+| `data.py` | 数据 | `InstructionSequenceDataset`（供 rollout 的连续窗口）；`InstructionFramePairDataset`（遗留的 pair）—— 两者均无动作标注，经 `latent_action.data` 的原始 uint8 |
+| `train_student.py` | Phase B | 递归展开循环；scheduled sampling（`--rollout_len`、`--max_ss_prob`、`--ss_ramp_frac`）；记录 `recon_step1/recon_stepK/ss_prob` |
+| `eval_drift.py` | Phase C | 每步递归 vs teacher-forced 漂移；推算安全重置周期 |
+| `eval_latency.py` | Phase C | streaming vs full 单步 + 摊销加速/Hz |
 
-## Consolidated results so far
+## 目前结果汇总
 
-| Quantity | Value | Source |
+| 量 | 数值 | 来源 |
 |---|---|---|
-| VLM prefix / per-step latency @10 steps | 45.5% (21.0 ms) | Phase A |
-| — vision tower / connector / text model | 4.86 / 0.07 / 15.19 ms | Phase A `--breakdown` |
-| vlm_frac @ 1 / 5 / 10 / 20 steps | 83% / 60% / 45% / 30% | Phase A |
-| Teacher-forced distill recon (1.0 = useless) | **0.504** | Phase B |
-| Per-step speedup @10 / 5 / 1 steps | 1.51× / 1.84× / 2.78× | Phase C latency |
-| Amortized speedup / Hz @10 steps, P=10 | 1.43× / 33 Hz | Phase C latency |
-| Recursive drift, teacher-forced-trained | 0.82→0.94 (diverges) | Phase C drift |
-| — teacher-forced reference (same model) | 0.36–0.62 (healthy) | Phase C drift |
-| — implied safe reset period | 0 steps | Phase C drift |
-| Rollout fix, toy-system final-step drift | 0.616 → 0.522 | drift-fix validation |
-| Rollout fix, real drift | *pending re-train* | — |
+| VLM 前缀 / 单步时延占比 @10 步 | 45.5%（21.0 ms） | Phase A |
+| — 视觉塔 / 连接器 / 语言模型 | 4.86 / 0.07 / 15.19 ms | Phase A `--breakdown` |
+| vlm_frac @ 1 / 5 / 10 / 20 步 | 83% / 60% / 45% / 30% | Phase A |
+| Teacher-forced 蒸馏 recon（1.0 = 无用） | **0.504** | Phase B |
+| 单步加速 @10 / 5 / 1 步 | 1.51× / 1.84× / 2.78× | Phase C 时延 |
+| 摊销加速 / Hz @10 步，P=10 | 1.43× / 33 Hz | Phase C 时延 |
+| 递归漂移，teacher-forced 训练 | 0.82→0.94（发散） | Phase C 漂移 |
+| — teacher-forced 参照（同一模型） | 0.36–0.62（健康） | Phase C 漂移 |
+| — 推算安全重置周期 | 0 步 | Phase C 漂移 |
+| Rollout 修复，玩具系统末步漂移 | 0.616 → 0.522 | 漂移修复验证 |
+| Rollout 修复，真实漂移 | *待重训* | — |
 
-## Related work & positioning (with links)
+## 相关工作与定位（附链接）
 
-- [VLA-Cache](https://arxiv.org/abs/2502.02175) — training-free adaptive
-  KV caching of static visual tokens. We differ: learned (not heuristic),
-  targets the text-model forward (not the vision tower), flow-matching (not
-  autoregressive), with a drift bound.
-- [TTF-VLA](https://arxiv.org/abs/2508.19257) — temporal token fusion via
-  pixel-attention. Same three differences.
-- [Real-Time Chunking (RTC)](https://arxiv.org/abs/2506.07339) —
-  inference-time async execution of action chunks; orthogonal (it overlaps
-  the action head across steps; we cut the prefix cost). Composable.
-- [SnapFlow](https://arxiv.org/abs/2604.05656) / one-step flow heads — the
-  trend that makes our contribution *more* relevant (as action-head steps
-  drop, prefix share rises to 83%).
-- [SmolVLA](https://arxiv.org/abs/2506.01844) — the affordable-VLA line
-  this stays on (single A800, 500M backbone).
+- [VLA-Cache](https://arxiv.org/abs/2502.02175) —— 免训练的静态视觉 token 自适应 KV 缓存。我们不同：可学习（非启发式）、瞄准语言模型前向（非视觉塔）、流匹配（非自回归），并带漂移界。
+- [TTF-VLA](https://arxiv.org/abs/2508.19257) —— 基于像素注意力的时序 token 融合。同样三点差异。
+- [Real-Time Chunking (RTC)](https://arxiv.org/abs/2506.07339) —— 推理时动作块异步执行；正交（它跨步重叠动作头，我们削减前缀成本）。可组合。
+- [SnapFlow](https://arxiv.org/abs/2604.05656) / 一步流匹配头 —— 使我们贡献*更*相关的趋势（动作头步数下降时，前缀占比升至 83%）。
+- [SmolVLA](https://arxiv.org/abs/2506.01844) —— 本工作坚持的“可负担 VLA”路线（单张 A800，500M 骨干）。
 
-## How this document is maintained
+## commit 对照
 
-Append a new numbered entry to the chronological log per experiment/fix
-(context → command → result → diagnosis), update "Current status" at the
-top every time, and keep this Reference section in sync when the framing
-(not just the latest number) changes. Commit alongside the corresponding
-code change.
+| Commit | 内容 |
+|---|---|
+| `cba0e34` | Phase A —— `profile_prefix.py` 时延 profiling |
+| `b0fd755` | Phase B —— `PrefixStateUpdater` + 蒸馏训练 |
+| `160f9da` | Phase B 结果（recon=0.50）+ Phase C 漂移/时延诊断 |
+| `6ed0559` | Exposure-bias 修复 —— 递归展开 + scheduled-sampling 训练 |
+
+## 本文档的维护约定
+
+每次实验/修复往时间线日志追加一条编号条目（背景 → 命令 → 结果 → 诊断），每次都更新顶部的“当前状态”，并在框架（而非仅最新数字）变化时同步“参考”区块。与对应的代码改动一起提交。
