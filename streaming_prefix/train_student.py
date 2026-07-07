@@ -45,8 +45,10 @@ except RuntimeError:
 
 from latent_action import config as C
 from latent_action.data import gpu_preprocess
-from streaming_prefix.data import InstructionFramePairDataset
-from streaming_prefix.models import PrefixStateUpdater, VLMPrefixTeacher, distillation_loss, save_updater
+from streaming_prefix.data import InstructionSequenceDataset
+from streaming_prefix.models import (
+    PrefixStateUpdater, VLMPrefixTeacher, masked_norm_mse, save_updater,
+)
 
 try:
     import wandb
@@ -64,9 +66,17 @@ def get_args_parser():
     p.add_argument("--image_size", type=int, default=384)
     p.add_argument("--seq_len", type=int, default=24)
     p.add_argument("--stride", type=int, default=1,
-                   help="frame gap for the distillation pair (in control steps)")
-    p.add_argument("--batch_size", type=int, default=64)
+                   help="frame gap between consecutive control steps")
+    p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--num_workers", type=int, default=8)
+    # recursive-rollout / scheduled-sampling (fixes exposure-bias drift)
+    p.add_argument("--rollout_len", type=int, default=8,
+                   help="steps to unroll per window; 1 == old teacher-forced training")
+    p.add_argument("--max_ss_prob", type=float, default=0.9,
+                   help="max probability of feeding the model's own prediction "
+                        "(scheduled sampling); ramped 0 -> this over --ss_ramp_frac")
+    p.add_argument("--ss_ramp_frac", type=float, default=0.5,
+                   help="fraction of training over which ss_prob ramps to max")
     # model
     p.add_argument("--depth", type=int, default=4)
     p.add_argument("--num_heads", type=int, default=8)
@@ -124,9 +134,9 @@ def main(args):
           f"(teacher text_model: {n_teacher_lm/1e6:.1f}M -> "
           f"{100*n_updater/n_teacher_lm:.1f}% of the cost it replaces)")
 
-    dataset = InstructionFramePairDataset(
-        args.meta_path, tokenizer=tokenizer, stride=args.stride,
-        seq_len=args.seq_len, training=True,
+    dataset = InstructionSequenceDataset(
+        args.meta_path, tokenizer=tokenizer, rollout_len=args.rollout_len,
+        stride=args.stride, seq_len=args.seq_len, training=True,
     )
     loader = DataLoader(
         dataset, batch_size=args.batch_size, num_workers=args.num_workers,
@@ -139,27 +149,47 @@ def main(args):
     step, t0 = 0, time.time()
     updater.train()
     amp_dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    ss_ramp_steps = max(1, int(args.ss_ramp_frac * args.iters))
 
     for batch in loader:
-        frames_t = gpu_preprocess(batch["frames_t"], args.image_size, device)
-        frames_tk = gpu_preprocess(batch["frames_tk"], args.image_size, device)
+        # frames: [B, K+1, V, H, W, 3] uint8
+        frames = batch["frames"].to(device, non_blocking=True)
+        B, Kp1, V = frames.shape[:3]
+        K = Kp1 - 1
         input_ids = batch["input_ids"].to(device, non_blocking=True)
-        mask = torch.ones(frames_t.shape[:2], dtype=torch.bool, device=device)
+        mask = torch.ones(B, V, dtype=torch.bool, device=device)
 
         lr = cosine_lr(step, args.warmup_steps, args.iters, args.learning_rate)
         for g in optim.param_groups:
             g["lr"] = lr
+        # scheduled sampling probability: 0 (teacher forcing) -> max_ss_prob
+        ss_prob = args.max_ss_prob * min(1.0, step / ss_ramp_steps)
 
+        # Real teacher states + cheap features for every step in the window (frozen).
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=device == "cuda"):
-            combined_t, attn_t = teacher.cheap_forward(frames_t, mask, input_ids)
-            cached_state = teacher.expensive_forward(combined_t, attn_t)
-            combined_tk, attn_tk = teacher.cheap_forward(frames_tk, mask, input_ids)
-            target = teacher.expensive_forward(combined_tk, attn_tk)
+            real_states, cheap_feats = [], []
+            for k in range(Kp1):
+                fk = gpu_preprocess(frames[:, k], args.image_size, device)
+                ck, ak = teacher.cheap_forward(fk, mask, input_ids)
+                real_states.append(teacher.expensive_forward(ck, ak).float())
+                cheap_feats.append(ck.float())
+            attn_full = torch.ones(B, real_states[0].shape[1], device=device)
 
+        # Recursive rollout with scheduled sampling. The fed state is detached
+        # (no backprop-through-time) but includes the model's OWN accumulated
+        # error, so the operator learns to correct drift -- the fix for the
+        # exposure bias that made teacher-forced training diverge at inference.
+        fed_state = real_states[0]
+        step_losses = []
         with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=device == "cuda"):
-            pred = updater(cached_state.float(), combined_tk.float())
-            losses = distillation_loss(pred, target.float(), cached_state.float(), attn_tk)
-            loss = losses["recon_loss"]
+            for k in range(1, Kp1):
+                pred = updater(fed_state, cheap_feats[k])
+                denom = (real_states[k] - real_states[k - 1]).pow(2).mean().detach()
+                step_losses.append(masked_norm_mse(pred, real_states[k], denom, attn_full))
+                # choose next fed state: model's own prediction (prob ss_prob) or real
+                use_pred = torch.rand(()) < ss_prob
+                fed_state = pred.detach() if use_pred else real_states[k]
+            loss = torch.stack(step_losses).mean()
 
         optim.zero_grad(set_to_none=True)
         loss.backward()
@@ -169,7 +199,12 @@ def main(args):
         if step % args.log_interval == 0:
             dt = (time.time() - t0) / max(1, args.log_interval)
             t0 = time.time()
-            logs = {"recon": loss.item(), "delta_energy": losses["delta_energy"].item(), "lr": lr}
+            logs = {
+                "recon": loss.item(),
+                "recon_step1": step_losses[0].item(),
+                "recon_stepK": step_losses[-1].item(),
+                "ss_prob": ss_prob, "lr": lr,
+            }
             print(f"[{step}/{args.iters}] " + " ".join(f"{k}={v:.4f}" for k, v in logs.items()) + f" ({dt:.2f}s/it)")
             if use_wandb:
                 wandb.log(logs, step=step)

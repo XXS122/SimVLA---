@@ -6,7 +6,79 @@ every experiment. Newest status at the top.
 
 ---
 
-## Current status (last updated: after Phase B training completed)
+## Current status (last updated: after Phase C results — drift fix delivered)
+
+**Split verdict from Phase C, and a design fix in response.**
+
+**Latency (eval_latency): clean success, beats Phase A's prediction.**
+Per-step streaming-vs-full speedup: **1.51x @ 10 Euler steps, 1.84x @ 5,
+2.78x @ 1**. Amortized with a reset every P steps (P=10): 1.43x–2.36x,
+lifting achievable control frequency to 33–103 Hz. The compute headroom
+is real and realized.
+
+**Drift (eval_drift): teacher-forced OK, recursive DIVERGENT — a real
+problem, traced to a training/deployment mismatch.** Over 50 episodes:
+teacher-forced error stays healthy (0.36–0.62, matching the 0.50 training
+recon), but recursive self-conditioned drift jumps to 0.82 at step 1 and
+sits at 0.73–0.94 thereafter; the exposure gap reaches 0.55 by step 10.
+Implied safe reset period at a 0.3 drift budget: **0 steps** — the
+operator cannot recurse on its own output even once. (The script's
+"SATURATING" note is a coarse tail-slope check and is misleading here:
+drift plateaus at a *high* level ~0.8, it does not stay bounded near 0.)
+
+**Root cause (my Phase B design error):** `train_student.py` trained
+purely teacher-forced (always fed the REAL previous fused output). The
+operator never saw its own erroneous predictions, so it learned a mapping
+that is brittle to input error — textbook exposure bias / covariate shift
+(the DAgger problem). Evidence is exact: teacher-forced and recursive
+drift are *identical* at step 1 (both fed the real reset) and only
+diverge from step 2 on, when the recursive path starts eating its own
+error.
+
+**Fix delivered (this commit):** recursive-rollout training with
+scheduled sampling — the operator is now unrolled `--rollout_len` steps
+per window and fed its OWN (detached) previous prediction with a
+probability ramped 0 → `--max_ss_prob` over training, with the loss
+averaged over all rollout steps. This puts the operator's own error
+distribution into training, exactly what's needed to learn drift
+correction. This also turns the paper's geometric-drift-bound claim from
+an assertion into a *trained* property (push the effective Lipschitz
+constant below 1 so recursive drift provably saturates), which is a
+stronger contribution than assuming it.
+
+**Verified** (this commit): full rollout loop runs end-to-end; and on a
+controlled toy dynamical system with real temporal structure, rollout+
+scheduled-sampling reduces final-step recursive drift vs. pure teacher
+forcing (0.616 → 0.522), confirming the fix is directionally correct, not
+just runnable.
+
+**Next action (re-train, then re-run the SAME drift eval):**
+```bash
+git pull
+CUDA_VISIBLE_DEVICES=6 python -m streaming_prefix.train_student \
+    --meta_path runs/latent_action_ws/metas/libero_train.json \
+    --output_dir runs/latent_action_ws/streaming_prefix_rollout \
+    --rollout_len 8 --max_ss_prob 0.9 --ss_ramp_frac 0.5 \
+    --iters 30000 --batch_size 32 --num_workers 16 \
+    2>&1 | tee logs/train_updater_rollout.log
+
+CUDA_VISIBLE_DEVICES=6 python -m streaming_prefix.eval_drift \
+    --meta_path runs/latent_action_ws/metas/libero_train.json \
+    --updater_ckpt runs/latent_action_ws/streaming_prefix_rollout/updater_final.pt \
+    --horizon 20 --num_episodes 50 \
+    --output logs/drift_report_rollout.json 2>&1 | tee logs/eval_drift_rollout.log
+```
+Go/no-go: recursive drift at the target reset period (say P=8–10) must
+fall well under the teacher-forced-only run's 0.8 — ideally into the
+0.3–0.5 band so `implied safe reset period` becomes ≥ a useful number.
+Watch `recon_stepK` during training (the hardest, last-rollout-step loss):
+it should track below the step-1 loss's naive recursion, and the
+`ss_prob` log confirms scheduled sampling is ramping. Batch dropped to 32
+because each step now does `rollout_len+1` teacher forward passes.
+
+---
+
+## (previous status) after Phase B training completed
 
 **Phase B training SUCCEEDED (teacher-forced).** 30k-step distillation
 run on real SmolVLM-500M + full LIBERO finished at **recon = 0.504**

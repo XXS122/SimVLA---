@@ -172,6 +172,20 @@ def distillation_loss(pred: torch.Tensor, target: torch.Tensor, cached_state: to
     return {"recon_loss": recon, "delta_energy": delta_energy.detach()}
 
 
+def masked_norm_mse(pred: torch.Tensor, target: torch.Tensor, denom_energy: torch.Tensor,
+                    attention_mask: torch.Tensor) -> torch.Tensor:
+    """Masked MSE(pred, target) normalized by a supplied energy scalar.
+
+    Used by rollout training so every step shares ONE consistent
+    denominator (the real single-step change energy), keeping the 1.0 ==
+    "predicts no change" convention stable even when the model is fed its
+    own (erroneous) previous prediction under scheduled sampling.
+    """
+    mask = attention_mask.unsqueeze(-1).to(pred.dtype)
+    sq_err = ((pred - target).pow(2) * mask).sum() / (mask.sum() * target.shape[-1] + 1e-8)
+    return sq_err / (denom_energy + 1e-8)
+
+
 def save_updater(model: PrefixStateUpdater, path, extra: dict | None = None):
     payload = {"config": model.config_dict(), "state_dict": model.state_dict()}
     if extra:
