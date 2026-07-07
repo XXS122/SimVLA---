@@ -301,7 +301,8 @@ shows ~1.0x speedup).
 |---|---|
 | `cba0e34` | Phase A — `profile_prefix.py` latency profiling |
 | `b0fd755` | Phase B — `PrefixStateUpdater` + distillation training |
-| *(this)* | Phase B result (recon=0.50) + Phase C drift/latency diagnostics |
+| `160f9da` | Phase B result (recon=0.50) + Phase C drift/latency diagnostics |
+| `6ed0559` | Exposure-bias fix — recursive-rollout + scheduled-sampling training |
 
 ## Open design questions for Phase C (not yet decided)
 
@@ -320,9 +321,160 @@ shows ~1.0x speedup).
   needs — but if the health-check recon doesn't move at stride=1, larger
   strides are worth a diagnostic look before concluding failure.
 
+---
+
+# Reference (stable — the framing, not the running log)
+
+## Paper skeleton (abstract structure)
+
+**Scientific gap.** Deployed VLA policies re-encode the full
+vision-language prefix at every control step, even though a robot's
+consecutive observations are nearly identical. Existing accelerators for
+this redundancy (VLA-Cache, arXiv:2502.02175; TTF-VLA, arXiv:2508.19257)
+are (i) training-free cosine-similarity heuristics that fail under camera
+motion / lighting change, (ii) validated on *discrete-autoregressive*
+decoders, not flow-matching heads, and (iii) targeted at the vision
+encoder. Our profiling shows the vision encoder is *not* the bottleneck
+in a modern compact VLA — the fused text-model forward over image+text
+tokens is (72% of prefix cost vs. 23%), and no prior work touches it in a
+principled, learned way. Worse, the bottleneck *grows* as flow-matching
+action heads move to few-/one-step generation (2025–2026 trend, e.g.
+SnapFlow arXiv:2604.05656): at 1 Euler step the prefix is 83% of latency.
+
+**Core challenge.** Replacing the fused text-model forward with a cheap
+recurrent state update raises a stability question unique to this
+setting: the cached features condition an entire multi-step ODE
+integration in the flow head, and at inference the update operator must
+be applied recursively on its *own* previous output between periodic
+resets — so single-step accuracy does not imply closed-loop stability.
+Reconstruction error can compound geometrically across steps.
+
+**Method.** A learned state-update operator (`PrefixStateUpdater`) that,
+given the previous step's real fused features and this step's cheaply
+recomputed vision+text-embedding features, predicts the *change* in the
+fused output — replacing the expensive text-model forward at non-reset
+steps. Trained by self-distillation against the frozen teacher VLM, with
+**recursive-rollout + scheduled-sampling** training so the operator learns
+to correct its own accumulated error. We prove a geometric drift bound
+(error ≤ δ/(1−L)) that makes periodic-reset scheduling a principled design
+rule, and show rollout training is what pushes the effective Lipschitz
+constant L below 1.
+
+**Key experiments / falsifiable predictions.** (1) Latency: streaming
+must Pareto-dominate full re-encode and both heuristic baselines on a
+time-vs-success plot — *confirmed*, 1.43–2.36× amortized speedup,
+33–103 Hz. (2) Drift: recursive drift must stay geometrically bounded
+under rollout training; if it diverges (as it does under teacher-forced
+training — *observed*), the approach is not closed-loop viable. (3)
+Closed-loop LIBERO success must stay within <1% of full re-encode at the
+safe reset period. (4) Under camera motion / lighting change, the learned
+operator must hold accuracy where the cosine-similarity heuristics
+collapse.
+
+## Architecture & data flow
+
+Split of `forward_vlm_efficient` (the per-step VLM prefix), with the two
+halves the profiler measured:
+
+```
+ per control step t:
+   images_t ─► vision tower ─► connector ─┐         CHEAP  (~23%, 4.9 ms)
+   instruction ─► text embeddings ────────┼─► combined_embeds_t
+                                           │        recompute EVERY step
+   ─────────────────────────────────────────────────────────────────────
+   combined_embeds_t ─► text_model forward ─► vlm_features_t   EXPENSIVE
+                                                        (~72%, 15.2 ms)
+                                        ▲
+                                        │  replaced at non-reset steps by:
+   cached vlm_features_{t-1} ──┐        │
+   combined_embeds_t ──────────┼─► PrefixStateUpdater ─► vlm_features_t
+                                        (cheap; predicts the delta)
+```
+
+- **Reset step** (every P steps): run the real expensive forward,
+  refresh the cache. Cost = full.
+- **Non-reset step**: run only the cheap half + the updater. Cost =
+  cheap + updater ≪ full.
+- Amortized per-step cost = `(full + (P−1)·streaming) / P`.
+
+The updater (`PrefixStateUpdater`) is a small transformer over the
+prefix-token sequence: `new_proj(combined_embeds_t) +
+cache_proj(cached_state) + pos_emb` → TransformerBlocks → `out_proj`
+(zero-initialized) → **delta**, returned as `cached_state + delta`. Zero
+init makes it an exact identity ("predict no change") at start, so the
+normalized loss begins at exactly 1.0.
+
+## Theory: the geometric drift bound
+
+Let `g` be the updater, `c_k` the cheap features at step k, `s*_k` the
+true full re-encode, and `s_k = g(s_{k−1}, c_k)` the recursive inference
+state (with `s_0 = s*_0` at a reset). Define error `e_k = ‖s_k − s*_k‖`.
+
+- Single-step (teacher-forced) reconstruction error:
+  `δ = ‖g(s*_{k−1}, c_k) − s*_k‖` — what Phase B minimizes.
+- If `g` is `L`-Lipschitz in its cached-state argument:
+  `‖g(s_{k−1},c_k) − g(s*_{k−1},c_k)‖ ≤ L·e_{k−1}`.
+- Triangle inequality: `e_k ≤ L·e_{k−1} + δ`, so
+  `e_k ≤ δ·(1 + L + … + L^{k−1})`.
+- **If L < 1:** `e_k ≤ δ/(1−L)` — bounded; a target drift budget maps to
+  a safe reset period P. **If L ≥ 1:** diverges.
+
+**This is the crux.** Teacher-forced training drives δ down but does
+nothing about L — and empirically the trained L was ≥ 1 (drift diverged,
+Phase C). Recursive-rollout + scheduled-sampling training penalizes `e_k`
+over multiple steps directly, which is exactly the pressure that pushes L
+below 1. So the bound is not an assumption the paper makes about the
+model — it's a property the training procedure is designed to *induce*,
+and the drift eval measures whether it succeeded.
+
+## Code map
+
+| File | Role | Key pieces |
+|---|---|---|
+| `profile_prefix.py` | Phase A | `profile_breakdown` (vision/connector/text split), per-Euler-step table, `vlm_frac` |
+| `models.py` | core | `VLMPrefixTeacher.cheap_forward` / `expensive_forward`; `PrefixStateUpdater` (delta, zero-init identity); `distillation_loss`, `masked_norm_mse` (1.0 = predict-no-change); `save/load_updater` |
+| `data.py` | data | `InstructionSequenceDataset` (consecutive windows for rollout); `InstructionFramePairDataset` (legacy pairs) — both action-free, raw-uint8 via `latent_action.data` |
+| `train_student.py` | Phase B | recursive-rollout loop; scheduled sampling (`--rollout_len`, `--max_ss_prob`, `--ss_ramp_frac`); logs `recon_step1/recon_stepK/ss_prob` |
+| `eval_drift.py` | Phase C | recursive vs. teacher-forced drift per step; implied safe reset period |
+| `eval_latency.py` | Phase C | streaming vs. full per-step + amortized speedup/Hz |
+
+## Consolidated results so far
+
+| Quantity | Value | Source |
+|---|---|---|
+| VLM prefix / per-step latency @10 steps | 45.5% (21.0 ms) | Phase A |
+| — vision tower / connector / text model | 4.86 / 0.07 / 15.19 ms | Phase A `--breakdown` |
+| vlm_frac @ 1 / 5 / 10 / 20 steps | 83% / 60% / 45% / 30% | Phase A |
+| Teacher-forced distill recon (1.0 = useless) | **0.504** | Phase B |
+| Per-step speedup @10 / 5 / 1 steps | 1.51× / 1.84× / 2.78× | Phase C latency |
+| Amortized speedup / Hz @10 steps, P=10 | 1.43× / 33 Hz | Phase C latency |
+| Recursive drift, teacher-forced-trained | 0.82→0.94 (diverges) | Phase C drift |
+| — teacher-forced reference (same model) | 0.36–0.62 (healthy) | Phase C drift |
+| — implied safe reset period | 0 steps | Phase C drift |
+| Rollout fix, toy-system final-step drift | 0.616 → 0.522 | drift-fix validation |
+| Rollout fix, real drift | *pending re-train* | — |
+
+## Related work & positioning (with links)
+
+- [VLA-Cache](https://arxiv.org/abs/2502.02175) — training-free adaptive
+  KV caching of static visual tokens. We differ: learned (not heuristic),
+  targets the text-model forward (not the vision tower), flow-matching (not
+  autoregressive), with a drift bound.
+- [TTF-VLA](https://arxiv.org/abs/2508.19257) — temporal token fusion via
+  pixel-attention. Same three differences.
+- [Real-Time Chunking (RTC)](https://arxiv.org/abs/2506.07339) —
+  inference-time async execution of action chunks; orthogonal (it overlaps
+  the action head across steps; we cut the prefix cost). Composable.
+- [SnapFlow](https://arxiv.org/abs/2604.05656) / one-step flow heads — the
+  trend that makes our contribution *more* relevant (as action-head steps
+  drop, prefix share rises to 83%).
+- [SmolVLA](https://arxiv.org/abs/2506.01844) — the affordable-VLA line
+  this stays on (single A800, 500M backbone).
+
 ## How this document is maintained
 
-Same convention as `latent_action/PROGRESS.md`: append a new entry per
-experiment/fix (context → command → result → diagnosis), update "Current
-status" at the top every time, commit alongside the corresponding code
-change.
+Append a new numbered entry to the chronological log per experiment/fix
+(context → command → result → diagnosis), update "Current status" at the
+top every time, and keep this Reference section in sync when the framing
+(not just the latest number) changes. Commit alongside the corresponding
+code change.

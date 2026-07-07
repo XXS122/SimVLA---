@@ -372,11 +372,99 @@ Awaiting the user's call — see "Current status" at the top.
   itself, since the downstream adapter (`LiberoZAdapterActionSpace`) is
   currently a strictly affine map in both directions.
 
+---
+
+# Reference (stable — the framing, not the running log)
+
+## Paper skeleton (abstract structure)
+
+**Scientific gap.** In a VLA, the vision-language backbone inherits
+internet-scale pretraining, but the generative action head (the
+flow-matching expert) is trained from scratch on a few hundred hours of
+robot demonstrations. Latent-action pretraining aims to close this
+asymmetry by learning actions from action-free video, but existing work
+either quantizes latent actions into a discrete codebook
+([LAPA](https://arxiv.org/abs/2410.11758),
+[UniVLA](https://arxiv.org/abs/2505.06111)) — capping fine-grained
+continuous control — or, in the continuous case
+([CLAM](https://arxiv.org/abs/2505.04999),
+[villa-X](https://arxiv.org/abs/2507.23682)), is purely empirical with no
+theory of *when* the latent space is recoverable.
+
+**Core challenge.** Without action labels, is the continuous latent-action
+space **identifiable up to an affine transform** of the true action
+space? The obstacle is that camera ego-motion, lighting, and object
+dynamics all produce feature-space change that is confounded with the
+robot's own action.
+
+**Method (as designed).** An inverse-dynamics encoder + forward decoder on
+frozen SigLIP features, with (i) VICReg variance/covariance whitening and
+(ii) shared ego-motion-invariance regularization, claimed to pin the
+latent space to affine-identifiability — so a probe-initialized *frozen
+affine adapter* suffices to transfer a flow expert pretrained purely on
+latent actions.
+
+**Key experiment (the gate).** A ridge probe z↔a should recover the true
+actions at high R² (≥0.6) if the affine-identifiability claim holds. It
+does not (see verdict below) — the claim is falsified for this data/design
+in its current form.
+
+## Why this thread is PAUSED (verdict)
+
+The go/no-go gate — affine probe mean R² ≥ 0.6 — was never cleared:
+
+- **v1** (stride-1, absolute reconstruction): R² = 0.03. Cause: at
+  10 Hz/128 px, one step of motion is nearly invisible in coarse features,
+  so the decoder copied the previous frame and z collapsed to scene
+  identity.
+- **v2** (delta prediction, stride 4): recon dropped from 1.0 to ~0.75
+  (z explains real feature-change variance), but affine probe R² stayed at
+  0.04 and the *nonlinear* (MLP) probe reached only 0.27 — z carries real
+  but weak, non-affine, partly-contaminated action information.
+- Two structural bugs found, fixed, and confirmed **not** to be the
+  bottleneck: z-collapse (delta-prediction fix) and a rotation-composition
+  error in the probe target (SO(3) fix; verified on synthetic data it can
+  turn a perfect affine relation into R²≈0, but changed the real numbers
+  by ~0).
+- Even restricting the nonlinear probe to the 5 visually-observable dims
+  (excluding roll/pitch) only reaches R² ≈ 0.34.
+
+**Conclusion:** for LIBERO at this resolution/backbone, fully
+action-free continuous latent actions are not affine-identifiable to a
+usable degree. Reviving this thread would require either CLAM-style
+few-shot grounding (mixing a little real-action supervision — a genuine
+change to the "fully action-free" claim) or a nonlinear adapter (which
+weakens the identifiability contribution). The user chose to pivot to
+Innovation 3 instead of taking either.
+
+## What carries forward to other threads
+
+- The **delta-prediction + normalized-loss (1.0 = useless)** convention —
+  reused directly by Innovation 3's PrefixStateUpdater.
+- The **shm-safe data path** (`data.py::gpu_preprocess`, `_demo_frames_raw`)
+  — reused by Innovation 3.
+- The **diagnostic-first discipline**: gate on a mechanism-level metric
+  (probe R²) cheaply before committing GPU-weeks to downstream training.
+
+## Code map
+
+| File | Role | Key pieces |
+|---|---|---|
+| `config.py` | env/workspace | `Workspace` layout under `$SIMVLA_CHECKPOINTS`; `latest_checkpoint` |
+| `make_splits.py` | Stage 0b | demo-level p1/p10 low-data splits (`demos` whitelist) |
+| `data.py` | data | `FramePairDataset`; `gpu_preprocess`, `_demo_frames_raw` (shm-safe, shared with Innovation 3); `iter_demos` |
+| `models.py` | LAM | `FrozenVisionBackbone`; `LatentActionModel` (delta forward); `variance_covariance_reg`, `shared_ego_augment`; `VectorQuantizerEMA` (discrete ablation) |
+| `train_lam.py` | Stage 1 | LAM training; logs `recon`/`var`/`cov`/`inv`/`delta_energy` |
+| `label_z.py` | Stage 1b | per-step z labels (+ `--ego_aug` stress); auto-detects stride from ckpt |
+| `probe.py` | Stage 1c | affine + `--nonlinear` MLP probe; SO(3) window target; go/no-go gate; adapter init |
+| `run.py` | driver | `python -m latent_action.run <stage>`; multi-GPU via accelerate |
+| (integration) | — | `models/action_hub.py::LatentZActionSpace`/`LiberoZAdapterActionSpace`; `datasets/domain_handler/libero_z.py` |
+
 ## How this document is maintained
 
 Append a new dated/numbered entry to the chronological log for every
 experiment or fix, in the same format as above (context → command →
 result → diagnosis). Update "Current status" at the top every time so a
 reader only needs that section for the current state; the log below is
-for detail and audit. Commit alongside the corresponding code change
-when there is one.
+for detail and audit. Keep the Reference section in sync when the framing
+changes. Commit alongside the corresponding code change when there is one.
