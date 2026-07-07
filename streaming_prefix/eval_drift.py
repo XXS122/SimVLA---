@@ -64,11 +64,14 @@ def get_args_parser():
     return p
 
 
-def _norm_mse(pred: torch.Tensor, target: torch.Tensor, ref_state: torch.Tensor) -> float:
-    """Normalized MSE on the same scale as training recon: error energy /
-    frame-change energy (relative to the step-0 reset reference)."""
-    denom = (target - ref_state).pow(2).mean() + 1e-8
-    return (pred - target).pow(2).mean().item() / denom.item()
+def _norm_mse(pred: torch.Tensor, target: torch.Tensor, scale: float) -> float:
+    """MSE(pred, target) divided by a supplied, per-episode STABLE scale
+    (mean single-step change energy). Using a fixed scale — instead of the
+    step-k-specific ‖target − reset‖² — avoids the artifact where episodes
+    start with the robot stationary (‖s_1 − s_0‖² ≈ 0), which made the
+    normalized drift blow up near k=1 and was not comparable to the
+    training recon. This matches training's single-step normalization."""
+    return (pred - target).pow(2).mean().item() / (scale + 1e-8)
 
 
 @torch.no_grad()
@@ -86,10 +89,11 @@ def main(args):
     items = list(meta["datalist"])
     rng.shuffle(items)
 
-    # drift_by_k[k] and tf_by_k[k] accumulate across episodes
+    # accumulate across episodes, for each deployment strategy
     H = args.horizon
-    drift_by_k = [[] for _ in range(H + 1)]
-    tf_by_k = [[] for _ in range(H + 1)]
+    recursive_by_k = [[] for _ in range(H + 1)]   # feed own prediction (compounds)
+    anchored_by_k = [[] for _ in range(H + 1)]    # feed the real last reset s_0 (no compounding)
+    tf_by_k = [[] for _ in range(H + 1)]          # feed real previous state (gap-1 reference)
 
     n_done = 0
     for item in items:
@@ -122,53 +126,67 @@ def main(args):
                     real_states.append(teacher.expensive_forward(combined, attn).float())
                     cheap_feats.append(combined.float())
 
-                ref = real_states[0]  # step-0 reset reference for normalization
+                # stable per-episode scale: mean single-step change energy
+                scale = float(np.mean([
+                    (real_states[j] - real_states[j - 1]).pow(2).mean().item()
+                    for j in range(1, H + 1)
+                ]))
+
                 recursive_state = real_states[0].clone()  # start from a real reset
-                drift_by_k[0].append(0.0)
-                tf_by_k[0].append(0.0)
+                for lst in (recursive_by_k, anchored_by_k, tf_by_k):
+                    lst[0].append(0.0)
                 for k in range(1, H + 1):
-                    # recursive: feed the model's own previous prediction
+                    # recursive: feed the model's own previous prediction (compounds)
                     recursive_state = updater(recursive_state, cheap_feats[k])
-                    drift_by_k[k].append(_norm_mse(recursive_state, real_states[k], ref))
-                    # teacher-forced reference: feed the real previous state
+                    recursive_by_k[k].append(_norm_mse(recursive_state, real_states[k], scale))
+                    # anchored: feed the real last reset s_0 (gap-k, no compounding)
+                    anch_pred = updater(real_states[0], cheap_feats[k])
+                    anchored_by_k[k].append(_norm_mse(anch_pred, real_states[k], scale))
+                    # teacher-forced: feed the real previous state (gap-1 reference)
                     tf_pred = updater(real_states[k - 1], cheap_feats[k])
-                    tf_by_k[k].append(_norm_mse(tf_pred, real_states[k], ref))
+                    tf_by_k[k].append(_norm_mse(tf_pred, real_states[k], scale))
                 n_done += 1
 
     def summarize(rows):
         return [float(np.mean(r)) if r else float("nan") for r in rows]
 
-    drift_mean = summarize(drift_by_k)
+    recursive_mean = summarize(recursive_by_k)
+    anchored_mean = summarize(anchored_by_k)
     tf_mean = summarize(tf_by_k)
 
-    # implied reset period: last k whose recursive drift stays under budget
-    reset_period = H
-    for k in range(1, H + 1):
-        if drift_mean[k] > args.drift_budget:
-            reset_period = k - 1
-            break
+    def reset_period(series):
+        for k in range(1, H + 1):
+            if series[k] > args.drift_budget:
+                return k - 1
+        return H
 
-    print(f"\nepisodes evaluated: {n_done}")
-    print(f"{'k':>4} {'recursive_drift':>16} {'teacher_forced':>16} {'exposure_gap':>14}")
+    rp_recursive = reset_period(recursive_mean)
+    rp_anchored = reset_period(anchored_mean)
+
+    print(f"\nepisodes evaluated: {n_done}  (drift normalized by mean single-step change energy)")
+    print(f"{'k':>4} {'recursive':>11} {'anchored':>11} {'teacher_forced':>15}")
     for k in range(H + 1):
-        gap = drift_mean[k] - tf_mean[k]
-        print(f"{k:>4} {drift_mean[k]:>16.4f} {tf_mean[k]:>16.4f} {gap:>14.4f}")
+        print(f"{k:>4} {recursive_mean[k]:>11.4f} {anchored_mean[k]:>11.4f} {tf_mean[k]:>15.4f}")
 
-    # crude geometric-bound check: is drift sub-linear / saturating?
-    tail = [d for d in drift_mean[1:] if not np.isnan(d)]
-    saturating = len(tail) >= 3 and (tail[-1] - tail[-2]) < (tail[1] - tail[0])
-    print(f"\nimplied safe reset period (drift<{args.drift_budget}): {reset_period} steps")
-    print(f"drift appears to be {'SATURATING (consistent with a geometric bound)' if saturating else 'NOT clearly saturating — check for divergence'}")
-
+    print(f"\nimplied safe reset period (drift<{args.drift_budget}):")
+    print(f"  recursive deployment : {rp_recursive} steps")
+    print(f"  anchored  deployment : {rp_anchored} steps")
+    print("\n>>> 'anchored' feeds the real last-reset state every step (no error "
+          "compounding by construction); it is the recommended deployment and the "
+          "one to compare against full re-encode. 'recursive' feeds the model's own "
+          "prediction and is expected to be worse. 'teacher_forced' (gap-1, real "
+          "state) is the best-case floor.")
     if args.output:
         out = Path(args.output)
         out.parent.mkdir(parents=True, exist_ok=True)
         with open(out, "w") as fh:
             json.dump({
                 "config": vars(args), "episodes": n_done,
-                "recursive_drift_by_k": drift_mean,
+                "recursive_drift_by_k": recursive_mean,
+                "anchored_drift_by_k": anchored_mean,
                 "teacher_forced_by_k": tf_mean,
-                "reset_period": reset_period, "saturating": bool(saturating),
+                "reset_period_recursive": rp_recursive,
+                "reset_period_anchored": rp_anchored,
             }, fh, indent=2)
         print(f"saved -> {out}")
 

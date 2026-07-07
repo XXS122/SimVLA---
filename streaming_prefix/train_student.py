@@ -69,9 +69,17 @@ def get_args_parser():
                    help="frame gap between consecutive control steps")
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--num_workers", type=int, default=8)
-    # recursive-rollout / scheduled-sampling (fixes exposure-bias drift)
+    # training strategy
+    p.add_argument("--train_mode", type=str, default="anchored",
+                   choices=["anchored", "rollout"],
+                   help="anchored: predict s_k from the REAL reset s_0 at gaps "
+                        "1..rollout_len (no exposure bias, matches anchored "
+                        "deployment; recommended). rollout: recursive + scheduled "
+                        "sampling (legacy).")
+    # recursive-rollout / scheduled-sampling (used only when --train_mode rollout)
     p.add_argument("--rollout_len", type=int, default=8,
-                   help="steps to unroll per window; 1 == old teacher-forced training")
+                   help="window length: gaps 1..rollout_len (anchored) or "
+                        "unroll steps (rollout); 1 == single-step training")
     p.add_argument("--max_ss_prob", type=float, default=0.9,
                    help="max probability of feeding the model's own prediction "
                         "(scheduled sampling); ramped 0 -> this over --ss_ramp_frac")
@@ -175,20 +183,29 @@ def main(args):
                 cheap_feats.append(ck.float())
             attn_full = torch.ones(B, real_states[0].shape[1], device=device)
 
-        # Recursive rollout with scheduled sampling. The fed state is detached
-        # (no backprop-through-time) but includes the model's OWN accumulated
-        # error, so the operator learns to correct drift -- the fix for the
-        # exposure bias that made teacher-forced training diverge at inference.
-        fed_state = real_states[0]
         step_losses = []
         with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=device == "cuda"):
-            for k in range(1, Kp1):
-                pred = updater(fed_state, cheap_feats[k])
-                denom = (real_states[k] - real_states[k - 1]).pow(2).mean().detach()
-                step_losses.append(masked_norm_mse(pred, real_states[k], denom, attn_full))
-                # choose next fed state: model's own prediction (prob ss_prob) or real
-                use_pred = torch.rand(()) < ss_prob
-                fed_state = pred.detach() if use_pred else real_states[k]
+            if args.train_mode == "anchored":
+                # Anchored-to-reset: predict s_k from the REAL reset s_0 (never
+                # a prediction) at every gap k. No recursion => no exposure bias
+                # by construction; matches the anchored deployment strategy. Each
+                # gap is normalized by its own change-from-reset energy so 1.0 =
+                # "predict no change from the anchor".
+                anchor = real_states[0]
+                for k in range(1, Kp1):
+                    pred = updater(anchor, cheap_feats[k])
+                    denom = (real_states[k] - anchor).pow(2).mean().detach()
+                    step_losses.append(masked_norm_mse(pred, real_states[k], denom, attn_full))
+            else:
+                # Recursive rollout with scheduled sampling (legacy; found to
+                # only weakly reduce inference drift -- see PROGRESS.md).
+                fed_state = real_states[0]
+                for k in range(1, Kp1):
+                    pred = updater(fed_state, cheap_feats[k])
+                    denom = (real_states[k] - real_states[k - 1]).pow(2).mean().detach()
+                    step_losses.append(masked_norm_mse(pred, real_states[k], denom, attn_full))
+                    use_pred = torch.rand(()) < ss_prob
+                    fed_state = pred.detach() if use_pred else real_states[k]
             loss = torch.stack(step_losses).mean()
 
         optim.zero_grad(set_to_none=True)

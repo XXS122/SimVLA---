@@ -4,7 +4,40 @@
 
 ---
 
-## 当前状态（最后更新：Phase C 结果出炉后 —— 漂移修复已交付）
+## 当前状态（最后更新：rollout 修复失败 → 转向"锚定部署"设计）
+
+**rollout + scheduled sampling 修复几乎无效。** 重训后重测递归漂移，与修复前基本一致：recursive drift 仍在 0.8 高位，exposure_gap 只从 0.55 微降到 0.45（k=10），安全重置周期仍为 0 步。递归展开这条路收益太小。
+
+**但数据指向一个更根本、更好的设计：不要递归，改为"锚定到最近一次真实重置"。** 现在的部署是递归的（每步喂自己上一步的预测 `s_k = g(s_{k-1}的预测, cheap_k)`），误差滚雪球。但完全没必要——每个重置步都会重算真实特征，那就让窗口内每一步都锚定到真实的 `s_0`：`s_k = g(s_0真实, cheap_k)`。计算成本完全相同，但**从设计上就不可能有 exposure bias**（喂进去的永远是真实重置，不是预测）。信息论论据：`expensive_forward` 是 `cheap_k` 的确定性函数，所以 updater 在 `cheap_k` 里已有算出 `s_k` 的全部信息，`s_0` 只是帮小模型少算的起点先验、锚定到真实值即可。
+
+之前 eval 从未测过这个锚定策略。已给 `eval_drift.py` 加 `anchored` 列（用现有模型零成本验证），给 `train_student.py` 加 `--train_mode anchored`（现为默认），并修了一个 eval 归一化假象（原来按 `‖s_k − s_0‖²` 归一，但轨迹开局机器人静止使分母趋零、drift 虚高；改为按整段的平均单步变化能量归一，与训练一致）。玩具系统已验证 anchored 每步都优于 recursive。
+
+**下一步（先零成本验证，再决定是否重训）：**
+```bash
+git pull
+# 1) 先用现有 rollout 模型重跑 eval，看新增的 anchored 列（无需重训）
+CUDA_VISIBLE_DEVICES=6 python -m streaming_prefix.eval_drift \
+    --meta_path runs/latent_action_ws/metas/libero_train.json \
+    --updater_ckpt runs/latent_action_ws/streaming_prefix_rollout/updater_final.pt \
+    --horizon 20 --num_episodes 50 \
+    --output logs/drift_report_anchored_check.json 2>&1 | tee logs/eval_drift_anchored_check.log
+```
+看 `anchored` 列：若它明显低于 `recursive` 且随 k 缓慢增长（安全重置周期变成正数），说明锚定策略可行；接着用锚定模式重训以进一步压低：
+```bash
+# 2) 锚定训练（若步骤1的 anchored 列有希望）
+CUDA_VISIBLE_DEVICES=6 python -m streaming_prefix.train_student \
+    --meta_path runs/latent_action_ws/metas/libero_train.json \
+    --output_dir runs/latent_action_ws/streaming_prefix_anchored \
+    --train_mode anchored --rollout_len 12 \
+    --iters 30000 --batch_size 32 --num_workers 16 \
+    2>&1 | tee logs/train_updater_anchored.log
+# 然后对 streaming_prefix_anchored/updater_final.pt 重跑上面的 eval_drift
+```
+go/no-go：anchored 部署的安全重置周期需变成有用的正数（≥5–8 步），使"每 P 步重置一次、摊销后仍有约 1.4x 加速且成功率不掉"的论证成立。
+
+---
+
+## （上一阶段状态）Phase C 结果出炉后 —— 递归 rollout 修复已交付
 
 **Phase C 给出一半成功一半问题的结论，并据此做了一处设计修复。**
 
