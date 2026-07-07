@@ -7,7 +7,7 @@
 > - `docs/research_proposals_zh.md` —— 最初的 5 个创新方向提案(本项目源自其中"想法一")
 > - `docs/experiment_log_zh.md` —— 推理时缩放阶段(实验 1–7)的详细分析版记录
 >
-> 最后更新:2026-07-06(第二轮 DPO 结果与训练日志诊断:数据多样性是瓶颈,需扩大采集)
+> 最后更新:2026-07-06(切换到强 ckpt-100000,采集 512 对新数据,第三轮 DPO 训练进行中——关键判定轮)
 
 ---
 
@@ -16,8 +16,11 @@
 | 阶段 | 状态 | 一句话结论 |
 |---|---|---|
 | 想法一:推理时算力缩放(多采样 + 免训练选择) | ✅ 已判死 | 纯采样不提升成功率;但副产品(步数结论、故障探针)有效 |
-| 裁决实验:失败是否可挽救 | ✅ 已完成 | 失败是"状态陷入"、系统性的,不可靠采样挽救 → 转 Flow-DPO |
-| 想法四:Flow-DPO(从失败中学习) | 🔄 进行中 | 第一轮训练把模型训坏(标签噪声);第二轮已修复问题、待评测结果 |
+| 裁决实验:失败是否可挽救 | ✅ 已完成(弱 ckpt) | 失败是"状态陷入"、系统性的,不可靠采样挽救 → 转 Flow-DPO |
+| 想法四:Flow-DPO(从失败中学习) | 🔄 进行中 | 弱 ckpt 上 1~2 轮验证流程跑通但无增益(数据太少);已切换到强 ckpt-100000(80%+)+ 512 对新数据,第三轮训练中,关键判定 |
+
+**基线沿革**:弱 ckpt(≈63%,实验 1–15 使用)→ 强 ckpt-100000(≈80%+,实验 16 起使用)。
+注意:实验 1–15 的所有结论均基于弱 ckpt,迁移到强 ckpt 时需谨慎(尤其实验 5 的裁决)。
 
 ---
 
@@ -238,28 +241,84 @@ SIMVLA_ENV=base bash screen_checkpoints.sh \
 
 ---
 
+### 16. 发现更强的基线 checkpoint,切换到 ckpt-100000(2026-07-06)
+**背景**:此前实验 6–15 全部基于一个较弱的 ckpt(libero_10 约 63%)。用户在 `runs/exp_tds/` 下发现两个 checkpoint:`ckpt-40000`(libero_10 约 60 多%)和 `ckpt-100000`(约 **80 多%**)。
+**决定**:切换到 **ckpt-100000** 作为新的基础模型与 DPO 的参考/起点。
+**连锁影响(重要)**:
+- 之前基于弱 ckpt 采集的所有偏好对(`dpo_data`)与 ckpt-100000 **不兼容**——那些是弱策略的失败点,反映的是不同策略的决策习惯,不能用于强 ckpt 的偏好训练。实验 6–15 就此归档为"跑通全流程的探路阶段",从这里起是全新一轮。
+- **一个悬而未决的警示**:实验 5 的"失败是系统性的、采样救不回来"这一裁决是在**弱 ckpt** 上做的。ckpt-100000 有 80%+,失败模式可能不同,不能默认该结论在强模型上仍成立。理想情况下应在 ckpt-100000 上重跑一次分叉验证(暂缓,不阻塞当前采集)。
+
+---
+
+### 17. 针对强 ckpt 重新采集偏好对(2026-07-06)
+**命令**:
+```bash
+# 终端 A(base 环境)起服务端,指向强 ckpt:
+CUDA_VISIBLE_DEVICES=6 python serve_smolvlm_libero.py \
+    --checkpoint ../../runs/exp_tds/ckpt-100000 \
+    --norm_stats ../../norm_stats/libero_norm.json --port 8102
+# 终端 B(libero 环境)采集:
+python branch_counterfactual.py --port 8102 --task_suite libero_10 \
+    --num_trials 40 --branches 8 --unc_threshold 0.0076 \
+    --randomize_control --control_call 40 \
+    --save_pairs_dir ./dpo_data_ckpt100k --log ./dpo_data_ckpt100k/branches.jsonl
+```
+**过程中的问题**:`--num_trials 40 --branches 8` 设得过于激进——每个触发点最多跑 8 条分支、每条可跑到 900 步上限,导致速度极慢(8 小时才到 task3/ep20,约 35%,预计总耗时 ~23 小时)。且强 ckpt 使旧阈值 0.0076 偏高,几乎触发不了 spike 臂,control 臂又大量 8/8 全成功(不产配对)。
+**止损**:数据是逐条追加写入的,中途 Ctrl+C 不丢数据。停在约 35% 进度时检查产出:
+```bash
+python -c "
+from datasets.dpo_pairs import build_pair_index
+p = build_pair_index('evaluation/libero/dpo_data_ckpt100k/branches.jsonl', max_pairs_per_snapshot=8, min_branch_rate=0.2, max_branch_rate=0.8)
+print(len(p), '对,', len(set(x['snapshot_file'] for x in p)), '个干净岔路口')"
+```
+**结果**:**512 对,来自 64 个干净岔路口存档**——已是第二轮(25 个)的 2.5 倍,足够验证"数据多样性是否为瓶颈",遂停止采集直接开训第三轮。
+
+---
+
+### 18. 第三轮训练:强 ckpt + 2.5 倍数据(2026-07-06,进行中)
+**命令**:
+```bash
+python train_flow_dpo.py \
+    --models ./runs/exp_tds/ckpt-100000 \
+    --pairs ./evaluation/libero/dpo_data_ckpt100k/branches.jsonl \
+    --norm_stats_path ./norm_stats/libero_norm.json \
+    --output_dir ./runs/flow_dpo_v3 \
+    --min_branch_rate 0.2 --max_branch_rate 0.8 \
+    --max_pairs_per_snapshot 8 \
+    --beta 10 --bc_coef 3.0 --learning_rate 1e-5 \
+    --iters 800 --save_interval 200 --batch_size 16
+```
+**相对第二轮的改动**:换强 ckpt、换 512 对新数据、`iters 500→800`/`save_interval 100→200`(数据翻 2.5 倍,25 遍数据,过拟合程度与第二轮相当)。产出 4 个 checkpoint(200/400/600/800)。
+**关键观察点**:`implicit_acc` 若这次**爬升更慢、更晚饱和**(不再像第二轮 260 步就到 1.0),说明更多样的数据迫使模型学真规律而非死记硬背——正是本轮要验证的核心假设。
+**筛选命令**(注意 `--num_trials` 提到 20,即 200 回合/ckpt,替代上轮不可靠的 10 回合快筛):
+```bash
+SIMVLA_ENV=base bash screen_checkpoints.sh \
+    ../../norm_stats/libero_norm.json libero_10 20 ./dpo_eval_v3 \
+    ../../runs/flow_dpo_v3/ckpt-dpo-200 ../../runs/flow_dpo_v3/ckpt-dpo-400 \
+    ../../runs/flow_dpo_v3/ckpt-dpo-600 ../../runs/flow_dpo_v3/ckpt-dpo-800
+```
+**状态**:⏳ 待用户执行 / 执行中,结果尚未回传。
+
+---
+
 ## 当前状态与待办
 
-**结论**:第二轮(过滤+保守超参)已确认是"空转"——训练学到了自信的偏好方向
-(implicit_acc 饱和至 1.0),但因训练集只有 25 个不重复状态而**很可能是记忆而非泛化**,
-评测端 5 个 checkpoint 全部落在基线噪声范围内(58–65%,均值 61.2%)。
-**裁定**:调超参这条路走到头了,下一步的核心杠杆是**扩大偏好对采集规模**。
+**当前基线**:`runs/exp_tds/ckpt-100000`,libero_10 成功率约 **80%+**(取代此前的弱 ckpt≈63%)。
+
+**卡点**:第三轮 Flow-DPO 训练(实验 18)+ 200 回合筛选尚未产出数字。这是**关键判定轮**。
 
 **下一步(按顺序)**:
-1. **[你]** 扩大采集规模到约 400 回合(4 倍),争取积累 ~100 个干净岔路口状态:
-   ```bash
-   python branch_counterfactual.py --port 8102 --task_suite libero_10 \
-       --num_trials 40 --branches 8 --unc_threshold 0.0076 \
-       --randomize_control --control_call 40 \
-       --save_pairs_dir ./dpo_data_v2 --log ./dpo_data_v2/branches.jsonl
-   ```
-   若 YYK 机器空闲,建议并行跑 `libero_goal`(不同任务场景是天然的数据增强,
-   比同任务里堆采样更有助于打破"记忆而非泛化"的问题)。
-2. **[我]** 采集完成后按同样流程过滤([0.2,0.8] 区间)、用同样保守超参
-   (`--beta 10 --bc_coef 3.0`)重训第三轮,重点看**评测是否终于跳出噪声范围**。
-3. **[你]** 筛选协议同步升级:下一轮用 `--num_trials 20`(200 回合/checkpoint)
-   替代这次的 10 回合快筛——这次的噪声(±5pp)已经证明快筛分辨力不够。
-4. **[可选,待办已久]** 把 libero_10 十个任务的 TDS 分数发我 → 做"模型早期不确定性 vs 人工 TDS"相关分析(实验 4 的副产品,免费出图)。
+1. **[你]** 跑实验 18 的训练 + 筛选,把训练日志的 `implicit_acc` 走势 + 4 个 checkpoint 的成功率发我。
+2. **[我]** 按结果裁决:
+   - 若明显超过 80% 基线(如 ≥84%)→ Flow-DPO 路线走通,加大采集(推向上千对)进入在线迭代循环;
+   - 若仍卡在基线附近 → 基本确认**在 80% 强模型上"从失败中学习"边际空间本就很小**(强模型少犯错、可学失败样本稀缺),这是诚实且有价值的负结论,应考虑换方向。
+3. **[建议补做]** 在 ckpt-100000 上重跑实验 5 的分叉裁决,确认"失败是否系统性"在强模型上是否依然成立(当前所有结论都建立在弱 ckpt 上)。
+4. **[可选,待办已久]** libero_10 十个任务的 TDS 分数 → "模型早期不确定性 vs 人工 TDS"相关分析(实验 4 副产品,免费出图)。
+
+**参数经验教训(供后续采集参考)**:
+- `--branches 8` 过重,`--branches 4` 已足够判定"成败混合"且速度翻倍;
+- 换 ckpt 后 `--unc_threshold` 需按新模型的不确定性分布重算(强模型整体不确定性更低,旧阈值会让 spike 臂几乎不触发);
+- 筛选用 `--num_trials 20`(200 回合)起步,10 回合的 ±5pp 噪声不可靠。
 
 ---
 
