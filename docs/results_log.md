@@ -296,3 +296,21 @@ sapi TDS 89.75 — consistent).
   `echo "task_name,sr" > P_sr_all.csv; grep -hv "^task_name" P_per_task_*.csv | grep -v "^$" >> P_sr_all.csv`
 - Docker `/dev/shm` too small → use `NUM_WORKERS=0` or enlarge shm.
 - Long evals: run inside tmux; a stray Ctrl+C kills the client (server survives).
+
+### LIBERO-PRO setup notes (robustness eval, verified on yyk 2026-07)
+- LIBERO resolves bddl/init data via `~/.libero/config.yaml`, NOT via the code
+  on PYTHONPATH → copy the HuggingFace data (`zhouxueyang/LIBERO-Pro`:
+  `bddl_files/*`, `init_files/*`) **into the original LIBERO tree** the config
+  points to (`.../LIBERO/libero/libero/{bddl_files,init_files}/`). PYTHONPATH
+  shadowing (run_eval_pro.sh) is still needed so the *perturbed suite names*
+  register.
+- Dimension → suite suffix: object→`_object`, position→`_swap`,
+  semantic→`_lan`, task→`_task`. **Do NOT use the `_temp` suites for paper
+  numbers** — `_temp` is the position-intensity workspace (contents = whatever
+  variant was last copied in; provenance ambiguous as downloaded).
+- This dataset release has **no `_env` folders** → environment dimension
+  skipped; the many `with_*` variants (blue_stick/mug/...) are per-distractor
+  environment suites, revisit if needed. Paper table: Obj/Pos(swap)/Sem(lan)/
+  Task + Avg (no "Ori" — that dimension does not exist in this release).
+- Always verify after launch: `grep -m1 "Task suite" <prefix>_*.txt` must show
+  the intended suffix (e.g. `libero_goal_object`), not `_temp` or bare names.
