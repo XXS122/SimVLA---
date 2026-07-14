@@ -12,4 +12,10 @@ eval_*.txt
 # WandB local cache
 wandb/
 *.mp4
-evaluation/libero/
+
+# Evaluation outputs inside evaluation/libero (scripts themselves ARE tracked;
+# the LIBERO benchmark checkout + rollout artifacts are not)
+evaluation/libero/LIBERO/
+evaluation/libero/eval_pro_*/
+evaluation/libero/*.csv
+evaluation/libero/*.txt

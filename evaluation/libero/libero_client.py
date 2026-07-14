@@ -52,6 +52,18 @@ MAX_STEPS = {
     "libero_90": 900,        # longest demo: 373
 }
 
+
+def get_max_steps(task_suite_name: str) -> int:
+    """Step budget for a suite; unknown suites (e.g. LIBERO-PRO's perturbed
+    variants like libero_goal_temp) fall back to their base suite's budget by
+    prefix match, then to 800."""
+    if task_suite_name in MAX_STEPS:
+        return MAX_STEPS[task_suite_name]
+    for base, steps in MAX_STEPS.items():
+        if task_suite_name.startswith(base):
+            return steps
+    return 800
+
 NUM_STEPS_WAIT = 10  # Wait for objects to stabilize
 
 benchmark_dict = benchmark.get_benchmark_dict()
@@ -207,16 +219,23 @@ def eval_libero(
     save_video: bool = True,
     task_id: int = None,
     per_task_csv: str = None,
+    max_steps_override: int = None,
 ) -> float:
     """
     Run LIBERO evaluation across all tasks in a suite.
     """
     np.random.seed(seed)
-    
+
     # Initialize task suite
+    if task_suite_name not in benchmark_dict:
+        raise SystemExit(
+            f"Unknown task suite '{task_suite_name}'. Registered suites: "
+            f"{sorted(benchmark_dict)}. For LIBERO-PRO suites (e.g. "
+            f"libero_goal_temp), put the LIBERO-PRO package on PYTHONPATH "
+            f"ahead of the bundled LIBERO (see run_eval_pro.sh).")
     task_suite = benchmark_dict[task_suite_name]()
     num_tasks = task_suite.n_tasks
-    max_steps = MAX_STEPS.get(task_suite_name, 400)
+    max_steps = max_steps_override or get_max_steps(task_suite_name)
     
     Path(video_out_path).mkdir(parents=True, exist_ok=True)
     
@@ -340,7 +359,12 @@ def main():
                         choices=["websocket", "http"],
                         help="Client type: websocket or http")
     parser.add_argument("--task_suite", type=str, default="libero_spatial",
-                        choices=["libero_spatial", "libero_object", "libero_goal", "libero_10", "libero_90"])
+                        help="Any suite registered in libero's benchmark dict: the "
+                             "standard libero_spatial/object/goal/10/90, or perturbed "
+                             "suites registered by LIBERO-PRO (e.g. libero_goal_temp).")
+    parser.add_argument("--max_steps", type=int, default=None,
+                        help="Override the per-episode step budget (default: per-suite "
+                             "table, prefix-matched for *_temp variants).")
     parser.add_argument("--num_trials", type=int, default=50)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--replan_steps", type=int, default=5)
@@ -394,6 +418,7 @@ def main():
         save_video=not args.no_video,
         task_id=args.task_id,
         per_task_csv=args.per_task_csv,
+        max_steps_override=args.max_steps,
     )
 
 
