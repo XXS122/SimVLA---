@@ -51,6 +51,12 @@ class SmolVLMVLAConfig(PretrainedConfig):
         use_adaptive_chunking: bool = False,
         chunk_loss_weight: float = 0.1,
 
+        # === Action-generation objective ===
+        # "flow" = flow matching (default, original behavior)
+        # "ddpm" = DDPM-style denoising diffusion (cross-decoder ablation)
+        action_objective: str = "flow",
+        diffusion_timesteps: int = 100,
+
         # === Image settings ===
         image_size: int = 384,  # Can be 384 or 512
         num_views: int = 3,  # Number of camera views

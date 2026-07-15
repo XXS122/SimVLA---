@@ -14,6 +14,7 @@ Key differences from FlorenceVLA:
 from __future__ import annotations
 
 import logging
+import math
 import traceback
 from typing import Any, Dict
 
@@ -88,6 +89,25 @@ class SmolVLMVLA(PreTrainedModel):
         # Adaptive action chunking
         self.use_adaptive_chunking = getattr(config, 'use_adaptive_chunking', False)
         self.chunk_loss_weight = getattr(config, 'chunk_loss_weight', 0.1)
+
+        # Action-generation objective: "flow" (default) or "ddpm"
+        self.action_objective = getattr(config, 'action_objective', 'flow').lower()
+        if self.action_objective not in ("flow", "ddpm"):
+            raise ValueError(f"Unknown action_objective '{self.action_objective}' (use 'flow' or 'ddpm')")
+        if self.action_objective == "ddpm":
+            if self.use_adaptive_chunking:
+                raise ValueError("action_objective='ddpm' + use_adaptive_chunking is not supported "
+                                 "(keep ablations single-variable)")
+            self.diffusion_timesteps = int(getattr(config, 'diffusion_timesteps', 100))
+            # Cosine noise schedule (Nichol & Dhariwal): alphas_cumprod[k] = abar_{k+1}
+            s = 0.008
+            steps = torch.arange(self.diffusion_timesteps + 1, dtype=torch.float64)
+            f = torch.cos(((steps / self.diffusion_timesteps) + s) / (1 + s) * math.pi / 2) ** 2
+            abar = (f / f[0]).clamp(min=1e-5, max=1.0)
+            self.register_buffer("ddpm_alphas_cumprod", abar[1:].float(), persistent=False)
+            logging.info(f"✓ Action objective: DDPM diffusion (T={self.diffusion_timesteps}, cosine schedule)")
+        else:
+            logging.info("✓ Action objective: flow matching")
 
         # Flow matching action head (SmolVLM version - no aux_visual)
         self.transformer = SmolVLMActionTransformer(
@@ -369,6 +389,25 @@ class SmolVLMVLA(PreTrainedModel):
         else:
             proprio_norm = proprio
         
+        # ----- DDPM objective (cross-decoder ablation; config.action_objective="ddpm") -----
+        if self.action_objective == "ddpm":
+            T_diff = self.diffusion_timesteps
+            k = torch.randint(0, T_diff, (B,), device=device)              # discrete step
+            abar_k = self.ddpm_alphas_cumprod.to(device)[k].view(-1, 1, 1) # [B,1,1]
+            noise = torch.randn_like(action_norm)
+            x_k = abar_k.sqrt() * action_norm + (1 - abar_k).sqrt() * noise
+            # Continuous time input in (0,1] for the shared timestep embedder
+            t_cont = (k.float() + 1.0) / T_diff
+            eps_pred = self.transformer(
+                vlm_features=enc["vlm_features"],
+                action_with_noise=x_k,
+                t=t_cont,
+                proprio=proprio_norm,
+            )
+            # Denoising (epsilon-prediction) MSE; key kept as "velocity_loss"
+            # so the trainer/logging remain unchanged.
+            return {"velocity_loss": torch.mean(torch.square(eps_pred - noise))}
+
         # Flow Matching
         noise = torch.randn_like(action_norm)
         t_expanded = t.view(-1, 1, 1)
@@ -466,26 +505,48 @@ class SmolVLMVLA(PreTrainedModel):
         else:
             proprio_norm = proprio
 
-        # Euler integration
         steps = max(1, int(steps))
+
+        # ----- DDPM checkpoint: DDIM sampling (deterministic, eta=0) -----
+        if self.action_objective == "ddpm":
+            T_diff = self.diffusion_timesteps
+            abar = self.ddpm_alphas_cumprod.to(device)
+            # Descending timestep subsequence, e.g. steps=10, T=100 -> 99,88,...,0
+            ks = torch.linspace(T_diff - 1, 0, steps).round().long().unique(sorted=True).flip(0)
+            x = torch.randn(B, self.num_actions, D, device=device, dtype=dtype)
+            for i, k in enumerate(ks.tolist()):
+                abar_k = abar[k]
+                t_tensor = torch.full((B,), (k + 1.0) / T_diff, device=device, dtype=dtype)
+                eps_hat = self.transformer(
+                    vlm_features=enc["vlm_features"],
+                    action_with_noise=x,
+                    proprio=proprio_norm,
+                    t=t_tensor,
+                )
+                x0_pred = (x - (1 - abar_k).sqrt() * eps_hat) / abar_k.sqrt()
+                abar_prev = abar[ks[i + 1]] if i + 1 < len(ks) else torch.ones_like(abar_k)
+                x = abar_prev.sqrt() * x0_pred + (1 - abar_prev).sqrt() * eps_hat
+            return self.action_space.postprocess(x)
+
+        # ----- Flow-matching checkpoint: Euler integration -----
         dt = -1.0 / steps
-        
+
         x_t = torch.randn(B, self.num_actions, D, device=device, dtype=dtype)
         t = 1.0
-        
+
         while t > -dt / 2:
             t_tensor = torch.full((B,), t, device=device, dtype=dtype)
-            
+
             v_t = self.transformer(
                 vlm_features=enc["vlm_features"],
                 action_with_noise=x_t,
                 proprio=proprio_norm,
                 t=t_tensor,
             )
-        
+
             x_t = x_t + dt * v_t
             t = t + dt
-        
+
         return self.action_space.postprocess(x_t)
 
     # =============================== FastAPI service =============================

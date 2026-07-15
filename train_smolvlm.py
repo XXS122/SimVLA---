@@ -158,6 +158,12 @@ def get_args_parser():
                         help="Weight for the boundary prediction auxiliary loss")
 
     # Transition-Density Sampling (TDS)
+    parser.add_argument("--action_objective", type=str, default="flow",
+                        choices=["flow", "ddpm"],
+                        help="Action-generation objective: flow matching (default) or "
+                             "DDPM diffusion (cross-decoder ablation)")
+    parser.add_argument("--diffusion_timesteps", type=int, default=100,
+                        help="Diffusion steps T for --action_objective ddpm")
     parser.add_argument("--tds_weights_csv", type=str, default=None,
                         help="task_difficulty.csv from transition_density_stats.py; "
                              "enables difficulty-weighted task sampling (off by default)")
@@ -294,6 +300,7 @@ def main(args):
         "use_adaln": args.use_adaln,
         "use_adaptive_chunking": args.use_adaptive_chunking,
         "chunk_loss_weight": args.chunk_loss_weight,
+        "action_objective": args.action_objective,
         "tds_weights_csv": args.tds_weights_csv,
     }
     
@@ -369,6 +376,8 @@ def main(args):
             image_size=args.image_size,
             use_adaptive_chunking=args.use_adaptive_chunking,
             chunk_loss_weight=args.chunk_loss_weight,
+            action_objective=args.action_objective,
+            diffusion_timesteps=args.diffusion_timesteps,
         )
         model = SmolVLMVLA(config)
         

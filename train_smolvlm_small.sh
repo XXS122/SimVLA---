@@ -65,6 +65,8 @@ USE_ADALN=false          # DiT-style conditioning
 USE_ADAPTIVE_CHUNKING=${USE_ADAPTIVE_CHUNKING:-false}  # change-rate-weighted loss + boundary head
 CHUNK_LOSS_WEIGHT=${CHUNK_LOSS_WEIGHT:-0.1}            # weight of boundary auxiliary loss
 TDS_WEIGHTS_CSV=${TDS_WEIGHTS_CSV:-""}                 # task_difficulty.csv -> enables TDS sampling
+ACTION_OBJECTIVE=${ACTION_OBJECTIVE:-flow}             # flow (default) | ddpm (cross-decoder ablation)
+DIFFUSION_TIMESTEPS=${DIFFUSION_TIMESTEPS:-100}        # only used when ACTION_OBJECTIVE=ddpm
 
 # =============================================================================
 # Step 1: Create training metadata (if not exists)
@@ -127,6 +129,12 @@ fi
 if [ -n "${TDS_WEIGHTS_CSV}" ]; then
     ARGS="${ARGS} --tds_weights_csv ${TDS_WEIGHTS_CSV}"
     echo "Transition-Density Sampling ENABLED (${TDS_WEIGHTS_CSV})"
+fi
+
+# Action-generation objective (flow default; ddpm for the cross-decoder ablation)
+if [ "${ACTION_OBJECTIVE}" != "flow" ]; then
+    ARGS="${ARGS} --action_objective ${ACTION_OBJECTIVE} --diffusion_timesteps ${DIFFUSION_TIMESTEPS}"
+    echo "Action objective: ${ACTION_OBJECTIVE} (T=${DIFFUSION_TIMESTEPS})"
 fi
 
 # Add resume checkpoint if specified
