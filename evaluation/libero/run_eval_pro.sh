@@ -26,9 +26,9 @@
 # Example (uniform 100k ckpt served on 8102, single GPU, object perturbation):
 #   bash run_eval_pro.sh 8102 20 uni100k object "0 0 0 0"
 #
-# Outputs (like run_eval_all.sh):
-#   <prefix>_<dim>_{spatial,object,goal,10}.txt
-#   <prefix>_<dim>_per_task_*.csv  and merged  <prefix>_<dim>_sr_all.csv
+# Outputs (note the "_pro_" tag distinguishing these from standard LIBERO):
+#   <prefix>_pro_<dim>_{spatial,object,goal,10}.txt
+#   <prefix>_pro_<dim>_per_task_*.csv  and merged  <prefix>_pro_<dim>_sr_all.csv
 # =============================================================================
 
 set -e
@@ -80,7 +80,9 @@ esac
 PRO_SUITES=${PRO_SUITES:-"libero_spatial_${SUFFIX} libero_object_${SUFFIX} libero_goal_${SUFFIX} libero_10_${SUFFIX}"}
 read -ra SUITE_ARRAY <<< "$PRO_SUITES"
 
-PREFIX="${OUTPUT_PREFIX}_${DIM}"
+# "_pro_" tags every LIBERO-PRO artifact so it is visually distinct from the
+# standard-LIBERO outputs of run_eval_all.sh / run_eval_seq.sh
+PREFIX="${OUTPUT_PREFIX}_pro_${DIM}"
 OUTPUT_DIR="./eval_pro_${PORT}"
 mkdir -p "$OUTPUT_DIR"
 rm -f "${PREFIX}"_per_task_*.csv "${PREFIX}_sr_all.csv"
